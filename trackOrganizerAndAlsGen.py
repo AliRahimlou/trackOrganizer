@@ -139,7 +139,6 @@ def extract_bpm_from_path(folder_path):
         bpm_value = int(parts[-3])
         return bpm_value
     except (IndexError, ValueError):
-        print(f"   Warning: Could not extract BPM from path '{folder_path}'.")
         return None
 
 def select_blank_als(bpm_value):
@@ -148,7 +147,6 @@ def select_blank_als(bpm_value):
         bpm_als_path = os.path.join(ALS_FILES_FOLDER, f"{bpm_value}.als")
         if os.path.exists(bpm_als_path):
             return bpm_als_path
-    print(f"⚠️ Warning: No ALS file found for BPM {bpm_value}. Skipping...")
     return None
 
 def get_duration_in_beats(track_path, bpm):
@@ -167,19 +165,22 @@ def modify_als_file(input_path, target_folder, track_names, bpm_value):
     """Loads the selected ALS file, replaces FLAC references, updates LoopEnd and OutMarker, and saves."""
     try:
         if input_path is None:
-            print(f"❌ Skipping folder '{target_folder}' due to missing ALS template.")
             return
         output_als = os.path.join(target_folder, "CH1.als")
         if os.path.exists(output_als) and SKIP_EXISTING:
-            print(f"⏭️ Skipping '{target_folder}' – CH1.als already exists.")
-            return
+            return  # Silently skip existing files
+        
+        # Only print when actually processing a new file
+        print(f"🎯 Processing new ALS for: {target_folder} (BPM: {bpm_value or 'Unknown'})")
+        print(f"   Using ALS template: {input_path}")
+        print("   Found track files:", track_names)
+
         shutil.copy(input_path, output_als)
         new_loop_end = None
         if track_names["drums"] and bpm_value:
             flac_path = os.path.join(FLAC_FOLDER, track_names["drums"])
             new_loop_end = get_duration_in_beats(flac_path, bpm_value)
-        else:
-            print("   No drums track or BPM value available; skipping LoopEnd modification.")
+        
         with gzip.open(output_als, "rb") as f:
             als_data = f.read()
         tree = ET.parse(BytesIO(als_data))
@@ -196,22 +197,27 @@ def modify_als_file(input_path, target_folder, track_names, bpm_value):
                     old_value = elem.get("Value")
                     elem.set("Value", new_loop_end)
                     print(f"   Updated <OutMarker> from {old_value} to {new_loop_end}")
+        
         with gzip.open(output_als, "wb") as f_out:
             tree.write(f_out, encoding="utf-8", xml_declaration=True)
+        
         with gzip.open(output_als, "rb") as f:
             als_data = f.read()
         als_str = als_data.decode("latin1")
+        
         replacements = {
             "drums-Tape B - i won't be ur drug.flac": track_names["drums"] if track_names["drums"] else "",
             "Inst-Tape B - i won't be ur drug.flac": track_names["Inst"] if track_names["Inst"] else "",
             "vocals-Tape B - i won't be ur drug.flac": track_names["vocals"] if track_names["vocals"] else "",
         }
+        
         for old, new in replacements.items():
             if new:
                 als_str = als_str.replace(old, new)
                 als_str = als_str.replace(f"../{old}", f"../{new}")
                 als_str = als_str.replace(f"{target_folder}/{old}", f"{target_folder}/{new}")
                 als_str = als_str.replace(old.replace(" ", "%20"), new.replace(" ", "%20"))
+        
         for old, new in replacements.items():
             if new:
                 old_track_name = old.replace(".flac", "")
@@ -220,9 +226,11 @@ def modify_als_file(input_path, target_folder, track_names, bpm_value):
                 als_str = re.sub(rf'(<UserName Value="){re.escape(old_track_name)}(")', rf'\1{new_track_name}\2', als_str)
                 als_str = re.sub(rf'(<Name Value="){re.escape(old_track_name)}(")', rf'\1{new_track_name}\2', als_str)
                 als_str = re.sub(rf'(<EffectiveName Value="){re.escape(old_track_name)}(")', rf'\1{new_track_name}\2', als_str)
+        
         with gzip.open(output_als, "wb") as f:
             f.write(als_str.encode("latin1"))
-        print(f"✅ Final modified ALS saved at: {output_als} (Modified {modified_count} LoopEnd elements)\n")
+        print(f"✅ New ALS saved at: {output_als} (Modified {modified_count} LoopEnd elements)\n")
+
     except Exception as e:
         print(f"❌ Error modifying ALS in folder '{target_folder}': {e}")
 
@@ -234,9 +242,6 @@ def generate_als_files():
     else:
         for folder, track_names, bpm_value in folders:
             blank_als_path = select_blank_als(bpm_value)
-            print(f"🎯 Processing folder: {folder} (BPM: {bpm_value or 'Unknown'})")
-            print(f"   Using ALS template: {blank_als_path if blank_als_path else '⚠️ Skipping (No ALS file)'}")
-            print("   Found track files:", track_names)
             modify_als_file(blank_als_path, folder, track_names, bpm_value)
         print("🎵 All ALS files generated successfully!")
 
