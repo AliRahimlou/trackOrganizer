@@ -9,6 +9,7 @@ import xml.etree.ElementTree as ET
 from mutagen.id3 import ID3, ID3NoHeaderError
 from mutagen.flac import FLAC
 from mutagen.wave import WAVE
+from mutagen.aiff import AIFF
 
 import trackTime  # your module for duration
 
@@ -256,8 +257,8 @@ def get_bpm_key_energy(file_path) -> Tuple[Optional[int], Optional[str], Optiona
         if ext == ".flac":
             audio = FLAC(file_path)
             return read_flac_bpm(audio), read_flac_key(audio), read_flac_energy(audio)
-        if ext == ".wav":
-            audio = WAVE(file_path)
+        if ext in {".wav", ".aif", ".aiff"}:
+            audio = WAVE(file_path) if ext == ".wav" else AIFF(file_path)
             bpm = key = energy = None
             if isinstance(audio.tags, ID3):
                 bpm    = read_id3_bpm(audio.tags)
@@ -277,7 +278,9 @@ def _ext_priority(p: str) -> int:
     if pl.endswith(".mp3"): return 0
     if pl.endswith(".flac"): return 1
     if pl.endswith(".wav"): return 2
-    return 3
+    if pl.endswith(".aiff"): return 3
+    if pl.endswith(".aif"): return 4
+    return 5
 
 def index_source_library(mp3_folder) -> Dict[str,str]:
     best: Dict[str,str] = {}
@@ -361,13 +364,16 @@ def select_blank_als(bpm_value: Optional[int]) -> Optional[str]:
 def collect_track_names_for_folder(folder_abs: str) -> Dict[str, Optional[str]]:
     roles: Dict[str, Optional[str]] = {"drums": None, "inst": None, "vocals": None}
     for f in os.listdir(folder_abs):
-        if not f.lower().endswith(".flac"):
+        if not f.lower().endswith((".flac", ".wav", ".aiff", ".aif")):
             continue
         low = f.lower()
         role = "drums" if low.startswith("drums") else ("inst" if low.startswith("inst") else ("vocals" if low.startswith("vocals") else None))
         if not role:
             continue
-        roles[role] = os.path.relpath(os.path.join(folder_abs, f), FLAC_FOLDER)
+        rel_path = os.path.relpath(os.path.join(folder_abs, f), FLAC_FOLDER)
+        cur = roles[role]
+        if cur is None or _ext_priority(rel_path) < _ext_priority(cur):
+            roles[role] = rel_path
     return roles
 
 def modify_als_file(input_path: Optional[str], target_folder: str, track_names: Dict[str, Optional[str]], bpm_value: Optional[int], force: bool=False) -> None:
@@ -422,8 +428,8 @@ def modify_als_file(input_path: Optional[str], target_folder: str, track_names: 
             als_str = als_str.replace(old, new)
             als_str = als_str.replace(old.replace(" ", "%20"), new.replace(" ", "%20"))
 
-            old_name = old.replace(".flac", "")
-            new_name = safe_xml_value(os.path.basename(rel_path).replace(".flac",""))
+            old_name = os.path.splitext(old)[0]
+            new_name = safe_xml_value(os.path.splitext(os.path.basename(rel_path))[0])
             for tag in ["MemorizedFirstClipName","UserName","Name","EffectiveName"]:
                 pattern = rf'(<{tag}\s+Value="){re.escape(old_name)}(")'
                 als_str = re.sub(pattern, rf"\1{new_name}\2", als_str)

@@ -18,10 +18,20 @@ OUTPUT_DIR        = Path("/Users/alirahimlou/Desktop/MUSIC/GeneratedSet/Set_Fest
 # Base ALS that contains CH1/CH2/CH3(/CH4) tracks
 BASE_ALS          = Path("/Users/alirahimlou/myapps/trackOrganizer/alsFiles/CH1.als")
 
-SET_LEN           = 85           # how many tracks to pick
-START_BPM         = None         # None = random start; or int like 124
+SET_LEN           = 90           # how many tracks to pick
+START_BPM         = 90         # None = random start; or int like 124
 BPM_STEP_MAX      = 4            # max BPM increase per transition
 MAX_PER_ARTIST    = 2            # soft cap per artist
+
+# If True, restrict the track pool to a BPM range (inclusive)
+USE_BPM_RANGE     = True
+BPM_RANGE_MIN     = 80
+BPM_RANGE_MAX     = 150
+
+# If True, ignore BPM/harmonic/energy settings and use all tracks in DATE_RANGE (by CH1.als mtime)
+USE_NEWEST_TRACKS = True
+# Required when USE_NEWEST_TRACKS=True. Format: "12-19-25--12-21-25" or "2025-12-19--2025-12-21"
+DATE_RANGE = "1-5-26--1-23-26"
 
 # strict → same key, ±1 (same letter), relative (A↔B)
 # energy → strict + energy boost/drop (±2, same letter)
@@ -59,7 +69,7 @@ HARMONIC_MODE     = "pro"
 # When the algorithm finds no candidates under the current energy rule, it automatically re-runs the search with the energy rule relaxed so your set can continue
 
 # Energy sequencing: 'ignore' | 'ramp' | 'wave' | 'match'
-ENERGY_STRATEGY   = "ramp"
+ENERGY_STRATEGY   = "wave"
 ENERGY_STEP_MAX   = 2
 
 RANDOM_SEED       = None         # None = different every run; or int like 42
@@ -160,14 +170,20 @@ def collect_tracks(stems_dir: str) -> List[Dict[str, Any]]:
                 if "CH1.als" in files:
                     track_folder = os.path.basename(root)
                     energy = parse_energy_from_folder(root)
+                    src_path = os.path.join(root, "CH1.als")
+                    try:
+                        added_ts = os.path.getmtime(src_path)
+                    except FileNotFoundError:
+                        added_ts = 0.0
                     tracks.append({
                         "bpm": bpm,
                         "key": key_name.upper(),
                         "energy": energy,           # may be None
                         "folder": track_folder,
-                        "src": os.path.join(root, "CH1.als"),
+                        "src": src_path,
                         "artist": guess_artist(track_folder),
                         "title_norm": norm_title_from_folder(track_folder),
+                        "added_ts": added_ts,
                     })
     def sort_key(t):
         m = CAMELOT_RE.fullmatch(t["key"])
@@ -177,14 +193,62 @@ def collect_tracks(stems_dir: str) -> List[Dict[str, Any]]:
     tracks.sort(key=sort_key)
     return tracks
 
+def sort_by_bpm_key_energy(tracks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def sort_key(t):
+        m = CAMELOT_RE.fullmatch(t["key"])
+        n = int(m.group(1)) if m else 99
+        L = 0 if (m and m.group(2).upper() == "A") else 1
+        energy_sort = t["energy"] if t["energy"] is not None else 999
+        return (t["bpm"], n, L, energy_sort, norm_text(t["folder"]))
+    return sorted(tracks, key=sort_key)
+
 def dedupe(tracks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     if not ENABLE_DEDUPING: return tracks
+    tracks = sorted(tracks, key=lambda t: t.get("added_ts", 0.0), reverse=True)
     seen, out = set(), []
     for t in tracks:
         k = (t["bpm"], t["key"], t["title_norm"])
         if k in seen: continue
         seen.add(k); out.append(t)
     return out
+
+def filter_newest_tracks(tracks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not USE_NEWEST_TRACKS:
+        return tracks
+    if not DATE_RANGE:
+        print("[ERROR] USE_NEWEST_TRACKS=True requires DATE_RANGE (e.g. \"12-19-25--12-21-25\").")
+        sys.exit(1)
+    rng = parse_date_range(DATE_RANGE)
+    if not rng:
+        print(f"[ERROR] DATE_RANGE not understood: {DATE_RANGE}")
+        sys.exit(1)
+    start_ts, end_ts = rng
+    return [t for t in tracks if start_ts <= t.get("added_ts", 0.0) <= end_ts]
+
+def parse_date_range(spec: str) -> Optional[Tuple[float, float]]:
+    if not spec: return None
+    if "--" not in spec: return None
+    a, b = [s.strip() for s in spec.split("--", 1)]
+    fmts = ["%Y-%m-%d", "%m-%d-%y"]
+    def parse_one(s: str) -> Optional[datetime.datetime]:
+        for f in fmts:
+            try:
+                return datetime.datetime.strptime(s, f)
+            except ValueError:
+                continue
+        return None
+    da = parse_one(a); db = parse_one(b)
+    if da is None or db is None: return None
+    if da > db: da, db = db, da
+    start = da.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+    end = db.replace(hour=23, minute=59, second=59, microsecond=999999).timestamp()
+    return (start, end)
+
+def filter_by_bpm_range(tracks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not USE_BPM_RANGE: return tracks
+    lo = min(BPM_RANGE_MIN, BPM_RANGE_MAX)
+    hi = max(BPM_RANGE_MIN, BPM_RANGE_MAX)
+    return [t for t in tracks if lo <= t.get("bpm", 0) <= hi]
 
 def build_indexes(tracks: List[Dict[str, Any]]):
     by_bpm: Dict[int, List[Dict[str, Any]]] = {}
@@ -265,13 +329,13 @@ def pick_next(curr: Dict[str, Any],
     candidates.sort(key=score)
     return random.choice(candidates[:5])
 
-def build_set(tracks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def build_set(tracks: List[Dict[str, Any]], set_len: int = SET_LEN) -> List[Dict[str, Any]]:
     by_bpm = build_indexes(tracks)
     current = choose_start(tracks, by_bpm)
     chosen = [current]
     used = {current["src"]}
     artist_counts = {current["artist"]: 1}
-    while len(chosen) < SET_LEN:
+    while len(chosen) < set_len:
         nxt = pick_next(chosen[-1], by_bpm, used, artist_counts)
         if not nxt: break
         chosen.append(nxt)
@@ -306,9 +370,13 @@ def liveset(root):
     return root.find("LiveSet")
 
 def scenes_node(root):
-    sc = root.find(".//Scenes") or root.find(".//SceneList")
+    sc = root.find(".//Scenes")
     if sc is None:
-        ls = liveset(root) or ET.SubElement(root, "LiveSet")
+        sc = root.find(".//SceneList")
+    if sc is None:
+        ls = liveset(root)
+        if ls is None:
+            ls = ET.SubElement(root, "LiveSet")
         sc = ET.SubElement(ls, "Scenes")
     return sc
 
@@ -333,7 +401,9 @@ def ch_index_from_label(name: str):
     return None
 
 def ch_tracks_map(root):
-    tp = tracks_parent(root) or []
+    tp = tracks_parent(root)
+    if tp is None:
+        return {}
     mapping = {}
     for t in list(tp):
         idx = ch_index_from_label(track_label(t))
@@ -349,7 +419,9 @@ def role_index_from_name(name: str):
     return None
 
 def src_role_map(root):
-    tp = tracks_parent(root) or []
+    tp = tracks_parent(root)
+    if tp is None:
+        return {}
     mapping = {}
     for t in list(tp):
         idx = role_index_from_name(track_label(t))
@@ -419,8 +491,12 @@ def append_scene(master_root: ET.Element,
     for ch_idx, dest_track in sorted(ch_map.items()):
         mcsl = main_csl(dest_track)
         if mcsl is None:
-            dc = dest_track.find("./DeviceChain") or ET.SubElement(dest_track, "DeviceChain")
-            ms = dc.find("./MainSequencer") or ET.SubElement(dc, "MainSequencer")
+            dc = dest_track.find("./DeviceChain")
+            if dc is None:
+                dc = ET.SubElement(dest_track, "DeviceChain")
+            ms = dc.find("./MainSequencer")
+            if ms is None:
+                ms = ET.SubElement(dc, "MainSequencer")
             mcsl = ET.SubElement(ms, "ClipSlotList")
 
         src_track = src_map.get(ch_idx)
@@ -509,10 +585,18 @@ def main():
         print("No CH1.als files found. Check /BPM/Key/Track/CH1.als")
         sys.exit(1)
 
-    tracks = dedupe(tracks)
-    set_tracks = build_set(tracks)
+    if USE_NEWEST_TRACKS:
+        tracks = filter_newest_tracks(tracks)
+        if not tracks:
+            print("No tracks found in DATE_RANGE.")
+            sys.exit(1)
+        set_tracks = sort_by_bpm_key_energy(tracks)
+    else:
+        tracks = dedupe(tracks)
+        tracks = filter_by_bpm_range(tracks)
+        set_tracks = build_set(tracks)
 
-    if len(set_tracks) < 2:
+    if (not USE_NEWEST_TRACKS) and len(set_tracks) < 2:
         print("Could not build a sequence with current constraints.\n"
               f"- HARMONIC_MODE: {HARMONIC_MODE}\n"
               f"- ENERGY_STRATEGY: {ENERGY_STRATEGY} (ENERGY_STEP_MAX={ENERGY_STEP_MAX})\n"

@@ -1,15 +1,40 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os, re, json, base64, html, shutil, gzip, unicodedata
+"""
+Combined pipeline:
+- Index library, read BPM/Key/Energy from tags
+- (Optional) load Rekordbox (MiK) cues from XML
+- Run clean-room cue detector (librosa + optional madmom) for drop/buildup/intro/outro
+- Merge cues (RBX + detector), snap to beat grid using BPM
+- Write CH1.als: stamp WarpMarkers (SecTime + BeatTime), update LoopEnd/OutMarker, replace clip names/paths
+
+Requires:
+  pip install numpy>=2.0 scipy>=1.13 soundfile>=0.12.1 audioread>=3.0.1 librosa>=0.10.2.post1
+Optional:
+  pip install madmom
+"""
+
+import os, re, json, base64, html, shutil, gzip, unicodedata, warnings
 from io import BytesIO
 from typing import Optional, Dict, Tuple, List
 import xml.etree.ElementTree as ET
 from urllib.parse import urlparse, unquote
 
+# --- audio tags ---
 from mutagen.id3 import ID3, ID3NoHeaderError
 from mutagen.flac import FLAC
 from mutagen.wave import WAVE
+
+# --- cue detector deps ---
+import numpy as np
+import librosa
+
+_HAS_MADMOM = True
+try:
+    from madmom.features.downbeats import RNNDownBeatProcessor, DBNDownBeatTrackingProcessor
+except Exception:
+    _HAS_MADMOM = False
 
 import trackTime  # your module for duration
 
@@ -512,12 +537,10 @@ def collect_track_names_for_folder(folder_abs: str) -> Dict[str, Optional[str]]:
 
 def _replace_warpmarkers_in_audioclip(aclip: ET.Element, cues_sec: List[float], bpm: Optional[int]):
     """
-    CH2-like markers but consistent:
-      - compute BeatTime from seconds using BPM
-      - snap to grid, then recompute SecTime from snapped BeatTime
-      - write BOTH BeatTime and SecTime (consistent!)
+    - compute BeatTime from seconds using BPM
+    - snap to grid, then recompute SecTime from snapped BeatTime
+    - write BOTH BeatTime and SecTime
     """
-    # remove existing WarpMarkers nodes
     for wm_parent in list(aclip.findall("WarpMarkers")):
         aclip.remove(wm_parent)
     wm_parent = ET.Element("WarpMarkers")
@@ -527,28 +550,288 @@ def _replace_warpmarkers_in_audioclip(aclip: ET.Element, cues_sec: List[float], 
             beat_q, sec_q = _snap_seconds_to_grid(sec, bpm)
             attrs = {"Id": str(i), "SecTime": f"{sec_q:.6f}", "BeatTime": f"{beat_q:.6f}"}
         else:
-            # fallback: just write seconds
             attrs = {"Id": str(i), "SecTime": f"{sec:.6f}"}
         wm_parent.append(ET.Element("WarpMarker", attrs))
 
-    aclip.insert(0, wm_parent)  # put near top for reliability
+    aclip.insert(0, wm_parent)
 
-def _stamp_mik_cues(root: ET.Element, cues_sec: List[float], bpm: Optional[int]) -> int:
-    count = 0
+def _stamp_cues(root: ET.Element, cues_sec: List[float], bpm: Optional[int]) -> int:
     if not cues_sec:
         return 0
+    count = 0
     for aclip in root.iter("AudioClip"):
         _replace_warpmarkers_in_audioclip(aclip, cues_sec, bpm)
         count += len(cues_sec)
-    # ensure warp enabled if present
     for node in root.iter("IsWarped"):
         node.set("Value", "true")
     return count
 
+# ======== Clean-room cue detector (embedded) ========
+def _smooth_same(x: np.ndarray, win: int) -> np.ndarray:
+    if win <= 1:
+        return x
+    k = np.ones(int(win), dtype=float) / float(win)
+    return np.convolve(x, k, mode="same")
+
+def _estimate_grid(y: np.ndarray, sr: int, hop: int = 512):
+    onset_env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop, aggregate=np.median)
+    tempo, beat_frames = librosa.beat.beat_track(onset_envelope=onset_env, sr=sr, hop_length=hop, units="frames")
+    beat_times = librosa.frames_to_time(beat_frames, sr=sr, hop_length=hop)
+    downbeats = np.array([])
+    if _HAS_MADMOM:
+        try:
+            proc = RNNDownBeatProcessor()
+            act = proc(y)
+            dbn = DBNDownBeatTrackingProcessor(beats_per_bar=[3,4], fps=proc.fps)
+            seq = dbn(act)
+            downbeats = seq[seq[:,1] == 1][:,0]
+        except Exception:
+            warnings.warn("madmom failed; using heuristic downbeats.")
+    if downbeats.size == 0 and len(beat_times) >= 8:
+        # heuristic 4/4 phase
+        beats_per_bar = 4
+        env = onset_env
+        env_t = librosa.frames_to_time(np.arange(len(env)), sr=sr, hop_length=hop)
+        best_phase, best_score = 0, -1e9
+        for phase in range(beats_per_bar):
+            idx = np.arange(phase, len(beat_times), beats_per_bar)
+            vals = np.interp(beat_times[idx], env_t, env)
+            sc = float(np.mean(vals)) if len(vals) else -1e9
+            if sc > best_score:
+                best_score, best_phase = sc, phase
+        idx = np.arange(best_phase, len(beat_times), beats_per_bar)
+        downbeats = beat_times[idx]
+    return beat_times, float(tempo), downbeats
+
+def _curves_on_beats(y: np.ndarray, sr: int, beat_times: np.ndarray, hop: int = 512) -> dict:
+    S = librosa.stft(y, n_fft=2048, hop_length=hop, window="hann")
+    H, P = librosa.decompose.hpss(S)
+    mag = np.abs(S); magH = np.abs(H)
+
+    n_frames = mag.shape[1]
+    frame_times = librosa.frames_to_time(np.arange(n_frames), sr=sr, hop_length=hop)
+
+    def _flux(M):
+        M = M / (M.sum(axis=0, keepdims=True) + 1e-9)
+        d = np.maximum(M[:,1:] - M[:,:-1], 0.0)
+        return d.sum(axis=0)
+
+    def _fix_len(curve, target=n_frames):
+        L = len(curve)
+        if L == target:
+            return curve
+        if L < target:
+            return np.pad(curve, (0, target - L), mode="edge")
+        return curve[:target]
+
+    flux_all = _fix_len(_flux(mag))
+    flux_perc = _fix_len(_flux(magH))
+
+    rms = librosa.feature.rms(S=mag, frame_length=2048, hop_length=hop, center=True)[0]
+    rms = _fix_len(rms)
+
+    S2 = librosa.stft(y, n_fft=4096, hop_length=hop, window="hann")
+    mag2 = np.abs(S2)
+    freqs = librosa.fft_frequencies(sr=sr, n_fft=4096)
+    bass_band = (freqs >= 20) & (freqs <= 120)
+    bass_env = _fix_len(mag2[bass_band].mean(axis=0))
+
+    def to_beats(curve):
+        L = min(len(curve), len(frame_times))
+        if L == 0:
+            return np.zeros_like(beat_times)
+        return np.interp(beat_times, frame_times[:L], curve[:L])
+
+    curves = dict(
+        flux_all = to_beats(flux_all),
+        flux_perc= to_beats(flux_perc),
+        rms      = to_beats(rms),
+        bass     = to_beats(bass_env),
+    )
+    # normalize 0..1
+    for k in list(curves.keys()):
+        c = curves[k]
+        rng = np.ptp(c) + 1e-9
+        curves[k] = (c - np.min(c)) / rng
+
+    bass_sm   = _smooth_same(curves["bass"], 4)
+    bass_ramp = np.gradient(bass_sm)
+    bass_ramp = (bass_ramp - np.min(bass_ramp)) / (np.ptp(bass_ramp) + 1e-9)
+
+    perc_sm   = _smooth_same(curves["flux_perc"], 2)
+    perc_acc  = np.clip(np.gradient(perc_sm), 0, None)
+    perc_acc  = (perc_acc - np.min(perc_acc)) / (np.ptp(perc_acc) + 1e-9)
+
+    energy = 0.45*curves["bass"] + 0.35*curves["flux_perc"] + 0.20*curves["rms"]
+    energy = (energy - np.min(energy)) / (np.ptp(energy) + 1e-9)
+    energy = _smooth_same(energy, 3)
+
+    drop_score = 0.55*_smooth_same(bass_ramp, 3) + 0.35*perc_acc + 0.15*curves["flux_all"]
+    drop_score = (drop_score - float(np.mean(drop_score))) / (float(np.std(drop_score)) + 1e-8)
+
+    curves["bass_ramp"]   = bass_ramp
+    curves["perc_accent"] = perc_acc
+    curves["energy"]      = energy
+    curves["drop_score"]  = drop_score
+    return curves
+
+def _pick_drops(beat_times: np.ndarray, downbeats: np.ndarray, curves: dict,
+                min_sep_bars=16, beats_per_bar=4) -> List[int]:
+    score = curves["drop_score"].copy()
+    n = len(score)
+    if n > 32:
+        score[:16] -= 2.0
+        score[-16:] -= 1.0
+    if len(downbeats):
+        db_idx = np.searchsorted(beat_times, downbeats)
+        mask = np.zeros_like(score)
+        for di in db_idx:
+            for k in (-1,0,1):
+                j = di + k
+                if 0 <= j < n: mask[j] += 1.0
+        score += 0.6*mask
+    used = np.zeros(n, dtype=bool)
+    picks = []
+    order = np.argsort(-score)
+    min_sep = max(1, min_sep_bars*beats_per_bar)
+    for idx in order:
+        if used[idx]: continue
+        if score[idx] < 0.5: break
+        picks.append(idx)
+        lo = max(0, idx - min_sep); hi = min(n, idx + min_sep + 1)
+        used[lo:hi] = True
+        if len(picks) == 2: break
+    picks.sort()
+    return picks
+
+def detect_cues_seconds(audio_path: str, max_hotcues: int = 8) -> Tuple[List[float], Optional[int]]:
+    """
+    Returns:
+      (cues_sec, energy12_fallback)
+      cues_sec: list of seconds for INTRO_START, PRE_DROP_8BARS, BUILDUP_START, DROP_1, POST_DROP_8BARS, BREAKDOWN_1, DROP_2?, OUTRO_START, ENERGY_PEAK_LATE?
+      energy12_fallback: 1..12 inferred if tags lack Energy (None if cannot infer)
+    """
+    try:
+        y, sr = librosa.load(audio_path, sr=None, mono=True)
+    except Exception as e:
+        print(f"[DETECT] Failed to load {audio_path}: {e}")
+        return [], None
+    y = librosa.util.normalize(y)
+
+    beat_times, tempo, downbeats = _estimate_grid(y, sr)
+    if len(beat_times) < 24:
+        return [], None
+    curves = _curves_on_beats(y, sr, beat_times)
+    drops = _pick_drops(beat_times, downbeats, curves)
+    if not drops:
+        energy = curves["energy"].copy()
+        if len(downbeats):
+            db_idx = np.searchsorted(beat_times, downbeats)
+            mask = np.zeros_like(energy)
+            for di in db_idx:
+                for k in (-1,0,1):
+                    j = di + k
+                    if 0 <= j < len(mask): mask[j] += 1.0
+            energy += 0.4*mask
+        drops = [int(np.argmax(energy))]
+
+    beats_per_bar = 4
+    drop1 = drops[0]
+    drop2 = drops[1] if len(drops) > 1 else None
+
+    # indices for cues (we'll convert to seconds at the end)
+    cues_idx: List[int] = []
+
+    # intro = first downbeat or beat 0
+    intro_idx = int(np.argmin(np.abs(beat_times - downbeats[0]))) if len(downbeats) else 0
+    cues_idx.append(intro_idx)
+
+    pre_drop = max(0, drop1 - 8*beats_per_bar); cues_idx.append(pre_drop)
+
+    # buildup start = where ramp crosses 60% within 16-64 bars before drop
+    start = max(0, drop1 - 64*beats_per_bar); end = max(0, drop1 - 16*beats_per_bar)
+    bs = None
+    if start < end:
+        ramp = curves["bass_ramp"][start:end]
+        if len(ramp) >= 8:
+            sm = _smooth_same(ramp, 4)
+            thr = 0.6 * (float(np.max(sm)) if np.isfinite(np.max(sm)) else 1.0)
+            idxs = np.where(sm >= thr)[0]
+            if len(idxs):
+                bs = start + int(idxs[0])
+    if bs is not None:
+        cues_idx.append(bs)
+
+    cues_idx.append(drop1)
+
+    post_drop = min(len(beat_times)-1, drop1 + 8*beats_per_bar); cues_idx.append(post_drop)
+
+    # breakdown valley 8..48 bars after drop
+    start = drop1 + 8*beats_per_bar; end = min(len(beat_times)-4, drop1 + 48*beats_per_bar)
+    if start < end:
+        energy_seg = curves["energy"][start:end]
+        if len(energy_seg) >= 8:
+            sm = _smooth_same(energy_seg, 4)
+            bd = start + int(np.argmin(sm))
+            cues_idx.append(bd)
+
+    if drop2 is not None and curves["drop_score"][drop2] > 0.6:
+        cues_idx.append(drop2)
+
+    # outro
+    n = len(beat_times)
+    start = n * 2 // 3
+    if start < n - 8:
+        flux = curves["flux_all"]; bass = curves["bass"]
+        best = start; best_score = -1e9; window = 16
+        for j in range(start, max(start + 1, n - window)):
+            seg = (1.0 - float(np.mean(_smooth_same(flux[j:j+window], 4)))) \
+                + (1.0 - float(np.mean(_smooth_same(bass[j:j+window], 4))))
+            if seg > best_score:
+                best_score = seg; best = j
+        cues_idx.append(best)
+
+    # late energy peak (optional)
+    start = n * 2 // 3
+    if start < n - 8:
+        late = curves["energy"].copy(); late[:start] = 0.0
+        ep = int(np.argmax(late))
+        if late[ep] > 0.6:
+            cues_idx.append(ep)
+
+    # dedupe & cap
+    cues_idx_sorted = []
+    seen = set()
+    for i in cues_idx:
+        if i not in seen:
+            seen.add(i); cues_idx_sorted.append(i)
+        if len(cues_idx_sorted) >= max_hotcues:
+            break
+
+    cues_sec = [float(beat_times[i]) for i in cues_idx_sorted]
+
+    # infer fallback energy (1..12) from energy curve (90th percentile)
+    e90 = float(np.percentile(curves["energy"], 90)) if len(curves["energy"]) else 0.5
+    energy12 = max(1, min(12, int(round(1 + 11*e90))))  # map 0..1 => 1..12
+    return cues_sec, energy12
+
 # ======= GLOBAL: MiK cue map
 RBX_MAP: Dict[str, Dict] = {}
 
-def modify_als_file(input_path: Optional[str], target_folder: str, track_names: Dict[str, Optional[str]], bpm_value: Optional[int], force: bool=False) -> None:
+def _merge_cues_seconds(cues_a: Optional[List[float]], cues_b: Optional[List[float]]) -> List[float]:
+    merged = []
+    for src in (cues_a or [], cues_b or []):
+        merged.extend(src)
+    # dedupe with small tolerance (5 ms) to avoid near-duplicates
+    merged = sorted(set(round(x, 3) for x in merged))
+    return merged
+
+def modify_als_file(input_path: Optional[str],
+                    target_folder: str,
+                    track_names: Dict[str, Optional[str]],
+                    bpm_value: Optional[int],
+                    cues_sec_merge: Optional[List[float]] = None,
+                    force: bool=False) -> None:
     output_als = os.path.join(target_folder, "CH1.als")
 
     if os.path.exists(output_als) and SKIP_EXISTING and not force:
@@ -562,19 +845,21 @@ def modify_als_file(input_path: Optional[str], target_folder: str, track_names: 
 
     print(f"\n🎯 Creating/Updating ALS for {target_folder} (BPM {bpm_value})")
 
-    # Read + parse ALS
     with gzip.open(output_als, "rb") as f:
         als_data = f.read()
     tree = ET.parse(BytesIO(als_data))
     root = tree.getroot()
 
-    # === Import MiK cues (seconds) and stamp snapped markers using BPM from original file
-    cues_sec = find_mik_cues_for_folder(RBX_MAP, target_folder)
-    if cues_sec:
-        stamped = _stamp_mik_cues(root, cues_sec, bpm_value)
-        print(f"   ➕ Stamped {len(cues_sec)} Rekordbox cue(s) as warp markers.")
+    # === cues: merge Rekordbox + detector-provided
+    rbx_secs = find_mik_cues_for_folder(RBX_MAP, target_folder)
+    cues_all = _merge_cues_seconds(rbx_secs, cues_sec_merge)
+    if cues_all:
+        stamped = _stamp_cues(root, cues_all, bpm_value)
+        print(f"   ➕ Stamped {len(cues_all)} cue(s) (RBX {len(rbx_secs or [])} + DET {len(cues_sec_merge or [])}).")
+    else:
+        print("   ⚠️  No cues found to stamp (RBX+DET empty).")
 
-    # === Keep your original start/stop updating (LoopEnd / OutMarker only)
+    # === Keep your original LoopEnd / OutMarker update (use drums track for duration if present)
     if track_names.get("drums") and bpm_value:
         flac_path = os.path.join(FLAC_FOLDER, track_names["drums"])
         loop_end_beats = get_duration_in_beats(flac_path, bpm_value)
@@ -613,7 +898,16 @@ def modify_als_file(input_path: Optional[str], target_folder: str, track_names: 
     print(f"✅ ALS saved: {output_als}")
 
 # ========= MOVES =========
-def move_folder_to_target(stems_folder_abs: str, bpm: int, cam: str, energy: Optional[int]) -> Tuple[str, bool, bool, bool]:
+def move_folder_to_target(stems_folder_abs: str,
+                          bpm: int,
+                          cam: str,
+                          energy: Optional[int],
+                          src_audio_path: Optional[str]) -> Tuple[str, bool, bool, bool]:
+    """
+    - Moves folder into destination/<bpm>/<cam>/
+    - Renames stems (adds energy if missing; uses detector-fallback if tags missing)
+    - Builds/updates CH1.als with merged cues (RBX + detector)
+    """
     track_name = os.path.basename(stems_folder_abs)
     bpm_folder = os.path.join(destination_folder, str(bpm))
     cam_folder = os.path.join(bpm_folder, cam)
@@ -628,15 +922,28 @@ def move_folder_to_target(stems_folder_abs: str, bpm: int, cam: str, energy: Opt
         print(f"[MOVE] {track_name}  →  {cam_folder}")
         moved = True
 
-    # Rename (adds energy if missing)
+    # Detect cues using source mixdown if we have it
+    det_secs: List[float] = []
+    energy_fallback: Optional[int] = None
+    if src_audio_path and os.path.exists(src_audio_path):
+        print(f"[DETECT] Analyzing: {src_audio_path}")
+        try:
+            det_secs, energy_fallback = detect_cues_seconds(src_audio_path, max_hotcues=8)
+            if det_secs:
+                print(f"[DETECT] Found {len(det_secs)} cue(s).")
+        except Exception as e:
+            print(f"[DETECT] Error: {e}")
+
+    # If Energy tag missing, use detector fallback 1..12
+    if energy is None and energy_fallback is not None:
+        energy = int(energy_fallback)
+
+    # Rename stems, maybe injecting energy if newly available
     energy_added = rename_stems_in_place(dest_path, bpm, cam, energy)
 
     output_als = os.path.join(dest_path, "CH1.als")
-
-    # When SKIP_EXISTING is False, force regeneration
     force_regen = (not SKIP_EXISTING)
     need_als = force_regen or (not os.path.exists(output_als)) or moved or energy_added
-
     if not need_als:
         return dest_path, moved, energy_added, False
 
@@ -644,9 +951,9 @@ def move_folder_to_target(stems_folder_abs: str, bpm: int, cam: str, energy: Opt
     track_names = collect_track_names_for_folder(dest_path)
 
     if blank_als is None and os.path.exists(output_als):
-        modify_als_file(output_als, dest_path, track_names, bpm, force=True)
+        modify_als_file(output_als, dest_path, track_names, bpm, cues_sec_merge=det_secs, force=True)
     else:
-        modify_als_file(blank_als, dest_path, track_names, bpm, force=force_regen)
+        modify_als_file(blank_als, dest_path, track_names, bpm, cues_sec_merge=det_secs, force=force_regen)
 
     return dest_path, moved, energy_added, True
 
@@ -668,7 +975,7 @@ def process_new_stems_from_toBeOrganized(idx_exact: Dict[str,str]) -> None:
         if bpm is None or cam == "Unknown Key":
             continue
 
-        move_folder_to_target(stems_abs, bpm, cam, energy)
+        move_folder_to_target(stems_abs, bpm, cam, energy, src_audio)
 
 def _snapshot_tracks(dest_folder: str):
     items = []
@@ -695,14 +1002,14 @@ def reconcile_existing_stems(idx_exact: Dict[str,str]) -> None:
     for cur_bpm, cur_cam, track_folder, track_abs in _snapshot_tracks(destination_folder):
         src_audio = find_source_for_track(idx_exact, track_folder)
         if not src_audio:
-            continue  # silent if no match
+            continue
 
         bpm, key, energy = get_bpm_key_energy(src_audio)
         cam = to_camelot(key or "")
         if bpm is None or cam == "Unknown Key":
             continue
 
-        _, did_move, added_energy, wrote_als = move_folder_to_target(track_abs, bpm, cam, energy)
+        _, did_move, added_energy, wrote_als = move_folder_to_target(track_abs, bpm, cam, energy, src_audio)
         if did_move: moved += 1
         if wrote_als: regenerated += 1
 
@@ -710,12 +1017,13 @@ def reconcile_existing_stems(idx_exact: Dict[str,str]) -> None:
 
 # ========= MAIN =========
 if __name__ == "__main__":
+    warnings.filterwarnings("ignore")
     if input("Ready? Type 'yes' to begin: ").strip().lower() == "yes":
         # Load MiK cues once
         RBX_MAP = load_rekordbox_mik_maps(REKORDBOX_XMLS)
 
         index_exact = index_source_library(mp3_source_folder)     # exact base-name index (NFC)
-        process_new_stems_from_toBeOrganized(index_exact)         # place new folders
+        process_new_stems_from_toBeOrganized(index_exact)         # place new folders + build ALS with cues
         reconcile_existing_stems(index_exact)                     # fix existing folders (force-regens if SKIP_EXISTING=False)
         print("🎵 Done.")
     else:
