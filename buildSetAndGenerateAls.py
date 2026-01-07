@@ -18,6 +18,10 @@ OUTPUT_DIR        = Path("/Users/alirahimlou/Desktop/MUSIC/GeneratedSet/Set_Fest
 # Base ALS that contains CH1/CH2/CH3(/CH4) tracks
 BASE_ALS          = Path("/Users/alirahimlou/myapps/trackOrganizer/alsFiles/CH1.als")
 
+# Optional: inject into an existing ALS that already has tracks/scenes
+INJECT_INTO_EXISTING = True
+INJECT_ALS          = Path("/Users/alirahimlou/Desktop/X1 TEMPLATE v2 Project/OG123-158 01-07-26.als")
+
 SET_LEN           = 90           # how many tracks to pick
 START_BPM         = 90         # None = random start; or int like 124
 BPM_STEP_MAX      = 4            # max BPM increase per transition
@@ -31,7 +35,7 @@ BPM_RANGE_MAX     = 150
 # If True, ignore BPM/harmonic/energy settings and use all tracks in DATE_RANGE (by CH1.als mtime)
 USE_NEWEST_TRACKS = True
 # Required when USE_NEWEST_TRACKS=True. Format: "12-19-25--12-21-25" or "2025-12-19--2025-12-21"
-DATE_RANGE = "1-5-26--1-23-26"
+DATE_RANGE = "12-31-25--1-7-26"
 
 # strict → same key, ±1 (same letter), relative (A↔B)
 # energy → strict + energy boost/drop (±2, same letter)
@@ -87,6 +91,7 @@ if RANDOM_SEED is not None:
 CAMELOT_RE = re.compile(r'^(\d{1,2})([ABab])$')
 # stems like: drums_80_2A_5-Artist - Title.flac (role may be drums/inst/vocals)
 STEM_RE    = re.compile(r'^(drums|inst|vocals)_(\d+)_(\d+[ABab])_(\d+)-', re.IGNORECASE)
+SCENE_SORT_RE = re.compile(r'^\s*(\d{2,3})\s*[_-]\s*([0-9]{1,2}[ABab])(?:[_-](\d{1,2}))?')
 
 def norm_text(s: str) -> str:
     s = s.lower()
@@ -394,6 +399,11 @@ def name_value(track: ET.Element) -> str:
 def track_label(track: ET.Element) -> str:
     return name_value(track)
 
+def scene_label(scene: ET.Element) -> str:
+    nm = scene.find("./Name")
+    if nm is None: return ""
+    return nm.attrib.get("Value", "")
+
 def ch_index_from_label(name: str):
     m = re.search(r'\bch(?:annel)?\s*([1-4])\b', name, flags=re.IGNORECASE)
     if m: return int(m.group(1))
@@ -426,6 +436,18 @@ def src_role_map(root):
     for t in list(tp):
         idx = role_index_from_name(track_label(t))
         if idx and idx not in mapping: mapping[idx] = t
+    return mapping
+
+def src_order_map(root):
+    tp = tracks_parent(root)
+    if tp is None:
+        return {}
+    tracks = [t for t in list(tp) if t.tag in ("AudioTrack","MidiTrack","GroupTrack")]
+    mapping = {}
+    for i, t in enumerate(tracks, start=1):
+        if i > 4:
+            break
+        mapping[i] = t
     return mapping
 
 def main_csl(track): 
@@ -466,17 +488,198 @@ def next_attr_id(parent: ET.Element) -> int:
         if cur and cur.isdigit(): mx = max(mx, int(cur))
     return mx + 1
 
-def append_scene(master_root: ET.Element,
+def camelot_key_tuple(key: str) -> Optional[Tuple[int, int]]:
+    m = CAMELOT_RE.fullmatch(key.strip()) if key else None
+    if not m: return None
+    n = int(m.group(1)); L = 0 if m.group(2).upper() == "A" else 1
+    return (n, L)
+
+def scene_sort_key_from_name(name: str) -> Optional[Tuple[int, int, int, int, str]]:
+    m = SCENE_SORT_RE.match(name or "")
+    if not m: return None
+    bpm = int(m.group(1))
+    key = m.group(2).upper()
+    key_tuple = camelot_key_tuple(key)
+    if not key_tuple: return None
+    energy = int(m.group(3)) if (m.group(3) and m.group(3).isdigit()) else 999
+    return (bpm, key_tuple[0], key_tuple[1], energy, norm_text(name))
+
+def clip_name_from_slot(slot: ET.Element) -> str:
+    for el in slot.iter():
+        if el.tag != "ClipSlot" and el.tag.endswith("Clip"):
+            nm = el.find("./Name")
+            if nm is not None and nm.attrib.get("Value"):
+                return nm.attrib["Value"]
+    return ""
+
+def scene_sort_key_from_clipname(name: str) -> Optional[Tuple[int, int, int, int, str]]:
+    m = STEM_RE.match(name or "")
+    if not m: return None
+    _role, bpm_str, key_str, energy_str = m.groups()
+    key_tuple = camelot_key_tuple(key_str.upper())
+    if not key_tuple:
+        return None
+    bpm = int(bpm_str)
+    energy = int(energy_str) if energy_str.isdigit() else 999
+    return (bpm, key_tuple[0], key_tuple[1], energy, norm_text(name))
+
+def track_slot_list(track: ET.Element) -> Optional[List[ET.Element]]:
+    csl = main_csl(track)
+    if csl is None:
+        return None
+    return list(csl.findall("./ClipSlot"))
+
+def source_clip_names(src_path: Path) -> Dict[int, str]:
+    try:
+        sroot = ET.fromstring(read_als_text(src_path))
+    except Exception:
+        return {}
+    src_map = ch_tracks_map(sroot) or src_role_map(sroot) or src_order_map(sroot)
+    out: Dict[int, str] = {}
+    for ch_idx, t in src_map.items():
+        slot = first_filled_slot(t)
+        if slot is None:
+            continue
+        nm = clip_name_from_slot(slot)
+        if nm:
+            out[ch_idx] = nm
+    return out
+
+def existing_clip_names(ch_map: dict[int, ET.Element], chs=(1,2,3)) -> Dict[int, Set[str]]:
+    out: Dict[int, Set[str]] = {}
+    for ch in chs:
+        t = ch_map.get(ch)
+        if t is None:
+            continue
+        slots = track_slot_list(t)
+        if not slots:
+            continue
+        names = set()
+        for sl in slots:
+            nm = clip_name_from_slot(sl)
+            if nm:
+                names.add(norm_text(nm))
+        out[ch] = names
+    return out
+
+def dedupe_existing_clips(ch_map: dict[int, ET.Element], chs=(1,2,3)):
+    for ch in chs:
+        t = ch_map.get(ch)
+        if t is None:
+            continue
+        slots = track_slot_list(t)
+        if not slots:
+            continue
+        seen = set()
+        for sl in slots:
+            nm = clip_name_from_slot(sl)
+            if not nm:
+                continue
+            key = norm_text(nm)
+            if key in seen:
+                remove_all_clips(sl)
+            else:
+                seen.add(key)
+
+def reorder_scene_rows(master_root: ET.Element, reference_track: Optional[ET.Element]):
+    sc = scenes_node(master_root)
+    scenes = list(sc.findall("./Scene"))
+    if not scenes or reference_track is None:
+        return
+    slots = track_slot_list(reference_track)
+    if not slots or len(slots) != len(scenes):
+        return
+
+    keys = []
+    for i, sl in enumerate(slots):
+        k = scene_sort_key_from_clipname(clip_name_from_slot(sl))
+        keys.append((i, k))
+
+    order = sorted(
+        range(len(scenes)),
+        key=lambda i: (0, keys[i][1]) if keys[i][1] is not None else (1, i)
+    )
+    if order == list(range(len(scenes))):
+        return
+
+    # Reorder Scenes
+    sc[:] = [scenes[i] for i in order]
+
+    # Reorder clip slots for all main tracks that match scene count
+    tp = tracks_parent(master_root)
+    if tp is None:
+        return
+    for t in list(tp):
+        if t.tag not in ("AudioTrack", "MidiTrack", "GroupTrack"):
+            continue
+        csl = main_csl(t)
+        if csl is None:
+            continue
+        slots = list(csl.findall("./ClipSlot"))
+        if len(slots) != len(scenes):
+            continue
+        csl[:] = [slots[i] for i in order]
+
+def scene_sort_key_from_track(t: Dict[str, Any]) -> Tuple[int, int, int, int, str]:
+    key_tuple = camelot_key_tuple(t["key"]) or (99, 9)
+    energy = t.get("energy") if t.get("energy") is not None else 999
+    return (t["bpm"], key_tuple[0], key_tuple[1], energy, norm_text(t["folder"]))
+
+def find_insert_index(sc: ET.Element, reference_track: Optional[ET.Element], new_key: Tuple[int, int, int, int, str]) -> int:
+    scenes = list(sc.findall("./Scene"))
+    parsed = []
+    if reference_track is not None:
+        csl = main_csl(reference_track)
+        if csl is not None:
+            slots = list(csl.findall("./ClipSlot"))
+            for i, sl in enumerate(slots[:len(scenes)]):
+                k = scene_sort_key_from_clipname(clip_name_from_slot(sl))
+                if k is not None:
+                    parsed.append((i, k))
+    if not parsed:
+        parsed = [(i, scene_sort_key_from_name(scene_label(s))) for i, s in enumerate(scenes)]
+        parsed = [(i, k) for i, k in parsed if k is not None]
+    if not parsed:
+        return len(scenes)
+    last_le = None
+    for i, k in parsed:
+        if k <= new_key:
+            last_le = i
+    if last_le is None:
+        return parsed[0][0]
+    return last_le + 1
+
+def make_blank_slot(mcsl: ET.Element) -> ET.Element:
+    prev = list(mcsl.findall("./ClipSlot"))
+    if prev:
+        slot = deep_copy(prev[-1]); remove_all_clips(slot)
+    else:
+        slot = ET.Element("ClipSlot")
+    slot.attrib["Id"] = str(next_attr_id(mcsl))
+    return slot
+
+def insert_scene(master_root: ET.Element,
+                 all_tracks: List[ET.Element],
                  ch_map: dict[int, ET.Element],
                  src_path: Path,
-                 scene_name: str):
+                 scene_name: str,
+                 insert_idx: int):
     sc = scenes_node(master_root)
 
     # New Scene node (attribute Id only)
     scene_id = next_attr_id(sc)
-    new_scene = ET.Element("Scene"); new_scene.attrib["Id"] = str(scene_id)
-    ET.SubElement(new_scene, "Name").attrib["Value"] = scene_name
-    sc.append(new_scene)
+    template_scene = sc.find("./Scene")
+    if template_scene is not None:
+        new_scene = deep_copy(template_scene)
+        new_scene.attrib["Id"] = str(scene_id)
+        nm = new_scene.find("./Name")
+        if nm is None:
+            nm = ET.SubElement(new_scene, "Name")
+        nm.attrib["Value"] = scene_name
+    else:
+        new_scene = ET.Element("Scene"); new_scene.attrib["Id"] = str(scene_id)
+        ET.SubElement(new_scene, "Name").attrib["Value"] = scene_name
+    sc.insert(insert_idx, new_scene)
 
     # Load source ALS and map source tracks
     try:
@@ -487,8 +690,13 @@ def append_scene(master_root: ET.Element,
     src_map = ch_tracks_map(sroot) if sroot is not None else {}
     if sroot is not None and not src_map:
         src_map = src_role_map(sroot)
+    if sroot is not None and not src_map:
+        src_map = src_order_map(sroot)
 
-    for ch_idx, dest_track in sorted(ch_map.items()):
+    ch_tracks = set(ch_map.values())
+    for dest_track in all_tracks:
+        if dest_track.tag == "ReturnTrack":
+            continue
         mcsl = main_csl(dest_track)
         if mcsl is None:
             dc = dest_track.find("./DeviceChain")
@@ -499,32 +707,34 @@ def append_scene(master_root: ET.Element,
                 ms = ET.SubElement(dc, "MainSequencer")
             mcsl = ET.SubElement(ms, "ClipSlotList")
 
-        src_track = src_map.get(ch_idx)
         new_slot = None
-        if src_track is not None:
-            src_slot = first_filled_slot(src_track)
-            if src_slot is not None:
-                new_slot = deep_copy(src_slot)
+        if dest_track in ch_tracks:
+            ch_idx = next((i for i, t in ch_map.items() if t is dest_track), None)
+            src_track = src_map.get(ch_idx) if ch_idx is not None else None
+            if src_track is not None:
+                src_slot = first_filled_slot(src_track)
+                if src_slot is not None:
+                    new_slot = deep_copy(src_slot)
 
         if new_slot is None:
-            prev = list(mcsl.findall("./ClipSlot"))
-            if prev:
-                new_slot = deep_copy(prev[-1]); remove_all_clips(new_slot)
-            else:
-                new_slot = ET.Element("ClipSlot")
+            new_slot = make_blank_slot(mcsl)
+        else:
+            new_slot.attrib["Id"] = str(next_attr_id(mcsl))
 
-        new_slot.attrib["Id"] = str(next_attr_id(mcsl))
-        mcsl.append(new_slot)
+        slots = list(mcsl.findall("./ClipSlot"))
+        if insert_idx >= len(slots):
+            mcsl.append(new_slot)
+        else:
+            mcsl.insert(insert_idx, new_slot)
 
         fcsl = freeze_csl(dest_track)
         if fcsl is not None:
-            fprev = list(fcsl.findall("./ClipSlot"))
-            if fprev:
-                fnew = deep_copy(fprev[-1]); remove_all_clips(fnew)
+            fnew = make_blank_slot(fcsl)
+            fslots = list(fcsl.findall("./ClipSlot"))
+            if insert_idx >= len(fslots):
+                fcsl.append(fnew)
             else:
-                fnew = ET.Element("ClipSlot")
-            fnew.attrib["Id"] = str(next_attr_id(fcsl))
-            fcsl.append(fnew)
+                fcsl.insert(insert_idx, fnew)
 
 def unique_save_path(directory: Path, base_name: str) -> Path:
     """
@@ -538,30 +748,36 @@ def unique_save_path(directory: Path, base_name: str) -> Path:
     stem, suf = os.path.splitext(base_name)
     return directory / f"{stem}_{ts}{suf}"
 
-def combine_in_order(chosen_tracks: List[Dict[str, Any]], base_als: Path, out_file: Path):
+def combine_in_order(chosen_tracks: List[Dict[str, Any]], base_als: Path, out_file: Path, insert_into_existing: bool = False):
     if not base_als.exists():
         print(f"[ERROR] Missing BASE_ALS: {base_als}")
         sys.exit(1)
 
     master_root = ET.fromstring(read_als_text(base_als))
 
-    # Keep only the FIRST CH tracks from base (prevents horizontal dupes)
     tp = tracks_parent(master_root)
     if tp is None:
         print("[ERROR] Base has no <Tracks>"); sys.exit(1)
-    first_for = {}
-    for t in list(tp):
-        idx = ch_index_from_label(track_label(t))
-        if idx and idx not in first_for: first_for[idx] = t
-    keep = set(first_for.values())
-    for t in list(tp):
-        if t not in keep: tp.remove(t)
+    if not insert_into_existing:
+        # Keep only the FIRST CH tracks from base (prevents horizontal dupes)
+        first_for = {}
+        for t in list(tp):
+            idx = ch_index_from_label(track_label(t))
+            if idx and idx not in first_for: first_for[idx] = t
+        keep = set(first_for.values())
+        for t in list(tp):
+            if t not in keep: tp.remove(t)
 
     ch_map = ch_tracks_map(master_root)
     if not ch_map:
         print("[ERROR] No CH tracks (CH1..CH4) in base"); sys.exit(1)
 
-    print(f"[INFO] Appending {len(chosen_tracks)} scene(s) in set order...")
+    all_tracks = [t for t in list(tp) if t.tag in ("AudioTrack","MidiTrack","GroupTrack")]
+    reference_track = ch_map.get(1) or ch_map.get(2) or ch_map.get(3) or ch_map.get(4)
+    dedupe_existing_clips(ch_map, chs=(1,2,3))
+    reorder_scene_rows(master_root, reference_track)
+    existing_names = existing_clip_names(ch_map, chs=(1,2,3))
+    print(f"[INFO] Inserting {len(chosen_tracks)} scene(s) into template...")
     for t in chosen_tracks:
         # Nice scene label: "BPM_KEY[_ENERGY]-TrackFolder"
         energy = t.get("energy")
@@ -569,7 +785,22 @@ def combine_in_order(chosen_tracks: List[Dict[str, Any]], base_als: Path, out_fi
             scene_name = f"{t['bpm']}_{t['key']}_{energy}-{t['folder']}"
         else:
             scene_name = f"{t['bpm']}_{t['key']}-{t['folder']}"
-        append_scene(master_root, ch_map, Path(t["src"]), scene_name)
+        src_names = source_clip_names(Path(t["src"]))
+        dup = False
+        for ch in (1,2,3):
+            nm = src_names.get(ch)
+            if nm and norm_text(nm) in existing_names.get(ch, set()):
+                dup = True
+                break
+        if dup:
+            print(f"[SKIP] Duplicate found, skipping: {scene_name}")
+            continue
+        insert_idx = find_insert_index(scenes_node(master_root), reference_track, scene_sort_key_from_track(t))
+        insert_scene(master_root, all_tracks, ch_map, Path(t["src"]), scene_name, insert_idx)
+        for ch in (1,2,3):
+            nm = src_names.get(ch)
+            if nm:
+                existing_names.setdefault(ch, set()).add(norm_text(nm))
 
     write_als_gz(out_file, master_root)
     print(f"[DONE] Wrote combined ALS → {out_file}")
@@ -606,9 +837,12 @@ def main():
     start_bpm = set_tracks[0]["bpm"]
     end_bpm   = set_tracks[-1]["bpm"]
 
-    # Final ALS path in Set_Festival, named by start-end BPM
-    final_als_name = f"{start_bpm}-{end_bpm}_Combined_CH_Scenes.als"
-    final_als_path = unique_save_path(OUTPUT_DIR, final_als_name)
+    # Final ALS path
+    if INJECT_INTO_EXISTING:
+        final_als_path = INJECT_ALS
+    else:
+        final_als_name = f"{start_bpm}-{end_bpm}_Combined_CH_Scenes.als"
+        final_als_path = unique_save_path(OUTPUT_DIR, final_als_name)
 
     # CSV log next to the ALS, same stem
     csv_path = final_als_path.with_suffix(".csv")
@@ -623,7 +857,8 @@ def main():
     print(f"[LOG] Wrote playlist CSV → {csv_path}")
 
     # Build the combined ALS directly from original CH1.als sources
-    combine_in_order(set_tracks, BASE_ALS, final_als_path)
+    base_als = INJECT_ALS if INJECT_INTO_EXISTING else BASE_ALS
+    combine_in_order(set_tracks, base_als, final_als_path, insert_into_existing=INJECT_INTO_EXISTING)
 
     print("\n✅ Done.")
     print(f"   Final ALS : {final_als_path}")
