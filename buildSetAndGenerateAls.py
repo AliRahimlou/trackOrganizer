@@ -35,7 +35,7 @@ BPM_RANGE_MAX     = 150
 # If True, ignore BPM/harmonic/energy settings and use all tracks in DATE_RANGE (by CH1.als mtime)
 USE_NEWEST_TRACKS = True
 # Required when USE_NEWEST_TRACKS=True. Format: "12-19-25--12-21-25" or "2025-12-19--2025-12-21"
-DATE_RANGE = "12-31-25--1-7-26"
+DATE_RANGE = "1-6-26--1-8-26"
 
 # strict → same key, ±1 (same letter), relative (A↔B)
 # energy → strict + energy boost/drop (±2, same letter)
@@ -562,25 +562,6 @@ def existing_clip_names(ch_map: dict[int, ET.Element], chs=(1,2,3)) -> Dict[int,
         out[ch] = names
     return out
 
-def dedupe_existing_clips(ch_map: dict[int, ET.Element], chs=(1,2,3)):
-    for ch in chs:
-        t = ch_map.get(ch)
-        if t is None:
-            continue
-        slots = track_slot_list(t)
-        if not slots:
-            continue
-        seen = set()
-        for sl in slots:
-            nm = clip_name_from_slot(sl)
-            if not nm:
-                continue
-            key = norm_text(nm)
-            if key in seen:
-                remove_all_clips(sl)
-            else:
-                seen.add(key)
-
 def reorder_scene_rows(master_root: ET.Element, reference_track: Optional[ET.Element]):
     sc = scenes_node(master_root)
     scenes = list(sc.findall("./Scene"))
@@ -774,8 +755,6 @@ def combine_in_order(chosen_tracks: List[Dict[str, Any]], base_als: Path, out_fi
 
     all_tracks = [t for t in list(tp) if t.tag in ("AudioTrack","MidiTrack","GroupTrack")]
     reference_track = ch_map.get(1) or ch_map.get(2) or ch_map.get(3) or ch_map.get(4)
-    dedupe_existing_clips(ch_map, chs=(1,2,3))
-    reorder_scene_rows(master_root, reference_track)
     existing_names = existing_clip_names(ch_map, chs=(1,2,3))
     print(f"[INFO] Inserting {len(chosen_tracks)} scene(s) into template...")
     for t in chosen_tracks:
