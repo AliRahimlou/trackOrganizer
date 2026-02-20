@@ -42,7 +42,7 @@ htdemucs_source_folder   = "/Users/alirahimlou/Desktop/MUSIC/STEMS/toBeOrganized
 destination_folder       = "/Users/alirahimlou/Desktop/STEMS2"
 ALS_FILES_FOLDER         = "alsFiles"  # folder containing <BPM>.als templates
 FLAC_FOLDER              = destination_folder
-SKIP_EXISTING            = False   # when False, force-regenerate ALS for every track folder
+SKIP_EXISTING            = True   # when False, force-regenerate ALS for every track folder
 RENAME_TRACKS            = True
 ONE_TIME_UNDO_RENAME     = False  # revert "Title - Artist" back to "Artist - Title" in destination_folder
 DROP_ANCHOR_OFFSET_SEC   = 0.0    # manual nudge for drop anchor (negative = earlier, positive = later)
@@ -70,6 +70,17 @@ ALSDROP_REQUIRE_MODEL_SELECTION = str(os.environ.get("ALSDROP_REQUIRE_MODEL_SELE
 ALSDROP_ALLOW_SAFE_FALLBACK = str(os.environ.get("ALSDROP_ALLOW_SAFE_FALLBACK", "0")).strip().lower() in {"1", "true", "yes", "on"}
 ALSDROP_SAFE_FALLBACK_MIN_CONF = float(os.environ.get("ALSDROP_SAFE_FALLBACK_MIN_CONF", "0.88"))
 ALSDROP_SAFE_FALLBACK_MIN_MARGIN = float(os.environ.get("ALSDROP_SAFE_FALLBACK_MIN_MARGIN", "0.08"))
+
+# ===== Stage-2 Micro Tuning Controls (edit these directly) =====
+DROP_STAGE2_ENABLE = True
+DROP_STAGE2_ATTACK_NUDGE_ENABLE = False
+DROP_STAGE2_MAX_SHIFT_BEATS = 0.38
+DROP_STAGE2_MIN_SHIFT_SEC = 0.008
+DROP_STAGE2_FIXED_LATE_SEC = 0.0008
+# By default we do not alter anchors learned from manual cues / DB labels.
+DROP_STAGE2_APPLY_ON_DB_ANCHOR = False
+DROP_STAGE2_APPLY_ON_MANUAL_ANCHOR = False
+DROP_STAGE2_VERBOSE = True
 
 AUDIO_EXTS = (".mp3", ".flac", ".wav", ".aiff", ".aif", ".m4a", ".mp4")
 STEM_AUDIO_EXTS = (".flac", ".wav", ".aiff", ".aif", ".mp3")
@@ -726,6 +737,17 @@ def _detect_drop_anchor_sec(drums_path: str, bpm: int) -> Tuple[Optional[float],
                 if nudged > float(sec) + 1e-6:
                     out_meta["wavefront_nudge_sec"] = float(nudged - float(sec))
                     sec = float(nudged)
+                if bool(DROP_STAGE2_ENABLE) and bool(DROP_STAGE2_ATTACK_NUDGE_ENABLE):
+                    micro = _micro_nudge_to_attack(
+                        y_cached,
+                        int(sr_cached),
+                        float(sec),
+                        int(bpm),
+                        max_shift_beats=float(DROP_STAGE2_MAX_SHIFT_BEATS),
+                    )
+                    if micro > float(sec) + float(DROP_STAGE2_MIN_SHIFT_SEC):
+                        out_meta["stage2_micro_nudge_sec"] = float(micro - float(sec))
+                        sec = float(micro)
         except Exception:
             pass
         return float(sec), out_meta
@@ -1423,6 +1445,102 @@ def _nudge_anchor_to_wavefront(y, sr: int, anchor_sec: float, bpm: int) -> float
     if shift <= 0.002:  # <=2ms is negligible
         return float(anchor_sec)
     if shift > (0.45 * beat_sec):
+        return float(anchor_sec)
+    return float(refined)
+
+def _micro_nudge_to_attack(y, sr: int, anchor_sec: float, bpm: int, max_shift_beats: float = 0.38) -> float:
+    """
+    Stage-2 micro alignment (optional):
+    move a slightly-early anchor to the first sustained attack just after anchor.
+    This keeps movement tiny and forward-only for DJ-safe cue behavior.
+    """
+    if np is None or y is None or len(y) < 64 or sr <= 0 or bpm <= 0:
+        return float(anchor_sec)
+
+    beat_sec = 60.0 / max(1.0, float(bpm))
+    max_shift_sec = max(0.0, float(max_shift_beats)) * beat_sec
+    max_shift_sec = min(max_shift_sec, 0.45 * beat_sec)
+    if max_shift_sec <= 0.0:
+        return float(anchor_sec)
+
+    i_anchor = int(round(float(anchor_sec) * float(sr)))
+    if i_anchor <= 1 or i_anchor >= (len(y) - 2):
+        return float(anchor_sec)
+
+    pre_sec = 0.35 * beat_sec
+    i0 = max(2, int(round((float(anchor_sec) - pre_sec) * float(sr))))
+    i1 = min(len(y) - 3, int(round((float(anchor_sec) + max_shift_sec) * float(sr))))
+    if i1 <= i_anchor + 2:
+        return float(anchor_sec)
+
+    env = np.abs(y).astype(np.float32, copy=False)
+    smooth = max(1, int(round(0.0025 * sr)))  # ~2.5ms
+    if smooth > 1:
+        ker = np.ones(smooth, dtype=np.float32) / float(smooth)
+        env = np.convolve(env, ker, mode="same").astype(np.float32, copy=False)
+
+    pre = env[i0:i_anchor]
+    post = env[i_anchor:i1 + 1]
+    if len(pre) < 16 or len(post) < 16:
+        return float(anchor_sec)
+
+    pre_med = float(np.percentile(pre, 60.0))
+    pre_p90 = float(np.percentile(pre, 90.0))
+    post_p98 = float(np.percentile(post, 98.0))
+    # Require a meaningful entry after anchor.
+    if post_p98 <= (pre_p90 * 1.05 + 1e-9):
+        return float(anchor_sec)
+
+    dyn = max(1e-9, post_p98 - pre_med)
+    env_thr = pre_med + (0.04 * dyn)
+    rise = np.maximum(0.0, np.diff(env, prepend=env[0])).astype(np.float32, copy=False)
+    rise_post = rise[i_anchor:i1 + 1]
+    if rise_post.size == 0:
+        return float(anchor_sec)
+    rise_thr = max(float(np.percentile(rise_post, 65.0)) * 0.45, float(np.mean(rise_post)) * 0.90)
+
+    hold = max(1, int(round(0.003 * sr)))  # ~3ms
+    sustain = max(1, int(round(0.035 * sr)))  # ~35ms
+
+    best_i = None
+    for i in range(i_anchor + 1, i1 - max(hold, sustain)):
+        if env[i] < env_thr:
+            continue
+        if rise[i] < rise_thr:
+            continue
+        if np.min(env[i:i + hold]) < env_thr:
+            continue
+        # Keep entries where energy does not immediately collapse.
+        early = float(np.mean(env[i:i + sustain]))
+        late = float(np.mean(env[i + hold:i + hold + sustain]))
+        if late < (0.72 * early):
+            continue
+        best_i = i
+        break
+
+    # Fallback for very subtle entries: small but clear rise from anchor level.
+    if best_i is None:
+        anchor_e = float(env[i_anchor])
+        subtle_thr = max(anchor_e * 1.08, pre_med + (0.03 * dyn))
+        subtle_hold = max(1, int(round(0.020 * sr)))  # ~20ms
+        for i in range(i_anchor + 1, i1 - subtle_hold):
+            if rise[i] <= 0.0:
+                continue
+            if env[i] < subtle_thr:
+                continue
+            if float(np.mean(env[i:i + subtle_hold])) < (anchor_e * 1.05):
+                continue
+            best_i = i
+            break
+
+    if best_i is None:
+        return float(anchor_sec)
+
+    refined = float(best_i) / float(sr)
+    shift = refined - float(anchor_sec)
+    if shift <= float(DROP_STAGE2_MIN_SHIFT_SEC):
+        return float(anchor_sec)
+    if shift > max_shift_sec:
         return float(anchor_sec)
     return float(refined)
 
@@ -2205,6 +2323,14 @@ def modify_als_file(input_path: Optional[str], target_folder: str, track_names: 
         return
 
     print(f"\n🎯 Creating/Updating ALS for {target_folder} (BPM {bpm_value})")
+    if bool(DROP_STAGE2_ENABLE) and bool(DROP_STAGE2_VERBOSE):
+        print(
+            f"[WARP] Stage2 active: attack_nudge={bool(DROP_STAGE2_ATTACK_NUDGE_ENABLE)}, "
+            f"max_shift_beats={float(DROP_STAGE2_MAX_SHIFT_BEATS):.2f}, "
+            f"fixed_late={float(DROP_STAGE2_FIXED_LATE_SEC):.3f}s, "
+            f"apply_db={bool(DROP_STAGE2_APPLY_ON_DB_ANCHOR)}, "
+            f"apply_manual={bool(DROP_STAGE2_APPLY_ON_MANUAL_ANCHOR)}"
+        )
 
     new_loop_end = None
     drop_sec = None
@@ -2284,6 +2410,25 @@ def modify_als_file(input_path: Optional[str], target_folder: str, track_names: 
                             drop_conf = max(float(drop_conf), min(0.95, 0.55 + (0.35 * float(ml_conf))))
 
     if bpm_value and drop_sec is not None:
+        if bool(DROP_STAGE2_ENABLE):
+            allow_db = bool(DROP_STAGE2_APPLY_ON_DB_ANCHOR)
+            allow_manual = bool(DROP_STAGE2_APPLY_ON_MANUAL_ANCHOR)
+            blocked = (used_db_anchor and (not allow_db)) or (used_manual_anchor and (not allow_manual))
+            if blocked:
+                if bool(DROP_STAGE2_VERBOSE):
+                    src = "db" if used_db_anchor else "manual"
+                    print(f"[WARP] Stage2 fixed late skipped (source={src}).")
+            else:
+                fixed_late = max(0.0, float(DROP_STAGE2_FIXED_LATE_SEC))
+                if fixed_late > 0.0 and bpm_value > 0:
+                    beat_sec = 60.0 / float(max(1, bpm_value))
+                    max_push = min(0.18 * beat_sec, 0.060)  # keep this strictly micro
+                    push = min(fixed_late, max_push)
+                    if push > 0.0:
+                        drop_sec = max(0.0, float(drop_sec) + float(push))
+                        drop_meta["stage2_fixed_late_sec"] = float(push)
+                        if bool(DROP_STAGE2_VERBOSE):
+                            print(f"[WARP] Stage2 fixed late shift: +{push:.3f}s")
         off = _drop_anchor_offset_for_track(target_folder)
         if off:
             drop_sec = max(0.0, float(drop_sec) + off)
