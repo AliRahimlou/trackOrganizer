@@ -1,0 +1,66 @@
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Python caches / envs
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+.coverage
+.coverage.*
+htmlcov/
+.venv/
+venv/
+venv311/
+
+# Local logs/temp
+*.log
+*.tmp
+*.swp
+
+# Large local media (do not push)
+*.wav
+*.flac
+*.mp3
+*.aiff
+*.aif
+*.m4a
+*.mp4
+*.asd
+
+# Large local Ableton/project files (do not push training source sets)
+*.als
+!alsFiles/*.als
+
+# Local ML artifacts
+*.pt
+*.pth
+*.onnx
+*.npz
+*.npy
+
+# Project-generated databases/state
+drop_marker_db.json
+drop_self_learning_model.json
+
+# ALSDrop generated assets (keep source code under alsdrop/)
+alsdrop/data/
+alsdrop/models/
+alsdrop/outputs/
+alsdrop_review_queue.jsonl
+alsdrop_review_queue.csv
+
+# Legacy als_detector generated artifacts (keep source code)
+als_detector/data/
+als_detector/models/
+als_detector/outputs/
+
+# Optional local helper binaries
+bin/

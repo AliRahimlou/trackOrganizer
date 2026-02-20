@@ -1,0 +1,8 @@
+librosa>=0.10.2
+numpy>=1.26
+torch>=2.2
+mutagen>=1.47
+# Optional downbeat model:
+# madmom>=0.16.1
+# Optional plotting:
+# matplotlib>=3.8

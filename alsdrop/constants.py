@@ -1,0 +1,20 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+from __future__ import annotations
+
+AUDIO_EXTS = {".wav", ".flac", ".aiff", ".aif", ".mp3", ".m4a", ".ogg"}
+DEFAULT_SR = 22050
+DEFAULT_HOP = 256  # ~11.6 ms @ 22.05kHz
+DEFAULT_MELS = 96
+DEFAULT_LONG_LEFT_SEC = 16.0
+DEFAULT_LONG_RIGHT_SEC = 8.0
+DEFAULT_SHORT_LEFT_SEC = 2.0
+DEFAULT_SHORT_RIGHT_SEC = 2.0
+DEFAULT_MAX_OFFSET_SEC = 0.150
+DEFAULT_SEED = 42
+
+FEATURE_VERSION = 2
+CANDIDATE_VERSION = 2
+DATASET_VERSION = 2
+MODEL_VERSION = 2

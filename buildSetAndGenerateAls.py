@@ -35,7 +35,11 @@ BPM_RANGE_MAX     = 150
 # If True, ignore BPM/harmonic/energy settings and use all tracks in DATE_RANGE (by CH1.als mtime)
 USE_NEWEST_TRACKS = True
 # Required when USE_NEWEST_TRACKS=True. Format: "12-19-25--12-21-25" or "2025-12-19--2025-12-21"
-DATE_RANGE = "1-6-26--1-8-26"
+DATE_RANGE = "2-14-26--2-18-26"
+# If True, rename "Artist - Title" to "Title - Artist" in scene/clip names
+RENAME_TRACKS = False
+# If True, duplicate tracks found in the target ALS are replaced instead of skipped
+OVERWRITE_DUPLICATES = True
 
 # strict → same key, ±1 (same letter), relative (A↔B)
 # energy → strict + energy boost/drop (±2, same letter)
@@ -92,6 +96,7 @@ CAMELOT_RE = re.compile(r'^(\d{1,2})([ABab])$')
 # stems like: drums_80_2A_5-Artist - Title.flac (role may be drums/inst/vocals)
 STEM_RE    = re.compile(r'^(drums|inst|vocals)_(\d+)_(\d+[ABab])_(\d+)-', re.IGNORECASE)
 SCENE_SORT_RE = re.compile(r'^\s*(\d{2,3})\s*[_-]\s*([0-9]{1,2}[ABab])(?:[_-](\d{1,2}))?')
+SCENE_PREFIX_RE = re.compile(r'^(\d{2,3}_[0-9]{1,2}[ABab](?:_\d{1,2})?)-(.*)$')
 
 def norm_text(s: str) -> str:
     s = s.lower()
@@ -107,6 +112,53 @@ def norm_title_from_folder(folder: str) -> str:
     base = re.sub(r'\b(feat|ft|with)\b.*', '', base, flags=re.I)
     base = re.sub(r'\b\d{2}\b', '', base)  # drop "01 " etc
     return norm_text(base)
+
+def swap_artist_title(text: str) -> str:
+    if not text:
+        return text
+    parts = [p.strip() for p in text.split(" - ", 1)]
+    if len(parts) == 2 and parts[0] and parts[1]:
+        return f"{parts[1]} - {parts[0]}"
+    return text
+
+def rename_clip_title(name: str) -> str:
+    if not name:
+        return name
+    m = STEM_RE.match(name)
+    if not m:
+        return swap_artist_title(name)
+    role, bpm_str, key_str, energy_str = m.groups()
+    prefix = f"{role}_{bpm_str}_{key_str}_{energy_str}-"
+    if not name.startswith(prefix):
+        return swap_artist_title(name)
+    folder = name[len(prefix):]
+    return f"{prefix}{swap_artist_title(folder)}"
+
+def rename_scene_title(name: str) -> str:
+    if not name:
+        return name
+    m = SCENE_PREFIX_RE.match(name)
+    if not m:
+        return swap_artist_title(name)
+    prefix, folder = m.groups()
+    return f"{prefix}-{swap_artist_title(folder)}"
+
+def rename_all_clip_titles(root: ET.Element):
+    tp = tracks_parent(root)
+    if tp is None:
+        return
+    for t in list(tp):
+        if t.tag not in ("AudioTrack", "MidiTrack", "GroupTrack"):
+            continue
+        csl = main_csl(t)
+        if csl is None:
+            continue
+        for sl in csl.findall("./ClipSlot"):
+            for el in sl.iter():
+                if el.tag != "ClipSlot" and el.tag.endswith("Clip"):
+                    nm = el.find("./Name")
+                    if nm is not None and nm.attrib.get("Value"):
+                        nm.attrib["Value"] = rename_clip_title(nm.attrib["Value"])
 
 def guess_artist(folder: str) -> str:
     base = Path(folder).name
@@ -512,6 +564,71 @@ def clip_name_from_slot(slot: ET.Element) -> str:
                 return nm.attrib["Value"]
     return ""
 
+def parse_clip_name(name: str) -> Optional[Dict[str, Any]]:
+    m = STEM_RE.match(name or "")
+    if not m:
+        return None
+    role, bpm_str, key_str, energy_str = m.groups()
+    prefix = f"{role}_{bpm_str}_{key_str}_{energy_str}-"
+    if not name.startswith(prefix):
+        return None
+    folder = name[len(prefix):]
+    return {
+        "role": role.lower(),
+        "bpm": int(bpm_str),
+        "key": key_str.upper(),
+        "energy": int(energy_str),
+        "folder": folder,
+    }
+
+def row_track_ids(ch_map: dict[int, ET.Element], row_idx: int) -> Set[Tuple[int, str, int, str]]:
+    ids = set()
+    for ch in (1, 2, 3):
+        t = ch_map.get(ch)
+        if t is None:
+            continue
+        csl = main_csl(t)
+        if csl is None:
+            continue
+        slots = csl.findall("./ClipSlot")
+        if row_idx >= len(slots):
+            continue
+        nm = clip_name_from_slot(slots[row_idx])
+        info = parse_clip_name(nm)
+        if info:
+            ids.add((info["bpm"], info["key"], info["energy"], info["folder"]))
+    return ids
+
+def locked_row_blocks(ch_map: dict[int, ET.Element]) -> List[Tuple[int, int]]:
+    # Group consecutive rows that share any track id with the previous row.
+    # This preserves stacked/section rows like CH2-only variations.
+    csl = main_csl(ch_map.get(1)) or main_csl(ch_map.get(2)) or main_csl(ch_map.get(3))
+    if csl is None:
+        return []
+    total = len(csl.findall("./ClipSlot"))
+    blocks = []
+    start = 0
+    prev_ids = set()
+    for i in range(total):
+        ids = row_track_ids(ch_map, i)
+        if i == 0:
+            prev_ids = ids
+            continue
+        if ids and prev_ids and ids.intersection(prev_ids):
+            prev_ids = ids
+            continue
+        blocks.append((start, i - 1))
+        start = i
+        prev_ids = ids
+    blocks.append((start, total - 1))
+    return blocks
+
+def adjust_insert_index_for_blocks(insert_idx: int, blocks: List[Tuple[int, int]]) -> int:
+    for start, end in blocks:
+        if start < insert_idx <= end:
+            return end + 1
+    return insert_idx
+
 def scene_sort_key_from_clipname(name: str) -> Optional[Tuple[int, int, int, int, str]]:
     m = STEM_RE.match(name or "")
     if not m: return None
@@ -561,6 +678,57 @@ def existing_clip_names(ch_map: dict[int, ET.Element], chs=(1,2,3)) -> Dict[int,
                 names.add(norm_text(nm))
         out[ch] = names
     return out
+
+def duplicate_row_indices(ch_map: dict[int, ET.Element],
+                          src_names: Dict[int, str],
+                          chs=(1,2,3)) -> List[int]:
+    wanted = {ch: norm_text(nm) for ch, nm in src_names.items() if ch in chs and nm}
+    if not wanted:
+        return []
+
+    slot_lists: Dict[int, List[ET.Element]] = {}
+    max_rows = 0
+    for ch in chs:
+        t = ch_map.get(ch)
+        if t is None:
+            continue
+        slots = track_slot_list(t) or []
+        slot_lists[ch] = slots
+        if len(slots) > max_rows:
+            max_rows = len(slots)
+
+    matches: List[int] = []
+    for i in range(max_rows):
+        for ch, wanted_name in wanted.items():
+            slots = slot_lists.get(ch, [])
+            if i >= len(slots):
+                continue
+            existing = clip_name_from_slot(slots[i])
+            if existing and norm_text(existing) == wanted_name:
+                matches.append(i)
+                break
+
+    return sorted(set(matches))
+
+def remove_scene_row(master_root: ET.Element, row_idx: int):
+    sc = scenes_node(master_root)
+    scenes = list(sc.findall("./Scene"))
+    if 0 <= row_idx < len(scenes):
+        sc.remove(scenes[row_idx])
+
+    tp = tracks_parent(master_root)
+    if tp is None:
+        return
+    for t in list(tp):
+        if t.tag not in ("AudioTrack", "MidiTrack", "GroupTrack"):
+            continue
+        for csl_fn in (main_csl, freeze_csl):
+            csl = csl_fn(t)
+            if csl is None:
+                continue
+            slots = list(csl.findall("./ClipSlot"))
+            if 0 <= row_idx < len(slots):
+                csl.remove(slots[row_idx])
 
 def reorder_scene_rows(master_root: ET.Element, reference_track: Optional[ET.Element]):
     sc = scenes_node(master_root)
@@ -701,6 +869,12 @@ def insert_scene(master_root: ET.Element,
             new_slot = make_blank_slot(mcsl)
         else:
             new_slot.attrib["Id"] = str(next_attr_id(mcsl))
+            if RENAME_TRACKS:
+                for el in new_slot.iter():
+                    if el.tag != "ClipSlot" and el.tag.endswith("Clip"):
+                        nm = el.find("./Name")
+                        if nm is not None and nm.attrib.get("Value"):
+                            nm.attrib["Value"] = rename_clip_title(nm.attrib["Value"])
 
         slots = list(mcsl.findall("./ClipSlot"))
         if insert_idx >= len(slots):
@@ -755,31 +929,35 @@ def combine_in_order(chosen_tracks: List[Dict[str, Any]], base_als: Path, out_fi
 
     all_tracks = [t for t in list(tp) if t.tag in ("AudioTrack","MidiTrack","GroupTrack")]
     reference_track = ch_map.get(1) or ch_map.get(2) or ch_map.get(3) or ch_map.get(4)
-    existing_names = existing_clip_names(ch_map, chs=(1,2,3))
     print(f"[INFO] Inserting {len(chosen_tracks)} scene(s) into template...")
     for t in chosen_tracks:
         # Nice scene label: "BPM_KEY[_ENERGY]-TrackFolder"
         energy = t.get("energy")
+        folder_name = swap_artist_title(t["folder"]) if RENAME_TRACKS else t["folder"]
         if energy is not None:
-            scene_name = f"{t['bpm']}_{t['key']}_{energy}-{t['folder']}"
+            scene_name = f"{t['bpm']}_{t['key']}_{energy}-{folder_name}"
         else:
-            scene_name = f"{t['bpm']}_{t['key']}-{t['folder']}"
+            scene_name = f"{t['bpm']}_{t['key']}-{folder_name}"
         src_names = source_clip_names(Path(t["src"]))
-        dup = False
-        for ch in (1,2,3):
-            nm = src_names.get(ch)
-            if nm and norm_text(nm) in existing_names.get(ch, set()):
-                dup = True
-                break
-        if dup:
+        dup_rows = duplicate_row_indices(ch_map, src_names, chs=(1,2,3))
+        if dup_rows and not OVERWRITE_DUPLICATES:
             print(f"[SKIP] Duplicate found, skipping: {scene_name}")
             continue
+        if dup_rows and OVERWRITE_DUPLICATES:
+            for row_idx in reversed(dup_rows):
+                remove_scene_row(master_root, row_idx)
+            print(f"[OVERWRITE] Replacing {len(dup_rows)} duplicate row(s): {scene_name}")
         insert_idx = find_insert_index(scenes_node(master_root), reference_track, scene_sort_key_from_track(t))
+        insert_idx = adjust_insert_index_for_blocks(insert_idx, locked_row_blocks(ch_map))
         insert_scene(master_root, all_tracks, ch_map, Path(t["src"]), scene_name, insert_idx)
-        for ch in (1,2,3):
-            nm = src_names.get(ch)
-            if nm:
-                existing_names.setdefault(ch, set()).add(norm_text(nm))
+
+    if RENAME_TRACKS:
+        sc = scenes_node(master_root)
+        for scene in sc.findall("./Scene"):
+            nm = scene.find("./Name")
+            if nm is not None and nm.attrib.get("Value"):
+                nm.attrib["Value"] = rename_scene_title(nm.attrib["Value"])
+        rename_all_clip_titles(master_root)
 
     write_als_gz(out_file, master_root)
     print(f"[DONE] Wrote combined ALS → {out_file}")
