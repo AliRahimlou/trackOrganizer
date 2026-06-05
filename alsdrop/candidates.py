@@ -21,8 +21,25 @@ def _require_librosa():
     return librosa
 
 
+def _patch_legacy_madmom_runtime() -> None:
+    """Keep madmom 0.16 usable on modern Python/NumPy runtimes."""
+    try:
+        import collections
+        import collections.abc
+
+        for name in ("MutableSequence", "MutableMapping", "Mapping", "Sequence", "Iterable"):
+            if not hasattr(collections, name):
+                setattr(collections, name, getattr(collections.abc, name))
+    except Exception:
+        pass
+    for name, value in {"float": float, "int": int, "complex": complex}.items():
+        if not hasattr(np, name):
+            setattr(np, name, value)
+
+
 def _madmom_downbeats(audio_path: str) -> Tuple[np.ndarray, np.ndarray]:
     try:
+        _patch_legacy_madmom_runtime()
         from madmom.features.downbeats import DBNDownBeatTrackingProcessor, RNNDownBeatProcessor  # type: ignore
     except Exception:
         return np.asarray([], dtype=np.float32), np.asarray([], dtype=np.float32)

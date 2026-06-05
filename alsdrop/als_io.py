@@ -396,9 +396,42 @@ def rewrite_clip_warp_markers(
     iw.set("Value", "true")
 
     end_beat = (dur - target) * beat_per_sec
-    for tag in ("LoopEnd", "OutMarker"):
-        for n in clip.iter(tag):
-            n.set("Value", f"{end_beat:.6f}")
+    phase = -target * beat_per_sec
+    current_start = clip.find("CurrentStart")
+    if current_start is not None:
+        current_start.set("Value", "0")
+    current_end = clip.find("CurrentEnd")
+    if current_end is not None:
+        current_end.set("Value", f"{end_beat:.6f}")
+
+    loop = clip.find("Loop")
+    if loop is not None:
+        for tag, value in (
+            ("LoopStart", 0.0),
+            ("LoopEnd", end_beat),
+            ("OutMarker", end_beat),
+            ("HiddenLoopStart", phase),
+            ("HiddenLoopEnd", phase + 4.0),
+        ):
+            node = loop.find(tag)
+            if node is not None:
+                node.set("Value", f"{float(value):.6f}")
+
+    scroller = clip.find("ScrollerTimePreserver")
+    if scroller is not None:
+        left = scroller.find("LeftTime")
+        if left is not None:
+            left.set("Value", f"{phase:.6f}")
+        right = scroller.find("RightTime")
+        if right is not None:
+            right.set("Value", f"{end_beat:.6f}")
+
+    selection = clip.find("TimeSelection")
+    if selection is not None:
+        for tag in ("AnchorTime", "OtherTime"):
+            node = selection.find(tag)
+            if node is not None:
+                node.set("Value", f"{phase:.6f}")
 
 
 def collect_list_ids(root: ET.Element) -> List[str]:

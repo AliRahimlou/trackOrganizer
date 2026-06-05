@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#f6f7f9" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-title" content="Drop Review" />
+    <title>Drop Aligner Review</title>
+  <link rel="stylesheet" href="/static/style.css?v=historical-regression-20260602b" />
+  </head>
+  <body>
+    <main class="app">
+      <section class="leftPane">
+        <div class="topBar">
+          <div>
+            <h1 id="trackName">Drop Review</h1>
+            <div id="trackPath" class="path"></div>
+          </div>
+          <div id="queueStats" class="queueStats"></div>
+        </div>
+
+        <div class="waveShell">
+          <div id="waveWrapper" class="waveWrapper">
+            <canvas id="waveCanvas"></canvas>
+            <div id="waveOverlay" class="waveOverlay"></div>
+            <div id="waveControlsOverlay" class="waveControlsOverlay"></div>
+          </div>
+        </div>
+
+        <section class="reviewFocus">
+          <div class="panelHeader">
+            <h2>Top candidates</h2>
+            <span class="muted">Tap a number, then tap Save.</span>
+          </div>
+          <ol id="candidateList" class="candidateList"></ol>
+          <details id="debugDetails" class="debugDetails">
+            <summary>Debug PNG</summary>
+            <div class="debugWrap">
+              <img id="debugImage" alt="Debug plot" />
+              <div id="debugMissing" class="empty">No debug PNG for this track.</div>
+            </div>
+          </details>
+        </section>
+
+        <div class="playRow">
+          <button id="playViewBtn" class="secondary">Play zoom</button>
+          <button id="playMarkerBtn" class="secondary">Play marker</button>
+          <button id="stopBtn" class="secondary">Stop</button>
+          <button id="fullTrackBtn" class="secondary">Whole track</button>
+          <button id="aiWindowBtn" class="secondary active">AI window</button>
+          <button class="secondary presetBtn" data-preset="5s">+-5s</button>
+          <button class="secondary presetBtn" data-preset="500ms">+-500ms</button>
+          <button class="secondary presetBtn" data-preset="50ms">+-50ms</button>
+          <button class="secondary presetBtn" data-preset="5ms">+-5ms</button>
+          <button class="secondary presetBtn" data-preset="1ms">+-1ms</button>
+          <button id="jumpAiBtn" class="secondary">Jump to AI</button>
+          <button id="exportPngBtn" class="secondary">Export PNG</button>
+          <span id="audioStatus" class="muted"></span>
+          <span id="playStatus" class="muted"></span>
+        </div>
+        <div class="transportRow">
+          <span id="playTime" class="muted">--</span>
+          <input id="playSeek" type="range" min="0" max="1" step="0.001" value="0" disabled />
+          <span id="playClip" class="muted">no clip loaded</span>
+        </div>
+        <div class="zoomRow">
+          <button id="zoomOutBtn" class="secondary">Zoom out</button>
+          <input id="zoomSlider" type="range" min="0" max="120000" step="1" value="0" />
+          <button id="zoomInBtn" class="secondary">Zoom in</button>
+          <button id="zoomResetBtn" class="secondary">Reset zoom</button>
+          <div class="waveModeGroup" aria-label="Waveform visual mode">
+            <button id="rmsWaveBtn" class="secondary active" type="button">RMS</button>
+            <button id="peakWaveBtn" class="secondary" type="button">Peaks</button>
+          </div>
+          <span id="zoomLabel" class="muted">Fit</span>
+        </div>
+
+      </section>
+
+      <aside class="sidePane">
+        <div class="buttons">
+          <div class="acceptActions">
+            <button id="approveBtn" class="primary markerAccept ai">ACCEPT AI MARKER</button>
+            <button id="acceptKneeBtn" class="secondary markerAccept knee disabled">ACCEPT KNEE MARKER</button>
+            <button id="saveCorrectionBtn" class="primary disabled">SAVE PLACED</button>
+          </div>
+          <div class="toolActions">
+            <button id="placeBtn" class="secondary">PLACE MANUAL</button>
+            <button id="aiAutoPlaceBtn" class="secondary">AI AUTO PLACE</button>
+            <button id="aiRefineBtn" class="secondary">AI REFINE</button>
+            <button id="clearMarkerBtn" class="secondary disabled">CLEAR</button>
+            <button id="skipBtn" class="secondary">SKIP</button>
+            <button id="wavePlayBtn" class="wavePlayButton" type="button" aria-label="Play or pause">PLAY</button>
+          </div>
+          <div id="quickStatus" class="quickStatus" role="status" aria-live="polite"></div>
+        </div>
+
+        <details id="detailPanel" class="detailPanel">
+          <summary>Review details</summary>
+          <div class="meta">
+            <div class="metric">
+              <span>AI marker</span>
+              <strong id="aiPick">--</strong>
+            </div>
+            <div class="metric">
+              <span>Confidence</span>
+              <strong><span id="confidenceTier" class="tier">--</span> <span id="confidenceScore"></span></strong>
+            </div>
+            <div class="metric">
+              <span>Selected by</span>
+              <strong id="selectedBy">--</strong>
+            </div>
+            <div class="metric stacked">
+              <span>Beatgrid</span>
+              <strong id="structureBeatgrid">--</strong>
+            </div>
+            <div class="metric">
+              <span>First drop</span>
+              <strong id="structureFirstDrop">--</strong>
+            </div>
+            <div class="metric">
+              <span>Second drop</span>
+              <strong id="structureSecondDrop">--</strong>
+            </div>
+            <div class="metric">
+              <span>Full groove</span>
+              <strong id="fullGrooveScore">--</strong>
+            </div>
+            <div class="metric">
+              <span>Immediate groove</span>
+              <strong id="immediateGrooveScore">--</strong>
+            </div>
+            <div class="metric">
+              <span>Groove stability</span>
+              <strong id="grooveStability">--</strong>
+            </div>
+            <div class="metric">
+              <span>Pre-drop contrast</span>
+              <strong id="preDropContrast">--</strong>
+            </div>
+            <div class="metric">
+              <span>DrumPrint score</span>
+              <strong id="drumprintScore">--</strong>
+            </div>
+            <div class="metric">
+              <span>Pattern stability</span>
+              <strong id="patternStability">--</strong>
+            </div>
+            <div class="metric">
+              <span>Fake hit penalty</span>
+              <strong id="fakeHitPenalty">--</strong>
+            </div>
+            <div class="metric">
+              <span>Later match</span>
+              <strong id="laterMatchScore">--</strong>
+            </div>
+            <div class="metric">
+              <span>Knee marker</span>
+              <strong id="microMarker">none</strong>
+            </div>
+            <div class="metric">
+              <span>Snap offset</span>
+              <strong id="microOffset">--</strong>
+            </div>
+            <div class="metric">
+              <span>Micro confidence</span>
+              <strong id="microConfidence">--</strong>
+            </div>
+            <div class="metric">
+              <span>Attack clean</span>
+              <strong id="attackCleanliness">--</strong>
+            </div>
+            <div class="metric">
+              <span>Zero crossing</span>
+              <strong id="zeroCrossingQuality">--</strong>
+            </div>
+            <div class="metric">
+              <span>Auto Accept Eligible</span>
+              <strong><span id="autoAcceptBadge" class="autoBadge review">--</span></strong>
+            </div>
+            <div class="metric stacked">
+              <span>Gate reason</span>
+              <strong id="autoAcceptReason">--</strong>
+            </div>
+            <div class="metric stacked">
+              <span>Risk flags</span>
+              <strong id="autoAcceptRisks">--</strong>
+            </div>
+            <div class="metric">
+              <span>Corrected marker</span>
+              <strong id="userPick">none</strong>
+            </div>
+          </div>
+
+          <button id="retrainBtn" class="wide">RETRAIN NOW</button>
+          <pre id="statusBox" class="statusBox"></pre>
+        </details>
+      </aside>
+    </main>
+  <script src="/static/app.js?v=historical-regression-20260602b"></script>
+  </body>
+</html>

@@ -6,23 +6,47 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import threading
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
 from .audio_features import extract_features
-from .candidates import bar_number_from_sec, generate_candidates, snap_to_nearest_downbeat
+from .candidates import CandidateSet, bar_number_from_sec, generate_candidates, snap_to_nearest_downbeat
 from .constants import DEFAULT_HOP, DEFAULT_MELS, DEFAULT_SR
 from .model import ContextConfig, build_candidate_contexts, build_model, sigmoid_np, temperature_scale_logits
 from .utils import as_float, parent_dir
 
 
+_TORCH_MODULE = None
+_MODEL_CACHE_LOCK = threading.Lock()
+_PREDICT_RUNTIME_CACHE: Dict[Tuple[str, str], Dict[str, object]] = {}
+
+
 def _require_torch():
+    global _TORCH_MODULE
+    if _TORCH_MODULE is not None:
+        return _TORCH_MODULE
     try:
         import torch
     except Exception as e:
         raise RuntimeError("PyTorch is required for inference. Install with: pip install torch") from e
+    try:
+        torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
+    if torch.cuda.is_available() and getattr(torch.backends, "cudnn", None) is not None:
+        torch.backends.cudnn.benchmark = True
+    _TORCH_MODULE = torch
     return torch
+
+
+def _require_librosa():
+    try:
+        import librosa  # type: ignore
+    except Exception as e:
+        raise RuntimeError("librosa is required: pip install librosa soundfile") from e
+    return librosa
 
 
 def _device_auto(torch, device_arg: str) -> str:
@@ -33,6 +57,73 @@ def _device_auto(torch, device_arg: str) -> str:
     if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
         return "mps"
     return "cpu"
+
+
+def _load_predict_runtime(model_path: str, device: str) -> Tuple[object, Dict[str, object]]:
+    torch = _require_torch()
+    resolved_model_path = os.path.abspath(model_path)
+    dev = _device_auto(torch, device)
+    cache_key = (resolved_model_path, dev)
+
+    with _MODEL_CACHE_LOCK:
+        cached = _PREDICT_RUNTIME_CACHE.get(cache_key)
+    if cached is not None:
+        return torch, cached
+
+    ckpt = torch.load(resolved_model_path, map_location="cpu")
+    cfg = dict(ckpt.get("config") or {})
+
+    sr = int(cfg.get("sr", DEFAULT_SR))
+    hop = int(cfg.get("hop", DEFAULT_HOP))
+    n_mels = int(cfg.get("n_mels", DEFAULT_MELS))
+    context = ContextConfig(
+        long_left_sec=float(cfg.get("long_left_sec", 12.0)),
+        long_right_sec=float(cfg.get("long_right_sec", 6.0)),
+        short_left_sec=float(cfg.get("short_left_sec", 2.0)),
+        short_right_sec=float(cfg.get("short_right_sec", 2.0)),
+        long_frames=int(cfg.get("long_frames", 384)),
+        short_frames=int(cfg.get("short_frames", 128)),
+    )
+
+    in_channels = int(cfg.get("in_channels", n_mels + 9))
+    meta_dim = int(cfg.get("meta_dim", 4))
+    width = int(cfg.get("width", 128))
+    dropout = float(cfg.get("dropout", 0.15))
+    max_offset_sec = float(cfg.get("max_offset_sec", 0.150))
+
+    model = build_model(
+        in_channels=in_channels,
+        meta_dim=meta_dim,
+        width=width,
+        dropout=dropout,
+        max_offset_sec=max_offset_sec,
+    )
+    model.load_state_dict(ckpt["state_dict"])
+    model.to(dev)
+    model.eval()
+
+    runtime = {
+        "cfg": cfg,
+        "sr": sr,
+        "hop": hop,
+        "n_mels": n_mels,
+        "context": context,
+        "model": model,
+        "device": dev,
+        "drop_region_prior": dict(ckpt.get("drop_region_prior") or {}),
+        "guardrails": dict(ckpt.get("guardrails") or {}),
+        "temperature": float(ckpt.get("temperature", 1.0)),
+        # A single cached model instance may be shared across worker threads.
+        # Serialize the forward pass; CPU feature extraction still runs in parallel.
+        "predict_lock": threading.Lock(),
+    }
+
+    with _MODEL_CACHE_LOCK:
+        existing = _PREDICT_RUNTIME_CACHE.get(cache_key)
+        if existing is not None:
+            return torch, existing
+        _PREDICT_RUNTIME_CACHE[cache_key] = runtime
+    return torch, runtime
 
 
 def _candidate_meta(
@@ -222,6 +313,266 @@ def _region_window(duration_sec: float, prior: Dict[str, float]) -> Tuple[float,
     return float(lo), float(max(lo + 0.5, hi))
 
 
+def _dedupe_times(times: np.ndarray, conf: np.ndarray, tol_sec: float = 0.070) -> Tuple[np.ndarray, np.ndarray]:
+    if times.size == 0:
+        return times.astype(np.float32, copy=False), conf.astype(np.float32, copy=False)
+    order = np.argsort(times)
+    t = times[order].astype(np.float32, copy=False)
+    c = conf[order].astype(np.float32, copy=False) if conf.size else np.zeros(t.shape[0], dtype=np.float32)
+    out_t: List[float] = [float(t[0])]
+    out_c: List[float] = [float(c[0])]
+    for i in range(1, int(t.shape[0])):
+        ti = float(t[i])
+        ci = float(c[i])
+        if abs(ti - out_t[-1]) <= float(tol_sec):
+            out_t[-1] = 0.5 * (out_t[-1] + ti)
+            out_c[-1] = max(out_c[-1], ci)
+        else:
+            out_t.append(ti)
+            out_c.append(ci)
+    return np.asarray(out_t, dtype=np.float32), np.asarray(out_c, dtype=np.float32)
+
+
+def _union_candidate_sets(sets: Sequence[CandidateSet], max_candidates: int = 1400) -> CandidateSet:
+    times_rows: List[np.ndarray] = []
+    conf_rows: List[np.ndarray] = []
+    down_rows: List[np.ndarray] = []
+    tempo_vals: List[float] = []
+    for s in sets:
+        if not isinstance(s, CandidateSet):
+            continue
+        if s.times.size:
+            times_rows.append(s.times.astype(np.float32, copy=False))
+            conf_rows.append(s.confidence.astype(np.float32, copy=False) if s.confidence.size else np.zeros(s.times.shape[0], dtype=np.float32))
+        if s.downbeats.size:
+            down_rows.append(s.downbeats.astype(np.float32, copy=False))
+        if float(s.tempo_bpm) > 0:
+            tempo_vals.append(float(s.tempo_bpm))
+
+    if not times_rows:
+        return CandidateSet(
+            times=np.asarray([], dtype=np.float32),
+            confidence=np.asarray([], dtype=np.float32),
+            downbeats=np.asarray([], dtype=np.float32),
+            tempo_bpm=0.0,
+        )
+
+    times = np.concatenate(times_rows, axis=0).astype(np.float32, copy=False)
+    conf = np.concatenate(conf_rows, axis=0).astype(np.float32, copy=False)
+    times, conf = _dedupe_times(times, conf, tol_sec=0.070)
+
+    if times.size > int(max_candidates):
+        idx_top = np.argsort(conf)[::-1][: int(max_candidates)]
+        idx_top = np.sort(idx_top.astype(np.int32))
+        times = times[idx_top]
+        conf = conf[idx_top]
+
+    if down_rows:
+        down = np.concatenate(down_rows, axis=0).astype(np.float32, copy=False)
+        down, _ = _dedupe_times(down, np.ones(down.shape[0], dtype=np.float32), tol_sec=0.070)
+    else:
+        down = times.copy()
+    tempo = float(np.median(np.asarray(tempo_vals, dtype=np.float32))) if tempo_vals else 0.0
+    return CandidateSet(times=times, confidence=conf, downbeats=down, tempo_bpm=tempo)
+
+
+def _deterministic_structural_candidates(
+    feature_dict: Dict[str, np.ndarray],
+    region: Tuple[float, float],
+    max_candidates: int = 256,
+) -> CandidateSet:
+    frame_times = feature_dict.get("frame_times", np.asarray([], dtype=np.float32)).astype(np.float32, copy=False)
+    if frame_times.size < 4:
+        return CandidateSet(
+            times=np.asarray([], dtype=np.float32),
+            confidence=np.asarray([], dtype=np.float32),
+            downbeats=np.asarray([], dtype=np.float32),
+            tempo_bpm=0.0,
+        )
+
+    duration_sec = float(frame_times[-1])
+    onset = _norm01(feature_dict.get("onset", np.zeros(frame_times.shape[0], dtype=np.float32)).astype(np.float32, copy=False))
+    low = _norm01(feature_dict.get("low_ratio", np.zeros(frame_times.shape[0], dtype=np.float32)).astype(np.float32, copy=False))
+    novelty = _norm01(feature_dict.get("novelty", np.zeros(frame_times.shape[0], dtype=np.float32)).astype(np.float32, copy=False))
+    m = min(len(frame_times), len(onset), len(low), len(novelty))
+    if m < 4:
+        return CandidateSet(
+            times=np.asarray([], dtype=np.float32),
+            confidence=np.asarray([], dtype=np.float32),
+            downbeats=np.asarray([], dtype=np.float32),
+            tempo_bpm=0.0,
+        )
+    frame_times = frame_times[:m]
+    onset = onset[:m]
+    low = low[:m]
+    novelty = novelty[:m]
+
+    tempo = float(as_float((feature_dict.get("tempo_est", np.asarray([0.0], dtype=np.float32))[0]), 0.0))
+    if tempo <= 0:
+        beat_times = feature_dict.get("beat_times", np.asarray([], dtype=np.float32)).astype(np.float32, copy=False)
+        if beat_times.size > 3:
+            d = np.diff(beat_times)
+            d = d[(d > 0.15) & (d < 1.2)]
+            if d.size:
+                tempo = 60.0 / float(np.median(d))
+    if tempo <= 0:
+        tempo = 128.0
+    beat_sec = max(0.28, min(0.75, 60.0 / float(tempo)))
+    bar_sec = 4.0 * beat_sec
+
+    lo_t = max(0.5, float(region[0]))
+    hi_t = min(max(lo_t + 1.0, float(region[1])), duration_sec - 0.5)
+    if hi_t <= lo_t:
+        return CandidateSet(
+            times=np.asarray([], dtype=np.float32),
+            confidence=np.asarray([], dtype=np.float32),
+            downbeats=np.asarray([], dtype=np.float32),
+            tempo_bpm=float(tempo),
+        )
+
+    times = np.arange(lo_t, hi_t + 1e-9, max(0.25, bar_sec), dtype=np.float32)
+    if times.size == 0:
+        return CandidateSet(
+            times=np.asarray([], dtype=np.float32),
+            confidence=np.asarray([], dtype=np.float32),
+            downbeats=np.asarray([], dtype=np.float32),
+            tempo_bpm=float(tempo),
+        )
+
+    score_rows: List[float] = []
+    for t in times.tolist():
+        pre_on = _slice_mean(onset, frame_times, t - 8.0, t - 1.0)
+        post_on = _slice_mean(onset, frame_times, t, t + 2.0)
+        pre_low = _slice_mean(low, frame_times, t - 2.0, t)
+        post_low = _slice_mean(low, frame_times, t, t + 2.0)
+        sus_low = _slice_mean(low, frame_times, t + 2.0, t + 8.0)
+        nov = _slice_mean(novelty, frame_times, t - 0.8, t + 1.2)
+        buildup = max(0.0, post_on - pre_on)
+        impact = max(0.0, post_low - pre_low)
+        sustain = max(0.0, sus_low - pre_low)
+        sc = (0.40 * impact) + (0.30 * buildup) + (0.22 * sustain) + (0.08 * max(0.0, nov))
+        score_rows.append(float(sc))
+
+    score = _norm01(np.asarray(score_rows, dtype=np.float32))
+    if score.size > int(max_candidates):
+        idx = np.argsort(score)[::-1][: int(max_candidates)]
+        idx = np.sort(idx.astype(np.int32))
+        times = times[idx]
+        score = score[idx]
+    return CandidateSet(
+        times=times.astype(np.float32, copy=False),
+        confidence=score.astype(np.float32, copy=False),
+        downbeats=times.astype(np.float32, copy=False),
+        tempo_bpm=float(tempo),
+    )
+
+
+def _candidate_cascade(
+    feature_dict: Dict[str, np.ndarray],
+    audio_path: str,
+    use_madmom: bool,
+    region: Tuple[float, float],
+) -> Tuple[CandidateSet, Dict[str, object]]:
+    primary = generate_candidates(feature_dict=feature_dict, audio_path=audio_path, use_madmom=bool(use_madmom))
+    secondary = generate_candidates(feature_dict=feature_dict, audio_path=audio_path, use_madmom=False)
+    tertiary = _deterministic_structural_candidates(feature_dict=feature_dict, region=region, max_candidates=256)
+
+    stage = "primary_madmom" if bool(use_madmom) else "secondary_librosa"
+    if primary.times.size == 0 and secondary.times.size > 0:
+        stage = "secondary_librosa"
+    if primary.times.size == 0 and secondary.times.size == 0 and tertiary.times.size > 0:
+        stage = "tertiary_structural"
+
+    merged = _union_candidate_sets([primary, secondary, tertiary], max_candidates=1400)
+    info = {
+        "stage": stage,
+        "primary_n": int(primary.times.size),
+        "secondary_n": int(secondary.times.size),
+        "tertiary_n": int(tertiary.times.size),
+        "merged_n": int(merged.times.size),
+    }
+    return merged, info
+
+
+def _micro_align_anchor(
+    audio_path: str,
+    anchor_sec: float,
+    pre_ms: float = 120.0,
+    post_ms: float = 180.0,
+    threshold_k: float = 1.25,
+    sr: int = 22050,
+    hop_length: int = 128,
+) -> Tuple[float, Dict[str, float]]:
+    librosa = _require_librosa()
+    pre = max(0.0, float(pre_ms) / 1000.0)
+    post = max(0.0, float(post_ms) / 1000.0)
+    left = max(0.0, float(anchor_sec) - pre)
+    right = float(anchor_sec) + post
+    duration = max(0.05, right - left)
+    try:
+        y, sr_loaded = librosa.load(audio_path, sr=int(sr), mono=True, offset=float(left), duration=float(duration))
+    except Exception:
+        return float(anchor_sec), {"used": 0.0, "reason": 1.0}
+    if y is None or len(y) < 256:
+        return float(anchor_sec), {"used": 0.0, "reason": 2.0}
+
+    n_fft = 1024
+    hop = max(64, min(128, int(hop_length)))
+    onset = librosa.onset.onset_strength(y=y, sr=sr_loaded, hop_length=hop).astype(np.float32, copy=False)
+    st = librosa.stft(y=y, n_fft=n_fft, hop_length=hop)
+    pwr = (np.abs(st) ** 2).astype(np.float32, copy=False)
+    freqs = librosa.fft_frequencies(sr=sr_loaded, n_fft=n_fft).astype(np.float32, copy=False)
+    low_mask = (freqs >= 20.0) & (freqs <= 150.0)
+    low_band = np.sum(pwr[low_mask, :], axis=0).astype(np.float32, copy=False) if np.any(low_mask) else np.zeros(pwr.shape[1], dtype=np.float32)
+    low_flux = np.maximum(0.0, np.diff(low_band, prepend=low_band[:1])).astype(np.float32, copy=False)
+    cent = librosa.feature.spectral_centroid(y=y, sr=sr_loaded, n_fft=n_fft, hop_length=hop)[0].astype(np.float32, copy=False)
+    novelty = np.maximum(0.0, np.diff(cent, prepend=cent[:1])).astype(np.float32, copy=False)
+
+    n = min(len(onset), len(low_flux), len(novelty))
+    if n < 4:
+        return float(anchor_sec), {"used": 0.0, "reason": 3.0}
+    onset = onset[:n]
+    low_flux = low_flux[:n]
+    novelty = novelty[:n]
+
+    def _z(x: np.ndarray) -> np.ndarray:
+        if x.size == 0:
+            return x.astype(np.float32, copy=False)
+        m = float(np.mean(x))
+        s = float(np.std(x))
+        if s <= 1e-9:
+            return np.zeros_like(x, dtype=np.float32)
+        return ((x - m) / s).astype(np.float32, copy=False)
+
+    s_on = _z(onset)
+    s_low = _z(low_flux)
+    s_nov = _z(novelty)
+    score = (0.55 * s_on) + (0.35 * s_low) + (0.10 * s_nov)
+
+    frame_times = librosa.frames_to_time(np.arange(n), sr=sr_loaded, hop_length=hop).astype(np.float32, copy=False)
+    abs_times = (frame_times + float(left)).astype(np.float32, copy=False)
+    mu = float(np.mean(score))
+    sd = float(np.std(score))
+    thr = mu + (float(threshold_k) * sd)
+
+    after = np.where(abs_times >= float(anchor_sec))[0]
+    pick = None
+    for idx in after.tolist():
+        if float(score[idx]) >= thr:
+            pick = int(idx)
+            break
+    if pick is None:
+        pick = int(np.argmax(score))
+    aligned = float(abs_times[pick])
+    aligned = min(float(right), max(float(left), aligned))
+    return aligned, {
+        "used": 1.0,
+        "threshold": float(thr),
+        "score_at_pick": float(score[pick]),
+        "shift_sec": float(aligned - float(anchor_sec)),
+    }
+
+
 def _predict_internal(
     audio_path: str,
     model_path: str,
@@ -231,44 +582,30 @@ def _predict_internal(
     review_threshold: float,
     return_candidates: bool,
     top_k: int = 5,
+    micro_align: bool = False,
+    micro_window_pre_ms: float = 120.0,
+    micro_window_post_ms: float = 180.0,
+    micro_threshold_k: float = 1.25,
 ) -> Dict[str, object]:
-    torch = _require_torch()
-    ckpt = torch.load(model_path, map_location="cpu")
-    cfg = dict(ckpt.get("config") or {})
-
-    sr = int(cfg.get("sr", DEFAULT_SR))
-    hop = int(cfg.get("hop", DEFAULT_HOP))
-    n_mels = int(cfg.get("n_mels", DEFAULT_MELS))
-    context = ContextConfig(
-        long_left_sec=float(cfg.get("long_left_sec", 12.0)),
-        long_right_sec=float(cfg.get("long_right_sec", 6.0)),
-        short_left_sec=float(cfg.get("short_left_sec", 2.0)),
-        short_right_sec=float(cfg.get("short_right_sec", 2.0)),
-        long_frames=int(cfg.get("long_frames", 384)),
-        short_frames=int(cfg.get("short_frames", 128)),
-    )
-
-    in_channels = int(cfg.get("in_channels", n_mels + 9))
-    meta_dim = int(cfg.get("meta_dim", 4))
-    width = int(cfg.get("width", 128))
-    dropout = float(cfg.get("dropout", 0.15))
-    max_offset_sec = float(cfg.get("max_offset_sec", 0.150))
-
-    model = build_model(
-        in_channels=in_channels,
-        meta_dim=meta_dim,
-        width=width,
-        dropout=dropout,
-        max_offset_sec=max_offset_sec,
-    )
-    model.load_state_dict(ckpt["state_dict"])
-
-    dev = _device_auto(torch, device)
-    model.to(dev)
-    model.eval()
+    torch, runtime = _load_predict_runtime(model_path, device)
+    cfg = dict(runtime.get("cfg") or {})
+    sr = int(runtime.get("sr") or DEFAULT_SR)
+    hop = int(runtime.get("hop") or DEFAULT_HOP)
+    n_mels = int(runtime.get("n_mels") or DEFAULT_MELS)
+    context = runtime.get("context") or ContextConfig()
+    model = runtime["model"]
+    dev = str(runtime.get("device") or _device_auto(torch, device))
 
     feat = extract_features(audio_path=audio_path, sr=sr, hop_length=hop, n_mels=n_mels)
-    cset = generate_candidates(feature_dict=feat, audio_path=audio_path, use_madmom=bool(use_madmom))
+    duration_sec = float(feat.get("frame_times", np.asarray([], dtype=np.float32))[-1]) if "frame_times" in feat and len(feat["frame_times"]) else 0.0
+    prior = dict(runtime.get("drop_region_prior") or {})
+    region_lo, region_hi = _region_window(duration_sec, prior=prior)
+    cset, cascade_info = _candidate_cascade(
+        feature_dict=feat,
+        audio_path=audio_path,
+        use_madmom=bool(use_madmom),
+        region=(float(region_lo), float(region_hi)),
+    )
     if cset.times.size == 0:
         raise RuntimeError("No candidate downbeats generated for this track")
 
@@ -279,12 +616,14 @@ def _predict_internal(
     xb_short = torch.from_numpy(short_ctx).to(device=dev, dtype=torch.float32)
     xb_meta = torch.from_numpy(meta).to(device=dev, dtype=torch.float32)
 
-    with torch.no_grad():
-        logits, offset = model(xb_long, xb_short, xb_meta)
-        logits_np = logits.detach().cpu().numpy().astype(np.float32, copy=False)
-        off_np = offset.detach().cpu().numpy().astype(np.float32, copy=False)
+    predict_lock = runtime["predict_lock"]
+    with predict_lock:
+        with torch.inference_mode():
+            logits, offset = model(xb_long, xb_short, xb_meta)
+            logits_np = logits.detach().cpu().numpy().astype(np.float32, copy=False)
+            off_np = offset.detach().cpu().numpy().astype(np.float32, copy=False)
 
-    temperature = float(ckpt.get("temperature", 1.0))
+    temperature = float(runtime.get("temperature") or 1.0)
     probs = sigmoid_np(temperature_scale_logits(logits_np, temperature)).astype(np.float32, copy=False)
     order = np.argsort(probs)[::-1]
     j = int(order[0])
@@ -302,12 +641,9 @@ def _predict_internal(
     if abs(refined - cand_t) > (0.22 * beat_sec):
         refined = cand_t
 
-    duration_sec = float(feat.get("frame_times", np.asarray([], dtype=np.float32))[-1]) if "frame_times" in feat and len(feat["frame_times"]) else 0.0
-    guardrails = dict(ckpt.get("guardrails") or {})
-    prior = dict(ckpt.get("drop_region_prior") or {})
+    guardrails = dict(runtime.get("guardrails") or {})
     min_conf = float(guardrails.get("min_confidence", max(0.55, float(review_threshold))))
     min_margin = float(guardrails.get("min_margin", 0.05))
-    region_lo, region_hi = _region_window(duration_sec, prior=prior)
     region_valid = bool(region_lo <= float(cand_t) <= region_hi)
 
     accept_model = bool((top1 >= min_conf) and (margin >= min_margin) and region_valid)
@@ -334,6 +670,18 @@ def _predict_internal(
             selected_by = "model_rejected"
 
     snapped = snap_to_nearest_downbeat(refined, cset.downbeats.tolist())
+    predicted = float(snapped)
+    micro_meta: Dict[str, float] = {"used": 0.0}
+    if bool(micro_align):
+        predicted, micro_meta = _micro_align_anchor(
+            audio_path=audio_path,
+            anchor_sec=float(snapped),
+            pre_ms=float(micro_window_pre_ms),
+            post_ms=float(micro_window_post_ms),
+            threshold_k=float(micro_threshold_k),
+            sr=int(sr),
+            hop_length=128,
+        )
 
     bpm_used = as_float(bpm_override)
     if bpm_used is None or bpm_used <= 0:
@@ -362,10 +710,11 @@ def _predict_internal(
         needs_review = bool((fallback_conf is None) or (float(fallback_conf) < float(fallback_review_threshold)))
     res = {
         "audio_path": os.path.abspath(audio_path),
-        "predicted_sec": float(snapped),
+        "predicted_sec": float(predicted),
         "candidate_sec": float(cand_t),
         "refined_sec": float(refined),
-        "ableton_cue_sec": float(snapped),
+        "downbeat_sec": float(snapped),
+        "ableton_cue_sec": float(predicted),
         "confidence": float(effective_conf),
         "model_confidence": float(top1),
         "score_margin": float(margin),
@@ -375,16 +724,24 @@ def _predict_internal(
         "fallback_sec": float(fallback_sec) if fallback_sec is not None else None,
         "fallback_confidence": float(fallback_conf) if fallback_conf is not None else None,
         "needs_manual_review": bool(needs_review),
-        "bar_number": int(bar_number_from_sec(snapped, float(bpm_used))),
+        "bar_number": int(bar_number_from_sec(predicted, float(bpm_used))),
         "bpm_used": float(bpm_used),
         "tempo_est": float(cset.tempo_bpm),
         "n_candidates": int(cset.times.shape[0]),
+        "candidate_cascade": cascade_info,
         "temperature": float(temperature),
         "guardrail_thresholds": {"min_confidence": float(min_conf), "min_margin": float(min_margin)},
         "fallback_review_threshold": float(fallback_review_threshold),
         "region_window_sec": [float(region_lo), float(region_hi)],
         "top_candidates": top,
         "model_path": os.path.abspath(model_path),
+        "micro_align": {
+            "enabled": bool(micro_align),
+            "window_pre_ms": float(micro_window_pre_ms),
+            "window_post_ms": float(micro_window_post_ms),
+            "threshold_k": float(micro_threshold_k),
+            "meta": micro_meta,
+        },
     }
     if bool(return_candidates):
         res["candidate_times"] = [float(x) for x in cset.times.tolist()]
@@ -402,6 +759,10 @@ def run_predict(
     bpm_override: Optional[float] = None,
     review_threshold: float = 0.55,
     return_candidates: bool = False,
+    micro_align: bool = False,
+    micro_window_pre_ms: float = 120.0,
+    micro_window_post_ms: float = 180.0,
+    micro_threshold_k: float = 1.25,
 ) -> Dict[str, object]:
     res = _predict_internal(
         audio_path=audio_path,
@@ -411,6 +772,10 @@ def run_predict(
         bpm_override=bpm_override,
         review_threshold=review_threshold,
         return_candidates=bool(return_candidates),
+        micro_align=bool(micro_align),
+        micro_window_pre_ms=float(micro_window_pre_ms),
+        micro_window_post_ms=float(micro_window_post_ms),
+        micro_threshold_k=float(micro_threshold_k),
     )
     if out_json:
         parent_dir(out_json)
@@ -430,6 +795,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--no-madmom", action="store_true", help="Disable madmom downbeat proposals")
     ap.add_argument("--bpm", type=float, default=0.0, help="Optional BPM override")
     ap.add_argument("--review-threshold", type=float, default=0.55)
+    ap.add_argument("--micro-align", action="store_true", help="Apply final high-resolution transient micro-alignment")
+    ap.add_argument("--micro-window-pre-ms", type=float, default=120.0, help="Micro-align search window before downbeat (ms)")
+    ap.add_argument("--micro-window-post-ms", type=float, default=180.0, help="Micro-align search window after downbeat (ms)")
+    ap.add_argument("--micro-threshold-k", type=float, default=1.25, help="Threshold k for first strong transient (mean + k*std)")
     return ap
 
 
@@ -443,6 +812,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         use_madmom=not bool(args.no_madmom),
         bpm_override=args.bpm if args.bpm > 0 else None,
         review_threshold=float(args.review_threshold),
+        micro_align=bool(args.micro_align),
+        micro_window_pre_ms=float(args.micro_window_pre_ms),
+        micro_window_post_ms=float(args.micro_window_post_ms),
+        micro_threshold_k=float(args.micro_threshold_k),
     )
     print(json.dumps(res, indent=2))
     return 0

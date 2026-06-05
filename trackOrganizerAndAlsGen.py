@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os, re, json, base64, html, math, shutil, gzip, subprocess, unicodedata, csv
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import os, re, json, base64, html, math, shutil, gzip, subprocess, unicodedata, csv, threading
 from io import BytesIO
 from typing import Optional, Dict, Tuple, List
 import xml.etree.ElementTree as ET
@@ -36,13 +37,35 @@ try:
 except Exception:
     alsdrop_run_predict = None
 
+try:
+    from first_downbeat_detector import build_als_anchor_map, detect_track_folder
+except Exception:
+    build_als_anchor_map = None
+    detect_track_folder = None
+
+try:
+    from rekordbox_mik_prior import lookup_first_drop_prior, lookup_track_cues
+except Exception:
+    lookup_first_drop_prior = None
+    lookup_track_cues = None
+
+try:
+    from drop_fusion_audit import (
+        build_audit as build_drop_fusion_audit,
+        _json_default as drop_fusion_json_default,
+    )
+except Exception:
+    build_drop_fusion_audit = None
+    drop_fusion_json_default = None
+
 # ========= USER SETTINGS =========
 mp3_source_folder        = "/Users/alirahimlou/Desktop/MUSIC/PlaylistsByDate"
 htdemucs_source_folder   = "/Users/alirahimlou/Desktop/MUSIC/STEMS/toBeOrganized"
-destination_folder       = "/Users/alirahimlou/Desktop/STEMS2"
-ALS_FILES_FOLDER         = "alsFiles"  # folder containing <BPM>.als templates
+destination_folder       = "/Users/alirahimlou/Desktop/MUSIC/STEMS"
+ALS_FILES_FOLDER         = os.path.join(os.path.dirname(os.path.abspath(__file__)), "alsFiles")  # folder containing <BPM>.als templates
 FLAC_FOLDER              = destination_folder
-SKIP_EXISTING            = True   # when False, force-regenerate ALS for every track folder
+SKIP_EXISTING            = str(os.environ.get("SKIP_EXISTING", "1")).strip().lower() not in {"0", "false", "no", "off"}   # when False, force-regenerate ALS for every track folder
+REPAIR_EXISTING_LIBRARY_ONLY = str(os.environ.get("REPAIR_EXISTING_LIBRARY_ONLY", "0")).strip().lower() in {"1", "true", "yes", "on"}  # when True, skip new inbox stems and only repair/rebuild CH1.als inside destination_folder
 RENAME_TRACKS            = True
 ONE_TIME_UNDO_RENAME     = False  # revert "Title - Artist" back to "Artist - Title" in destination_folder
 DROP_ANCHOR_OFFSET_SEC   = 0.0    # manual nudge for drop anchor (negative = earlier, positive = later)
@@ -53,12 +76,42 @@ DROP_MARKER_DB_PATH      = os.path.join(os.path.dirname(os.path.abspath(__file__
 DROP_SELF_LEARN_MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "drop_self_learning_model.json")
 USE_SELF_LEARN_MODEL     = True
 USE_ALSDROP_MODEL        = True
+USE_FIRST_DOWNBEAT_DETECTOR = True
+FIRST_DOWNBEAT_MIN_CONFIDENCE = 0.45
+USE_DROP_FUSION_AUTOMATION = str(os.environ.get("USE_DROP_FUSION_AUTOMATION", "1")).strip().lower() not in {"0", "false", "no", "off"}
+DROP_FUSION_REQUIRE_SAFE = str(os.environ.get("DROP_FUSION_REQUIRE_SAFE", "1")).strip().lower() not in {"0", "false", "no", "off"}
+DROP_FUSION_OVERRIDE_DB_ANCHOR = str(os.environ.get("DROP_FUSION_OVERRIDE_DB_ANCHOR", "1")).strip().lower() not in {"0", "false", "no", "off"}
+DROP_FUSION_OVERRIDE_MANUAL_ANCHOR = str(os.environ.get("DROP_FUSION_OVERRIDE_MANUAL_ANCHOR", "0")).strip().lower() not in {"0", "false", "no", "off"}
+DROP_FUSION_MIN_CONFIDENCE = float(os.environ.get("DROP_FUSION_MIN_CONFIDENCE", "0.64"))
+DROP_FUSION_MIN_SCORE = float(os.environ.get("DROP_FUSION_MIN_SCORE", "0.58"))
+DROP_FUSION_SAMPLE_RATE = int(str(os.environ.get("DROP_FUSION_SAMPLE_RATE", "22050")).strip() or "22050")
+DROP_FUSION_PER_ROLE_LIMIT = int(str(os.environ.get("DROP_FUSION_PER_ROLE_LIMIT", "28")).strip() or "28")
+DROP_FUSION_CANDIDATE_LIMIT = int(str(os.environ.get("DROP_FUSION_CANDIDATE_LIMIT", "40")).strip() or "40")
+ALS_BACKUP_BEFORE_WRITE = str(os.environ.get("ALS_BACKUP_BEFORE_WRITE", "1")).strip().lower() not in {"0", "false", "no", "off"}
+TRACK_ORGANIZER_PARALLEL = str(os.environ.get("TRACK_ORGANIZER_PARALLEL", "1")).strip().lower() not in {"0", "false", "no", "off"}
+try:
+    TRACK_ORGANIZER_MAX_WORKERS = max(1, int(str(os.environ.get("TRACK_ORGANIZER_MAX_WORKERS", str(os.cpu_count() or 1))).strip() or "1"))
+except Exception:
+    TRACK_ORGANIZER_MAX_WORKERS = max(1, int(os.cpu_count() or 1))
+USE_REKORDBOX_MIK_CUE_PRIOR = True
+USE_SOURCE_AUDIO_MIK_CUE_TAGS = str(os.environ.get("USE_SOURCE_AUDIO_MIK_CUE_TAGS", "1")).strip().lower() not in {"0", "false", "no", "off"}
+USE_REKORDBOX_MIK_CUE_STAMP_TEST = str(os.environ.get("USE_REKORDBOX_MIK_CUE_STAMP_TEST", "0")).strip().lower() not in {"0", "false", "no", "off"}
+MIK_FIRST_DROP_EARLY_IGNORE_SEC = float(os.environ.get("MIK_FIRST_DROP_EARLY_IGNORE_SEC", "1.0"))
+MIK_FIRST_DROP_LOCALITY_BEATS = float(os.environ.get("MIK_FIRST_DROP_LOCALITY_BEATS", "1.5"))
+MIK_FIRST_DROP_MIN_CONFIDENCE = float(os.environ.get("MIK_FIRST_DROP_MIN_CONFIDENCE", "0.25"))
+MIK_FIRST_DROP_MAX_CUES_TO_TRY = int(str(os.environ.get("MIK_FIRST_DROP_MAX_CUES_TO_TRY", "6")).strip() or "6")
+REKORDBOX_XML_PATH       = (os.environ.get("REKORDBOX_XML_PATH") or "/Users/alirahimlou/Documents/rekordbox.xml").strip()
+REKORDBOX_FIRST_DROP_HOTCUE_NUM = int(str(os.environ.get("REKORDBOX_FIRST_DROP_HOTCUE_NUM", "1")).strip() or "1")
+REKORDBOX_PRIOR_CONFIDENCE = float(os.environ.get("REKORDBOX_PRIOR_CONFIDENCE", "0.98"))
+REKORDBOX_CUE_SNAP_NEAR_INT_TOL = float(os.environ.get("REKORDBOX_CUE_SNAP_NEAR_INT_TOL", "0.125"))
+REKORDBOX_CUE_GRID_RES = int(str(os.environ.get("REKORDBOX_CUE_GRID_RES", "24")).strip() or "24")
 _ALSDROP_ROOT            = os.path.join(os.path.dirname(os.path.abspath(__file__)), "alsdrop")
 _ALSDROP_MODELS_DIR      = os.path.join(_ALSDROP_ROOT, "models")
 _ALSDROP_OUTPUTS_DIR     = os.path.join(_ALSDROP_ROOT, "outputs")
 ALSDROP_MODEL_PATH_ENV   = (os.environ.get("ALSDROP_MODEL_PATH") or "").strip()
 ALSDROP_MODEL_BASELINE_PATH = os.path.join(_ALSDROP_MODELS_DIR, "model.pt")
 ALSDROP_MODEL_PROD_PATH  = os.path.join(_ALSDROP_MODELS_DIR, "model_prod.pt")
+ALSDROP_DEVICE           = (os.environ.get("ALSDROP_DEVICE") or "auto").strip() or "auto"
 ALSDROP_AUTO_MODEL_SELECT = str(os.environ.get("ALSDROP_AUTO_MODEL_SELECT", "1")).strip().lower() not in {"0", "false", "no", "off"}
 ALSDROP_MIN_TEST_DOWNBEAT = float(os.environ.get("ALSDROP_MIN_TEST_DOWNBEAT", "0.75"))
 ALSDROP_MIN_CANDIDATE_RECALL = float(os.environ.get("ALSDROP_MIN_CANDIDATE_RECALL", "0.90"))
@@ -91,6 +144,10 @@ _DROP_DB_CACHE = None
 _DROP_LEARN_MODEL_CACHE = None
 _ALSDROP_WARNED = False
 _ALSDROP_REVIEW_QUEUE: List[Dict[str, object]] = []
+_ALSDROP_REVIEW_QUEUE_LOCK = threading.Lock()
+_ACTIVE_ANALYSIS_TASKS = 0
+_PEAK_ANALYSIS_TASKS = 0
+_ACTIVE_ANALYSIS_LOCK = threading.Lock()
 _ALSDROP_MODEL_RESOLVED_PATH: Optional[str] = None
 _ALSDROP_MODEL_RESOLVED_REASON: str = ""
 _DROP_ROLE_PREFIX_RE = re.compile(r"^(drums|inst|vocals)_", re.I)
@@ -583,15 +640,19 @@ def _queue_alsdrop_review(pred: Dict[str, object]) -> None:
     }
     if not row["audio_path"]:
         return
-    _ALSDROP_REVIEW_QUEUE.append(row)
+    with _ALSDROP_REVIEW_QUEUE_LOCK:
+        _ALSDROP_REVIEW_QUEUE.append(row)
 
 
 def _write_alsdrop_review_queue_exports() -> None:
-    if not _ALSDROP_REVIEW_QUEUE:
+    with _ALSDROP_REVIEW_QUEUE_LOCK:
+        queue_rows = list(_ALSDROP_REVIEW_QUEUE)
+
+    if not queue_rows:
         return
 
     dedup: Dict[str, Dict[str, object]] = {}
-    for row in _ALSDROP_REVIEW_QUEUE:
+    for row in queue_rows:
         ap = str(row.get("audio_path") or "").strip()
         if not ap:
             continue
@@ -646,7 +707,7 @@ def _predict_drop_with_alsdrop(drums_path: str, bpm: Optional[int]) -> Tuple[Opt
         return None, 0.0, {}
     if alsdrop_run_predict is None:
         if not _ALSDROP_WARNED:
-            print("[WARN] ALSDrop import unavailable; falling back to legacy drop detector.")
+            print(f"[WARN] ALSDrop import unavailable; falling back to legacy drop detector. Install torch to enable device={ALSDROP_DEVICE}.")
             _ALSDROP_WARNED = True
         return None, 0.0, {}
     if not drums_path or not os.path.exists(drums_path):
@@ -655,7 +716,10 @@ def _predict_drop_with_alsdrop(drums_path: str, bpm: Optional[int]) -> Tuple[Opt
     if _ALSDROP_MODEL_RESOLVED_PATH is None:
         _ALSDROP_MODEL_RESOLVED_PATH, _ALSDROP_MODEL_RESOLVED_REASON = _resolve_alsdrop_model_path()
         if _ALSDROP_MODEL_RESOLVED_PATH:
-            print(f"[ALSDrop] Using model: {_ALSDROP_MODEL_RESOLVED_PATH} ({_ALSDROP_MODEL_RESOLVED_REASON})")
+            print(
+                f"[ALSDrop] Using model: {_ALSDROP_MODEL_RESOLVED_PATH} "
+                f"({_ALSDROP_MODEL_RESOLVED_REASON}, device={ALSDROP_DEVICE})"
+            )
 
     model_path = _ALSDROP_MODEL_RESOLVED_PATH
     if not model_path or not os.path.exists(model_path):
@@ -670,7 +734,7 @@ def _predict_drop_with_alsdrop(drums_path: str, bpm: Optional[int]) -> Tuple[Opt
             audio_path=drums_path,
             model_path=model_path,
             out_json=None,
-            device="auto",
+            device=ALSDROP_DEVICE,
             use_madmom=bool(ALSDROP_USE_MADMOM),
             bpm_override=float(bpm) if bpm else None,
             review_threshold=float(ALSDROP_REVIEW_THRESHOLD),
@@ -847,6 +911,323 @@ def parse_mik_comment(text: str) -> Tuple[Optional[int], Optional[str], Optional
     except Exception:
         energy = None
     return bpm, key, energy
+
+
+def _parse_mik_cue_payload(payload) -> List[float]:
+    raw_bytes: Optional[bytes] = None
+    if payload is None:
+        return []
+    if isinstance(payload, bytes):
+        raw_bytes = payload
+    elif isinstance(payload, str):
+        raw_bytes = payload.encode("utf-8", "ignore")
+    else:
+        raw_bytes = str(payload).encode("utf-8", "ignore")
+
+    json_text = None
+    for candidate in (raw_bytes, base64.b64decode(raw_bytes, validate=False)):
+        try:
+            json_text = candidate.decode("utf-8", "ignore")
+        except Exception:
+            continue
+        if json_text and '"cues"' in json_text:
+            break
+        json_text = None
+    if not json_text:
+        return []
+
+    try:
+        obj = json.loads(json_text)
+    except Exception:
+        return []
+    cues = obj.get("cues") if isinstance(obj, dict) else None
+    if not isinstance(cues, list):
+        return []
+
+    out: List[float] = []
+    seen = set()
+    for cue in cues:
+        if not isinstance(cue, dict):
+            continue
+        ms = _as_float(cue.get("time"))
+        if ms is None:
+            continue
+        sec = round(max(0.0, float(ms) / 1000.0), 6)
+        if sec in seen:
+            continue
+        seen.add(sec)
+        out.append(sec)
+    out.sort()
+    return out
+
+
+def _lookup_source_audio_mik_cues(track_names: Dict[str, Optional[str]],
+                                  src_audio_path: Optional[str]=None) -> Tuple[List[float], str]:
+    if not USE_SOURCE_AUDIO_MIK_CUE_TAGS:
+        return [], ""
+
+    candidates: List[str] = []
+    seen = set()
+
+    def add(path: Optional[str]) -> None:
+        if not path:
+            return
+        full = os.path.abspath(str(path))
+        if not os.path.exists(full) or full in seen:
+            return
+        seen.add(full)
+        candidates.append(full)
+
+    add(src_audio_path)
+    for rel in track_names.values():
+        if not rel:
+            continue
+        add(os.path.join(FLAC_FOLDER, rel))
+
+    for audio_path in candidates:
+        try:
+            audio = mutagen.File(audio_path)
+        except Exception:
+            continue
+        tags = getattr(audio, "tags", None)
+        if tags is None:
+            continue
+
+        payloads: List[object] = []
+        if isinstance(tags, ID3):
+            for frame in tags.getall("GEOB"):
+                if str(getattr(frame, "desc", "")).strip().lower() == "cuepoints":
+                    payloads.append(getattr(frame, "data", None))
+        if hasattr(tags, "keys"):
+            for key in tags.keys():
+                if str(key).strip().lower() != "cuepoints":
+                    continue
+                value = tags.get(key)
+                if isinstance(value, list):
+                    payloads.extend(value)
+                else:
+                    payloads.append(value)
+
+        for payload in payloads:
+            cues = _parse_mik_cue_payload(payload)
+            if cues:
+                return cues, f"source_mik_tags:{os.path.basename(audio_path)}"
+    return [], ""
+
+
+def _select_mik_local_anchor(result: Dict[str, object], cue_sec: float, drums_sec: float, bpm_value: int, y=None, sr: int=0) -> Tuple[float, bool]:
+    beat_sec = 60.0 / float(max(1, int(bpm_value)))
+    snap_debug = ((result.get("debug") or {}) if isinstance(result, dict) else {}).get("ableton_snap") or {}
+    candidate_secs: List[float] = []
+    max_cue_delta = max(0.05, 1.05 * beat_sec)
+    max_late_delta = max(0.05, 0.75 * beat_sec)
+
+    def _mean_abs(start_sec: float, end_sec: float) -> float:
+        if np is None or y is None or sr <= 0:
+            return 0.0
+        i0 = max(0, int(round(float(start_sec) * float(sr))))
+        i1 = min(len(y), int(round(float(end_sec) * float(sr))))
+        if i1 <= i0:
+            return 0.0
+        return float(np.mean(np.abs(y[i0:i1])))
+
+    def _extract_features(sec: float) -> Dict[str, float]:
+        pre_span = max(0.10, 0.28 * beat_sec)
+        pre_gap = max(0.010, 0.03 * beat_sec)
+        hit_span = max(0.07, 0.16 * beat_sec)
+        sustain_start = float(sec) + hit_span
+        sustain_end = float(sec) + max(0.34, 0.82 * beat_sec)
+        late_end = float(sec) + max(0.62, 1.45 * beat_sec)
+
+        pre = _mean_abs(float(sec) - pre_span, float(sec) - pre_gap)
+        hit = _mean_abs(float(sec), float(sec) + hit_span)
+        sustain = _mean_abs(sustain_start, sustain_end)
+        late = _mean_abs(sustain_end, late_end)
+
+        attack_gain = max(0.0, float(hit) - float(pre))
+        sustain_gain = max(0.0, float(sustain) - float(pre))
+        late_gain = max(0.0, float(late) - float(hit))
+        beat_offset = (float(sec) - float(cue_sec)) / max(1e-9, beat_sec)
+        near_number = abs(float(beat_offset) - round(float(beat_offset)))
+        return {
+            "attack_gain": float(attack_gain),
+            "sustain_gain": float(sustain_gain),
+            "late_gain": float(late_gain),
+            "near_number": float(near_number),
+            "cue_delta": abs(float(sec) - float(cue_sec)),
+            "drums_delta": abs(float(sec) - float(drums_sec)),
+        }
+
+    def _normalize(values: List[float], invert: bool=False) -> List[float]:
+        if not values:
+            return []
+        lo = min(float(v) for v in values)
+        hi = max(float(v) for v in values)
+        if hi <= lo + 1e-9:
+            base = [0.5 for _ in values]
+        else:
+            span = hi - lo
+            base = [(float(v) - lo) / span for v in values]
+        if invert:
+            return [1.0 - float(v) for v in base]
+        return [float(v) for v in base]
+
+    for key in ("first_plausible_marker_seconds", "earliest_near_best_marker_seconds", "chosen_marker_seconds"):
+        sec = _as_float(snap_debug.get(key))
+        if sec is None:
+            continue
+        if abs(float(sec) - float(cue_sec)) > max_cue_delta:
+            continue
+        if float(sec) > float(drums_sec) + max_late_delta:
+            continue
+        candidate_secs.append(float(sec))
+
+    for event in (snap_debug.get("events") or []):
+        if not isinstance(event, dict):
+            continue
+        for key in ("first_plausible_marker_seconds", "chosen_marker_seconds"):
+            sec = _as_float(event.get(key))
+            if sec is None:
+                continue
+            if abs(float(sec) - float(cue_sec)) > max_cue_delta:
+                continue
+            if float(sec) > float(drums_sec) + max_late_delta:
+                continue
+            candidate_secs.append(float(sec))
+
+    for raw_sec in (snap_debug.get("nearby_raw_markers_seconds") or []):
+        sec = _as_float(raw_sec)
+        if sec is None:
+            continue
+        if abs(float(sec) - float(cue_sec)) > max_cue_delta:
+            continue
+        if float(sec) > float(drums_sec) + max_late_delta:
+            continue
+        candidate_secs.append(float(sec))
+
+    if candidate_secs:
+        unique_secs = sorted(set(round(float(sec), 6) for sec in candidate_secs))
+        features = [_extract_features(float(sec)) for sec in unique_secs]
+        attack_scores = _normalize([f["attack_gain"] for f in features])
+        sustain_scores = _normalize([f["sustain_gain"] for f in features])
+        late_scores = _normalize([f["late_gain"] for f in features], invert=True)
+        beat_number_scores = _normalize([f["near_number"] for f in features], invert=True)
+        cue_scores = _normalize([f["cue_delta"] for f in features], invert=True)
+        drums_scores = _normalize([f["drums_delta"] for f in features], invert=True)
+
+        best_idx = max(
+            range(len(unique_secs)),
+            key=lambda idx: (
+                (0.36 * attack_scores[idx]) +
+                (0.18 * sustain_scores[idx]) +
+                (0.22 * late_scores[idx]) +
+                (0.20 * beat_number_scores[idx]) +
+                (0.03 * cue_scores[idx]) +
+                (0.01 * drums_scores[idx]),
+                beat_number_scores[idx],
+                cue_scores[idx],
+                drums_scores[idx],
+                -float(unique_secs[idx]),
+            ),
+        )
+        return float(unique_secs[int(best_idx)]), True
+    return float(drums_sec), False
+
+
+def _detect_first_drop_from_mik_cues(target_folder: str,
+                                     track_names: Dict[str, Optional[str]],
+                                     bpm_value: Optional[int],
+                                     cue_secs: List[float]) -> Tuple[Dict[str, float], Optional[float], float, Optional[str], Optional[float]]:
+    if not bpm_value or bpm_value <= 0 or detect_track_folder is None:
+        return {}, None, 0.0, None, None
+    if not cue_secs:
+        return {}, None, 0.0, None, None
+
+    beat_sec = 60.0 / float(max(1, int(bpm_value)))
+    locality_sec = max(0.20, float(MIK_FIRST_DROP_LOCALITY_BEATS) * beat_sec)
+    ordered = sorted(
+        set(
+            round(max(0.0, float(sec)), 6)
+            for sec in cue_secs
+            if _as_float(sec) is not None
+        )
+    )
+    usable = [sec for sec in ordered if float(sec) >= float(MIK_FIRST_DROP_EARLY_IGNORE_SEC)]
+    if not usable and ordered:
+        usable = [ordered[0]]
+    usable = usable[:max(1, int(MIK_FIRST_DROP_MAX_CUES_TO_TRY))]
+
+    drums_path = _find_drums_stem_path(target_folder, track_names)
+    drums_audio = (None, 0)
+    if drums_path and np is not None:
+        try:
+            drums_audio = _load_audio_mono_f32_ffmpeg(drums_path, sr=22050)
+        except Exception:
+            drums_audio = (None, 0)
+
+    best_choice = None
+    for cue_sec in usable:
+        try:
+            result = detect_track_folder(
+                track_dir=target_folder,
+                debug_dir=None,
+                generate_plots=False,
+                legacy_prior_seconds=float(cue_sec),
+                legacy_prior_confidence=0.98,
+                legacy_prior_source=f"source_mik_cue:{cue_sec:.3f}",
+            )
+        except Exception as e:
+            print(f"[MIK] Cue-guided first-drop detection failed for {target_folder} at {cue_sec:.3f}s: {e}")
+            continue
+
+        raw_map = {}
+        if build_als_anchor_map is not None:
+            try:
+                raw_map = build_als_anchor_map(result)
+            except Exception:
+                raw_map = {}
+
+        drums_info = result.get("drums") or {}
+        debug_info = result.get("debug") or {}
+        drums_sec = _as_float(drums_info.get("downbeat_seconds"))
+        conf = float(_as_float(drums_info.get("confidence")) or 0.0)
+        strategy = str(debug_info.get("candidate_strategy")) if debug_info.get("candidate_strategy") else None
+        if drums_sec is None:
+            continue
+
+        anchor_sec, has_local_anchor = _select_mik_local_anchor(
+            result,
+            float(cue_sec),
+            float(drums_sec),
+            int(bpm_value),
+            y=drums_audio[0],
+            sr=int(drums_audio[1]),
+        )
+
+        delta_sec = abs(float(drums_sec) - float(cue_sec))
+        close = bool(delta_sec <= locality_sec)
+        score = float(conf)
+        if close:
+            score += 2.0
+        if strategy == "ableton_asd":
+            score += 0.15
+
+        anchor_map = _uniform_anchor_map(track_names, anchor_sec)
+
+        choice = (float(delta_sec), -float(score), float(cue_sec), anchor_map, float(anchor_sec), float(conf), strategy, bool(has_local_anchor))
+        if close and conf >= float(MIK_FIRST_DROP_MIN_CONFIDENCE):
+            return anchor_map, float(anchor_sec), float(conf), strategy, float(cue_sec)
+        if best_choice is None or choice[:3] < best_choice[:3]:
+            best_choice = choice
+
+    if best_choice is None:
+        return {}, None, 0.0, None, None
+
+    delta_sec, _, cue_sec, anchor_map, drums_sec, conf, strategy, has_local_anchor = best_choice
+    accept_without_local_anchor = float(delta_sec) <= max(2.0 * beat_sec, 0.75)
+    if (bool(has_local_anchor) or accept_without_local_anchor) and float(delta_sec) <= max(locality_sec * 2.0, 1.0) and float(conf) >= float(MIK_FIRST_DROP_MIN_CONFIDENCE):
+        return anchor_map, float(drums_sec), float(conf), strategy, float(cue_sec)
+    return {}, None, 0.0, None, None
 
 def swap_artist_title(text: str) -> str:
     parts = [p.strip() for p in text.split(" - ", 1)]
@@ -1138,12 +1519,90 @@ def get_duration_seconds(track_path: str) -> Optional[float]:
     print(f"[ERROR] Duration for {track_path}: unable to read duration (ffprobe/mutagen/trackTime).")
     return None
 
+def _available_template_bpms() -> List[int]:
+    bpms: List[int] = []
+    try:
+        for name in os.listdir(ALS_FILES_FOLDER):
+            stem, ext = os.path.splitext(name)
+            if ext.lower() != ".als":
+                continue
+            try:
+                bpm = int(stem)
+            except Exception:
+                continue
+            if bpm > 0:
+                bpms.append(int(bpm))
+    except Exception:
+        return []
+    return sorted(set(bpms))
+
 def select_blank_als(bpm_value: Optional[int]) -> Optional[str]:
     if bpm_value:
-        p = os.path.join(ALS_FILES_FOLDER, f"{bpm_value}.als")
+        exact_bpm = int(round(float(bpm_value)))
+        p = os.path.join(ALS_FILES_FOLDER, f"{exact_bpm}.als")
         if os.path.exists(p):
             return p
+
+        avail = _available_template_bpms()
+        if avail:
+            nearest = min(avail, key=lambda bpm: (abs(int(exact_bpm) - int(bpm)), int(bpm)))
+            fallback = os.path.join(ALS_FILES_FOLDER, f"{nearest}.als")
+            if os.path.exists(fallback):
+                print(f"[WARN] No exact ALS template for BPM {exact_bpm}; using nearest template {nearest}.")
+                return fallback
     return None
+
+_STEM_BPM_RE = re.compile(r"^(?:drums|inst|vocals)_(\d{2,3})_", re.I)
+
+def _infer_template_bpm_for_track(track_folder: str, folder_bpm: Optional[int]) -> Optional[int]:
+    bpm_votes: List[int] = []
+    try:
+        for name in os.listdir(track_folder):
+            m = _STEM_BPM_RE.match(name)
+            if not m:
+                continue
+            try:
+                bpm = int(m.group(1))
+            except Exception:
+                continue
+            if bpm > 0:
+                bpm_votes.append(int(bpm))
+    except Exception:
+        bpm_votes = []
+
+    if folder_bpm and folder_bpm > 0 and int(folder_bpm) in bpm_votes:
+        return int(folder_bpm)
+    if bpm_votes:
+        counts: Dict[int, int] = {}
+        for bpm in bpm_votes:
+            counts[int(bpm)] = int(counts.get(int(bpm), 0)) + 1
+        return sorted(counts.items(), key=lambda item: (-int(item[1]), int(item[0])))[0][0]
+    if folder_bpm and folder_bpm > 0:
+        return int(folder_bpm)
+    return None
+
+def _repair_track_als_from_library(track_abs: str, folder_bpm: Optional[int], force: bool=False) -> bool:
+    output_als = os.path.join(track_abs, "CH1.als")
+    if os.path.exists(output_als) and SKIP_EXISTING and not force:
+        return False
+
+    template_bpm = _infer_template_bpm_for_track(track_abs, folder_bpm)
+    if not template_bpm:
+        print(f"[SKIP] Could not infer template BPM for {track_abs}")
+        return False
+
+    blank_als = select_blank_als(template_bpm)
+    if blank_als is None:
+        print(f"[SKIP] No ALS template for BPM {template_bpm} at {track_abs}")
+        return False
+
+    track_names = collect_track_names_for_folder(track_abs)
+    if not any(track_names.values()):
+        print(f"[SKIP] No audio stems found in {track_abs}")
+        return False
+
+    modify_als_file(blank_als, track_abs, track_names, template_bpm, force=True)
+    return True
 
 def collect_track_names_for_folder(folder_abs: str) -> Dict[str, Optional[str]]:
     roles: Dict[str, Optional[str]] = {"drums": None, "inst": None, "vocals": None}
@@ -2164,6 +2623,76 @@ def _compute_phase_to_drop_bar_one(drop_sec: float, bpm: int) -> float:
     drop_beats = _sec_to_beats(drop_sec, bpm)
     return -float(drop_beats)
 
+
+def _fmt_beat_value(value: float) -> str:
+    return f"{float(value):.9f}".rstrip("0").rstrip(".")
+
+
+def _set_node_value(node: Optional[ET.Element], value: object) -> bool:
+    if node is None:
+        return False
+    new_value = str(value)
+    if node.get("Value") == new_value:
+        return False
+    node.set("Value", new_value)
+    return True
+
+
+def _normalize_audio_clip_launch_timing(clip: ET.Element,
+                                        bpm: Optional[int],
+                                        anchor_sec: Optional[float],
+                                        end_sec: Optional[float]) -> bool:
+    """
+    Use one Ableton convention everywhere:
+      - the detected drop/first downbeat is beat 0 (Live's 1.1.1)
+      - Session launch starts at beat 0
+      - loop/out/current-end use the post-anchor length
+      - hidden/scroller state shows the pre-anchor phase without changing launch
+    """
+    if not bpm or bpm <= 0 or anchor_sec is None or end_sec is None:
+        return False
+    anchor = max(0.0, float(anchor_sec))
+    clip_end = max(anchor + 0.01, float(end_sec))
+    phase = _compute_phase_to_drop_bar_one(anchor, int(bpm))
+    end_beat = max(0.01, _sec_to_beats(clip_end, int(bpm)) + float(phase))
+
+    changed = False
+    changed = _set_node_value(clip.find("./CurrentStart"), "0") or changed
+    changed = _set_node_value(clip.find("./CurrentEnd"), _fmt_beat_value(end_beat)) or changed
+
+    loop = clip.find("./Loop")
+    if loop is not None:
+        changed = _set_node_value(loop.find("./LoopStart"), "0") or changed
+        changed = _set_node_value(loop.find("./LoopEnd"), _fmt_beat_value(end_beat)) or changed
+        changed = _set_node_value(loop.find("./OutMarker"), _fmt_beat_value(end_beat)) or changed
+        changed = _set_node_value(loop.find("./HiddenLoopStart"), _fmt_beat_value(phase)) or changed
+        changed = _set_node_value(loop.find("./HiddenLoopEnd"), _fmt_beat_value(phase + 4.0)) or changed
+
+    scroller = clip.find("./ScrollerTimePreserver")
+    if scroller is not None:
+        changed = _set_node_value(scroller.find("./LeftTime"), _fmt_beat_value(phase)) or changed
+        changed = _set_node_value(scroller.find("./RightTime"), _fmt_beat_value(end_beat)) or changed
+
+    selection = clip.find("./TimeSelection")
+    if selection is not None:
+        changed = _set_node_value(selection.find("./AnchorTime"), _fmt_beat_value(phase)) or changed
+        changed = _set_node_value(selection.find("./OtherTime"), _fmt_beat_value(phase)) or changed
+
+    return changed
+
+
+def _snap_rekordbox_cue_to_grid(seconds: float, bpm: int) -> Tuple[float, float]:
+    if not bpm or bpm <= 0:
+        return float(seconds), float(seconds)
+    beats = _sec_to_beats(float(seconds), int(bpm))
+    nearest_int = round(beats)
+    if abs(beats - nearest_int) <= float(REKORDBOX_CUE_SNAP_NEAR_INT_TOL):
+        beats_q = float(nearest_int)
+    else:
+        beats_q = round(beats * int(REKORDBOX_CUE_GRID_RES)) / float(REKORDBOX_CUE_GRID_RES)
+    sec_q = (beats_q * 60.0) / float(bpm)
+    return beats_q, sec_q
+
 def _drop_anchor_offset_for_track(target_folder: str) -> float:
     track_name = os.path.basename(target_folder)
     if track_name in DROP_ANCHOR_OVERRIDES_SEC:
@@ -2172,9 +2701,9 @@ def _drop_anchor_offset_for_track(target_folder: str) -> float:
 
 def _manual_drop_from_project_als(target_folder: str, bpm: Optional[int]) -> Optional[float]:
     """
-    If user manually inserted a transient/warp marker in:
+    If user manually set the correct 1.1.1 in:
       <track folder>/CH1 Project/CH1.als
-    use the nearest marker before BeatTime=0 on the drums clip as manual drop.
+    use the drums clip marker at BeatTime=0 as the manual anchor.
     """
     proj_als = os.path.join(target_folder, "CH1 Project", "CH1.als")
     if not os.path.exists(proj_als):
@@ -2211,8 +2740,7 @@ def _manual_drop_from_project_als(target_folder: str, bpm: Optional[int]) -> Opt
             except Exception:
                 continue
             pts.append((sec, beat))
-        if len(pts) < 4:
-            # likely auto-generated (0, drop, end) with no manual marker
+        if len(pts) < 3:
             continue
         pts.sort(key=lambda x: x[0])
 
@@ -2223,23 +2751,7 @@ def _manual_drop_from_project_als(target_folder: str, bpm: Optional[int]) -> Opt
                 break
         if zero_sec is None:
             continue
-
-        prev = [(sec, beat) for sec, beat in pts if sec < (zero_sec - 1e-6)]
-        if not prev:
-            continue
-        sec_prev, beat_prev = prev[-1]
-        if beat_prev >= -1e-6:
-            # manual pre-drop marker should sit before 1.1.1 (negative beat)
-            continue
-
-        # sanity window: marker should be within up to ~8 beats before 1.1.1
-        if bpm and bpm > 0:
-            max_back = 8.0 * (60.0 / float(bpm))
-            if (zero_sec - sec_prev) > max_back:
-                continue
-        if (zero_sec - sec_prev) < 0.05:
-            continue
-        return float(sec_prev)
+        return float(zero_sec)
     return None
 
 def _max_duration_seconds(track_names: Dict[str, Optional[str]]) -> Optional[float]:
@@ -2252,6 +2764,24 @@ def _max_duration_seconds(track_names: Dict[str, Optional[str]]) -> Optional[flo
         if sec and sec > max_sec:
             max_sec = sec
     return max_sec if max_sec > 0 else None
+
+
+def _shared_stem_duration_seconds(track_names: Dict[str, Optional[str]], tolerance_sec: float = 0.05) -> Tuple[Optional[float], Dict[str, float]]:
+    durations: Dict[str, float] = {}
+    for role, rel in track_names.items():
+        if not rel:
+            continue
+        p = os.path.join(FLAC_FOLDER, rel)
+        sec = get_duration_seconds(p)
+        if sec and sec > 0:
+            durations[str(role)] = float(sec)
+    if not durations:
+        return None, {}
+    vals = list(durations.values())
+    if (max(vals) - min(vals)) <= float(tolerance_sec):
+        shared = max(vals)
+        return float(shared), {role: float(shared) for role in durations.keys()}
+    return None, durations
 
 def _max_audible_end_seconds(track_names: Dict[str, Optional[str]]) -> Optional[float]:
     if np is None:
@@ -2274,23 +2804,307 @@ def _max_audible_end_seconds(track_names: Dict[str, Optional[str]]) -> Optional[
         return max_sec
     return _max_duration_seconds(track_names)
 
+def _role_audible_end_seconds(track_names: Dict[str, Optional[str]]) -> Dict[str, float]:
+    out: Dict[str, float] = {}
+    for role, rel in track_names.items():
+        if not rel:
+            continue
+        p = os.path.join(FLAC_FOLDER, rel)
+        if not os.path.exists(p):
+            continue
+        sec = None
+        if np is None:
+            sec = get_duration_seconds(p)
+        else:
+            y, sr = _load_audio_mono_f32_ffmpeg(p, sr=22050)
+            if y is None:
+                sec = get_duration_seconds(p)
+            else:
+                sec = _last_audible_sec(y, sr)
+        if sec and sec > 0:
+            out[str(role)] = float(sec)
+    return out
+
+_CLIP_ROLE_RE = re.compile(r"(^|[^a-z])(drums|inst|vocals)(?:[-_/ ]|$)", re.I)
+
+def _clip_role_from_audio_clip(clip: ET.Element) -> Optional[str]:
+    vals: List[str] = []
+    for path in ("Name", "EffectiveName", "UserName", ".//SampleRef/FileRef/Path", ".//SampleRef/FileRef/RelativePath"):
+        node = clip.find(path)
+        if node is None:
+            continue
+        v = node.get("Value")
+        if v:
+            vals.append(str(v))
+    joined = " | ".join(vals).lower()
+    m = _CLIP_ROLE_RE.search(joined)
+    if not m:
+        return None
+    role = str(m.group(2)).lower()
+    return role if role in {"drums", "inst", "vocals"} else None
+
+def _uniform_anchor_map(track_names: Dict[str, Optional[str]], drop_sec: Optional[float]) -> Dict[str, float]:
+    if drop_sec is None:
+        return {}
+    out: Dict[str, float] = {}
+    for role, rel in track_names.items():
+        if rel:
+            out[str(role)] = max(0.0, float(drop_sec))
+    return out
+
+def _shift_anchor_map(anchor_map: Dict[str, float], delta_sec: float) -> Dict[str, float]:
+    if not anchor_map:
+        return {}
+    out: Dict[str, float] = {}
+    for role, sec in anchor_map.items():
+        out[str(role)] = max(0.0, float(sec) + float(delta_sec))
+    return out
+
+def _phi_map_from_anchor_map(anchor_map: Dict[str, float], bpm: Optional[int]) -> Dict[str, float]:
+    out: Dict[str, float] = {}
+    if not bpm or bpm <= 0:
+        return out
+    for role, sec in anchor_map.items():
+        out[str(role)] = _compute_phase_to_drop_bar_one(float(sec), int(bpm))
+    return out
+
+def _lookup_rekordbox_first_drop_prior(target_folder: str,
+                                       track_names: Dict[str, Optional[str]],
+                                       src_audio_path: Optional[str]=None) -> Tuple[Optional[float], float, str]:
+    if not USE_REKORDBOX_MIK_CUE_PRIOR or lookup_first_drop_prior is None:
+        return None, 0.0, ""
+    if not REKORDBOX_XML_PATH or not os.path.exists(REKORDBOX_XML_PATH):
+        return None, 0.0, ""
+
+    stem_paths: List[str] = []
+    for rel in track_names.values():
+        if not rel:
+            continue
+        full = os.path.join(FLAC_FOLDER, rel)
+        if os.path.exists(full):
+            stem_paths.append(full)
+
+    try:
+        return lookup_first_drop_prior(
+            xml_path=REKORDBOX_XML_PATH,
+            track_dir=target_folder,
+            source_audio_path=src_audio_path,
+            stem_paths=stem_paths,
+            preferred_num=int(REKORDBOX_FIRST_DROP_HOTCUE_NUM),
+            confidence=float(REKORDBOX_PRIOR_CONFIDENCE),
+        )
+    except Exception as e:
+        print(f"[RBX] Rekordbox cue lookup failed for {target_folder}: {e}")
+        return None, 0.0, ""
+
+
+def _lookup_rekordbox_track_cues(target_folder: str,
+                                 track_names: Dict[str, Optional[str]],
+                                 src_audio_path: Optional[str]=None) -> Tuple[List[float], str]:
+    if not USE_REKORDBOX_MIK_CUE_STAMP_TEST or lookup_track_cues is None:
+        return [], ""
+    if not REKORDBOX_XML_PATH or not os.path.exists(REKORDBOX_XML_PATH):
+        return [], ""
+
+    stem_paths: List[str] = []
+    for rel in track_names.values():
+        if not rel:
+            continue
+        full = os.path.join(FLAC_FOLDER, rel)
+        if os.path.exists(full):
+            stem_paths.append(full)
+
+    try:
+        cues, match_key = lookup_track_cues(
+            xml_path=REKORDBOX_XML_PATH,
+            track_dir=target_folder,
+            source_audio_path=src_audio_path,
+            stem_paths=stem_paths,
+        )
+        return [float(sec) for sec in cues], str(match_key or "")
+    except Exception as e:
+        print(f"[RBX] Rekordbox cue list lookup failed for {target_folder}: {e}")
+        return [], ""
+
+def _detect_alignment_with_first_downbeat(target_folder: str,
+                                          track_names: Dict[str, Optional[str]],
+                                          legacy_prior_sec: Optional[float]=None,
+                                          legacy_prior_confidence: float=0.0,
+                                          legacy_prior_source: Optional[str]=None) -> Tuple[Dict[str, float], Optional[float], float, Optional[str]]:
+    if not USE_FIRST_DOWNBEAT_DETECTOR or detect_track_folder is None:
+        return {}, None, 0.0, None
+    try:
+        result = detect_track_folder(
+            track_dir=target_folder,
+            debug_dir=None,
+            generate_plots=False,
+            legacy_prior_seconds=legacy_prior_sec,
+            legacy_prior_confidence=legacy_prior_confidence if legacy_prior_sec is not None else None,
+            legacy_prior_source=legacy_prior_source,
+        )
+    except Exception as e:
+        print(f"[WARP] FirstDownbeat detector failed for {target_folder}: {e}")
+        return {}, None, 0.0, None
+
+    anchor_map: Dict[str, float] = {}
+    if build_als_anchor_map is not None:
+        try:
+            raw_map = build_als_anchor_map(result)
+        except Exception:
+            raw_map = {}
+    else:
+        raw_map = {}
+
+    drums_info = result.get("drums") or {}
+    debug_info = result.get("debug") or {}
+    drums_sec = _as_float(drums_info.get("downbeat_seconds"))
+    conf = float(_as_float(drums_info.get("confidence")) or 0.0)
+    strategy = str(debug_info.get("candidate_strategy")) if debug_info.get("candidate_strategy") else None
+    if drums_sec is None:
+        return {}, None, conf, strategy
+
+    for role in ("drums", "inst", "vocals"):
+        if not track_names.get(role):
+            continue
+        sec = _as_float(raw_map.get(role))
+        if sec is None:
+            sec = float(drums_sec)
+        anchor_map[str(role)] = max(0.0, float(sec))
+    return anchor_map, float(drums_sec), conf, strategy
+
+
+def _drop_fusion_json_default(value):
+    if callable(drop_fusion_json_default):
+        try:
+            return drop_fusion_json_default(value)
+        except Exception:
+            pass
+    try:
+        if np is not None:
+            if isinstance(value, np.integer):
+                return int(value)
+            if isinstance(value, np.floating):
+                return float(value)
+            if isinstance(value, np.ndarray):
+                return value.tolist()
+    except Exception:
+        pass
+    return str(value)
+
+
+def _detect_drop_with_fusion(target_folder: str,
+                             track_names: Dict[str, Optional[str]],
+                             bpm_value: Optional[int],
+                             output_als: Optional[str]=None,
+                             src_audio_path: Optional[str]=None) -> Tuple[Optional[float], float, Dict[str, object]]:
+    if not USE_DROP_FUSION_AUTOMATION or build_drop_fusion_audit is None:
+        return None, 0.0, {}
+    if not bpm_value or bpm_value <= 0:
+        return None, 0.0, {}
+
+    als_path = output_als if output_als and os.path.exists(output_als) else None
+    report_path = os.path.join(target_folder, "drop_fusion_audit.json")
+    try:
+        audit = build_drop_fusion_audit(
+            target_folder,
+            als_path=als_path,
+            source_audio_path=src_audio_path,
+            rekordbox_xml_path=REKORDBOX_XML_PATH,
+            sample_rate=int(DROP_FUSION_SAMPLE_RATE),
+            per_role_limit=int(DROP_FUSION_PER_ROLE_LIMIT),
+            candidate_limit=int(DROP_FUSION_CANDIDATE_LIMIT),
+        )
+    except Exception as e:
+        print(f"[FUSION] Drop fusion audit failed for {target_folder}: {e}")
+        return None, 0.0, {"error": str(e)}
+
+    try:
+        with open(report_path, "w", encoding="utf-8") as fh:
+            json.dump(audit, fh, indent=2, sort_keys=True, default=_drop_fusion_json_default)
+            fh.write("\n")
+    except Exception as e:
+        print(f"[FUSION] Could not write fusion report for {target_folder}: {e}")
+
+    suggestion = audit.get("suggestion") if isinstance(audit, dict) else None
+    if not isinstance(suggestion, dict) or not suggestion.get("available"):
+        print(f"[FUSION] No fused drop suggestion for {target_folder}.")
+        return None, 0.0, {"report_path": report_path, "available": False}
+
+    sec = _as_float(suggestion.get("time_sec"))
+    score = float(_as_float(suggestion.get("score")) or 0.0)
+    conf = float(_as_float(suggestion.get("confidence")) or 0.0)
+    margin = float(_as_float(suggestion.get("margin_from_runner_up")) or 0.0)
+    safe = bool(suggestion.get("safe_to_write"))
+    sources = [str(src) for src in (suggestion.get("sources") or [])]
+    if sec is None:
+        return None, 0.0, {"report_path": report_path, "available": False}
+
+    meta: Dict[str, object] = {
+        "report_path": report_path,
+        "safe_to_write": safe,
+        "score": score,
+        "confidence": conf,
+        "margin_from_runner_up": margin,
+        "sources": sources,
+        "selected_policy": str(suggestion.get("selected_policy") or ""),
+    }
+    if bool(DROP_FUSION_REQUIRE_SAFE) and not safe:
+        print(
+            f"[FUSION] Held for review: {sec:.3f}s score={score:.2f} "
+            f"conf={conf:.2f} margin={margin:.3f} report={report_path}"
+        )
+        return None, conf, meta
+    if conf < float(DROP_FUSION_MIN_CONFIDENCE) or score < float(DROP_FUSION_MIN_SCORE):
+        print(
+            f"[FUSION] Rejected low-confidence suggestion: {sec:.3f}s "
+            f"score={score:.2f} conf={conf:.2f} report={report_path}"
+        )
+        return None, conf, meta
+
+    src_txt = ", ".join(sources[:5]) if sources else "fusion"
+    print(
+        f"[FUSION] Fused drop anchor: {sec:.3f}s "
+        f"score={score:.2f} conf={conf:.2f} margin={margin:.3f} sources={src_txt}"
+    )
+    return float(sec), float(conf), meta
+
 def _stamp_drop_anchor_warpmarkers(root: ET.Element,
                                    bpm: Optional[int],
-                                   drop_sec: Optional[float],
+                                   anchor_map: Dict[str, float],
+                                   role_end_sec_map: Dict[str, float],
                                    end_sec: Optional[float]) -> int:
-    if not bpm or bpm <= 0 or drop_sec is None:
+    if not bpm or bpm <= 0 or not anchor_map:
         return 0
-    if end_sec is None or end_sec <= 0:
+    drums_sec = _as_float(anchor_map.get("drums"))
+    fallback_anchor = float(drums_sec) if drums_sec is not None else None
+    if fallback_anchor is None:
+        for sec in anchor_map.values():
+            fallback_anchor = float(sec)
+            break
+    if fallback_anchor is None:
         return 0
-
-    phi = _compute_phase_to_drop_bar_one(drop_sec, bpm)
-    anchors = [0.0, float(drop_sec), float(end_sec)]
-    points = sorted(set(round(max(0.0, p), 6) for p in anchors))
-    if len(points) < 2:
+    fallback_end = _as_float(end_sec)
+    if fallback_end is None or fallback_end <= 0:
+        for sec in role_end_sec_map.values():
+            if sec and sec > 0:
+                fallback_end = max(float(fallback_end or 0.0), float(sec))
+    if fallback_end is None or fallback_end <= 0:
         return 0
 
     total = 0
     for aclip in root.iter("AudioClip"):
+        role = _clip_role_from_audio_clip(aclip)
+        clip_anchor = _as_float(anchor_map.get(role or ""))
+        if clip_anchor is None:
+            clip_anchor = float(fallback_anchor)
+        clip_end = _as_float(role_end_sec_map.get(role or "")) or float(fallback_end)
+        if clip_end <= 0.0:
+            continue
+        phi = _compute_phase_to_drop_bar_one(float(clip_anchor), int(bpm))
+        anchors = [0.0, float(clip_anchor), float(clip_end)]
+        points = sorted(set(round(max(0.0, p), 6) for p in anchors))
+        if len(points) < 2:
+            continue
         for wm in list(aclip.findall("WarpMarkers")):
             aclip.remove(wm)
         wm_parent = ET.Element("WarpMarkers")
@@ -2302,18 +3116,116 @@ def _stamp_drop_anchor_warpmarkers(root: ET.Element,
                 "BeatTime": f"{beats:.6f}",
             }))
         aclip.insert(0, wm_parent)
+        _normalize_audio_clip_launch_timing(aclip, int(bpm), float(clip_anchor), float(clip_end))
         total += len(points)
 
     for node in root.iter("IsWarped"):
         node.set("Value", "true")
     return total
 
-def modify_als_file(input_path: Optional[str], target_folder: str, track_names: Dict[str, Optional[str]], bpm_value: Optional[int], force: bool=False) -> None:
+
+def _replace_warpmarkers_with_explicit_cues(aclip: ET.Element,
+                                            cues_sec: List[float],
+                                            bpm: Optional[int],
+                                            anchor_sec: Optional[float]=None) -> int:
+    ordered: List[float] = []
+    seen = set()
+    anchor_value = _as_float(anchor_sec)
+    if anchor_value is not None:
+        zero_value = 0.0
+        seen.add(zero_value)
+        ordered.append(zero_value)
+    for raw_sec in cues_sec:
+        sec = _as_float(raw_sec)
+        if sec is None:
+            continue
+        sec = round(max(0.0, float(sec)), 6)
+        if sec in seen:
+            continue
+        seen.add(sec)
+        ordered.append(sec)
+    if anchor_value is not None:
+        anchor_value = round(max(0.0, float(anchor_value)), 6)
+        if anchor_value not in seen:
+            ordered.append(anchor_value)
+    ordered.sort()
+    if not ordered:
+        return 0
+
+    for wm_parent in list(aclip.findall("WarpMarkers")):
+        aclip.remove(wm_parent)
+    wm_parent = ET.Element("WarpMarkers")
+
+    for i, sec in enumerate(ordered):
+        if bpm and bpm > 0:
+            if anchor_value is None:
+                beat_q, sec_q = _snap_rekordbox_cue_to_grid(sec, int(bpm))
+                attrs = {
+                    "Id": str(i),
+                    "SecTime": f"{sec_q:.6f}",
+                    "BeatTime": f"{beat_q:.6f}",
+                }
+            else:
+                beat_time = _sec_to_beats(sec, int(bpm)) - _sec_to_beats(anchor_value, int(bpm))
+                attrs = {
+                    "Id": str(i),
+                    "SecTime": f"{sec:.6f}",
+                    "BeatTime": f"{beat_time:.6f}",
+                }
+        else:
+            attrs = {"Id": str(i), "SecTime": f"{sec:.6f}"}
+        wm_parent.append(ET.Element("WarpMarker", attrs))
+
+    aclip.insert(0, wm_parent)
+    return len(ordered)
+
+
+def _stamp_rekordbox_cues(root: ET.Element,
+                          cues_sec: List[float],
+                          bpm: Optional[int],
+                          anchor_map: Optional[Dict[str, float]]=None) -> int:
+    if not cues_sec:
+        return 0
+    fallback_anchor = None
+    if anchor_map:
+        drums_anchor = _as_float(anchor_map.get("drums"))
+        fallback_anchor = float(drums_anchor) if drums_anchor is not None else None
+        if fallback_anchor is None:
+            for sec in anchor_map.values():
+                fallback_anchor = _as_float(sec)
+                if fallback_anchor is not None:
+                    fallback_anchor = float(fallback_anchor)
+                    break
+    total = 0
+    for aclip in root.iter("AudioClip"):
+        role = _clip_role_from_audio_clip(aclip)
+        clip_anchor = _as_float((anchor_map or {}).get(role or "")) if anchor_map else None
+        if clip_anchor is None and fallback_anchor is not None:
+            clip_anchor = float(fallback_anchor)
+        clip_cues = list(cues_sec)
+        if clip_anchor is not None and fallback_anchor is not None:
+            delta_sec = float(clip_anchor) - float(fallback_anchor)
+            clip_cues = [max(0.0, float(sec) + delta_sec) for sec in cues_sec]
+        total += _replace_warpmarkers_with_explicit_cues(aclip, clip_cues, bpm, anchor_sec=clip_anchor)
+    for node in root.iter("IsWarped"):
+        node.set("Value", "true")
+    return total
+
+def modify_als_file(input_path: Optional[str], target_folder: str, track_names: Dict[str, Optional[str]], bpm_value: Optional[int], force: bool=False, src_audio_path: Optional[str]=None) -> None:
     output_als = os.path.join(target_folder, "CH1.als")
 
     # Respect SKIP_EXISTING unless forcing
     if os.path.exists(output_als) and SKIP_EXISTING and not force:
         return
+
+    if os.path.exists(output_als) and bool(ALS_BACKUP_BEFORE_WRITE):
+        backup_path = output_als + ".pre_fusion_backup"
+        if not os.path.exists(backup_path):
+            try:
+                shutil.copy2(output_als, backup_path)
+                print(f"[BACKUP] Saved existing ALS backup: {backup_path}")
+            except Exception as e:
+                print(f"[WARN] Could not create ALS backup for {output_als}: {e}")
 
     # If a template is provided and it's not the same file, copy it; otherwise edit in place
     if input_path and os.path.abspath(input_path) != os.path.abspath(output_als):
@@ -2322,7 +3234,9 @@ def modify_als_file(input_path: Optional[str], target_folder: str, track_names: 
         print(f"[WARN] No template for BPM {bpm_value} and no existing CH1.als at {target_folder}; skipping.")
         return
 
-    print(f"\n🎯 Creating/Updating ALS for {target_folder} (BPM {bpm_value})")
+    active_now, _peak_now = _analysis_activity_snapshot()
+    active_txt = f" [active {active_now}]" if TRACK_ORGANIZER_PARALLEL and active_now > 1 else ""
+    print(f"\n🎯{active_txt} Creating/Updating ALS for {target_folder} (BPM {bpm_value})")
     if bool(DROP_STAGE2_ENABLE) and bool(DROP_STAGE2_VERBOSE):
         print(
             f"[WARP] Stage2 active: attack_nudge={bool(DROP_STAGE2_ATTACK_NUDGE_ENABLE)}, "
@@ -2336,48 +3250,168 @@ def modify_als_file(input_path: Optional[str], target_folder: str, track_names: 
     drop_sec = None
     drop_conf = 0.0
     drop_meta: Dict[str, float] = {}
-    end_sec = _max_audible_end_seconds(track_names)
+    shared_duration_sec, shared_duration_map = _shared_stem_duration_seconds(track_names)
+    role_end_sec_map = dict(shared_duration_map) if shared_duration_map else _role_audible_end_seconds(track_names)
+    end_sec = float(shared_duration_sec) if shared_duration_sec is not None else (max(role_end_sec_map.values()) if role_end_sec_map else _max_audible_end_seconds(track_names))
     phi_beats = 0.0
     drums_source_path = None
     used_db_anchor = False
     used_manual_anchor = False
+    used_first_downbeat = False
+    used_fusion_anchor = False
+    role_anchor_map: Dict[str, float] = {}
+    first_downbeat_drums_sec = None
+    first_downbeat_conf = 0.0
+    first_downbeat_strategy = None
+    rekordbox_prior_sec = None
+    rekordbox_prior_conf = 0.0
+    rekordbox_prior_reason = ""
+    rekordbox_cues_sec: List[float] = []
+    rekordbox_cue_match = ""
+    use_rekordbox_cue_test = False
+    mik_first_drop_cue_sec = None
 
-    if track_names.get("drums") and bpm_value:
+    if USE_REKORDBOX_MIK_CUE_STAMP_TEST:
+        rekordbox_cues_sec, rekordbox_cue_match = _lookup_source_audio_mik_cues(
+            track_names,
+            src_audio_path=src_audio_path,
+        )
+        if not rekordbox_cues_sec:
+            rekordbox_cues_sec, rekordbox_cue_match = _lookup_rekordbox_track_cues(
+                target_folder,
+                track_names,
+                src_audio_path=src_audio_path,
+            )
+        if rekordbox_cues_sec:
+            use_rekordbox_cue_test = True
+            print(f"[MIK] Test cue-stamp mode: {len(rekordbox_cues_sec)} cue(s) loaded via {rekordbox_cue_match or 'mixed_in_key'}.")
+        else:
+            print(f"[MIK] Test cue-stamp mode enabled but no Mixed In Key cues were found for {target_folder}; falling back to drop-anchor warp markers.")
+
+    if use_rekordbox_cue_test and bpm_value and rekordbox_cues_sec:
+        role_anchor_map, first_downbeat_drums_sec, first_downbeat_conf, first_downbeat_strategy, mik_first_drop_cue_sec = _detect_first_drop_from_mik_cues(
+            target_folder,
+            track_names,
+            bpm_value,
+            rekordbox_cues_sec,
+        )
+        if first_downbeat_drums_sec is not None:
+            drop_sec = float(first_downbeat_drums_sec)
+            drop_conf = max(float(drop_conf), float(first_downbeat_conf))
+            used_first_downbeat = True
+            cue_txt = f" cue={float(mik_first_drop_cue_sec):.3f}s" if mik_first_drop_cue_sec is not None else ""
+            strategy_txt = f" strategy={first_downbeat_strategy}" if first_downbeat_strategy else ""
+            print(f"[MIK] ASD first-drop anchor:{cue_txt} -> {float(first_downbeat_drums_sec):.3f}s conf={float(first_downbeat_conf):.2f}{strategy_txt}")
+
+    if bpm_value and not use_rekordbox_cue_test:
+        rekordbox_prior_sec, rekordbox_prior_conf, rekordbox_prior_reason = _lookup_rekordbox_first_drop_prior(
+            target_folder,
+            track_names,
+            src_audio_path=src_audio_path,
+        )
+        if rekordbox_prior_sec is not None:
+            print(f"[RBX] Mixed In Key first-drop prior: {float(rekordbox_prior_sec):.3f}s ({rekordbox_prior_reason})")
+
+    if bpm_value and not used_first_downbeat:
+        role_anchor_map, first_downbeat_drums_sec, first_downbeat_conf, first_downbeat_strategy = _detect_alignment_with_first_downbeat(
+            target_folder,
+            track_names,
+            legacy_prior_sec=rekordbox_prior_sec,
+            legacy_prior_confidence=float(rekordbox_prior_conf),
+            legacy_prior_source=rekordbox_prior_reason or None,
+        )
+        if first_downbeat_drums_sec is not None:
+            strategy_suffix = f" strategy={first_downbeat_strategy}" if first_downbeat_strategy else ""
+            print(f"[WARP] FirstDownbeat detector: drums={float(first_downbeat_drums_sec):.3f}s conf={float(first_downbeat_conf):.2f}{strategy_suffix}")
+            if float(first_downbeat_conf) >= float(FIRST_DOWNBEAT_MIN_CONFIDENCE):
+                drop_sec = float(first_downbeat_drums_sec)
+                drop_conf = max(float(drop_conf), float(first_downbeat_conf))
+                used_first_downbeat = True
+            else:
+                print(
+                    f"[WARP] FirstDownbeat confidence {float(first_downbeat_conf):.2f} "
+                    f"below gate {float(FIRST_DOWNBEAT_MIN_CONFIDENCE):.2f}; using legacy fallback for drums anchor."
+                )
+
+    if (not used_first_downbeat) and track_names.get("drums") and bpm_value:
         flac_path = os.path.join(FLAC_FOLDER, track_names["drums"])
         drums_source_path = flac_path if os.path.exists(flac_path) else None
         new_loop_end = get_duration_in_beats(flac_path, bpm_value)
         if os.path.exists(flac_path):
             drop_sec, drop_conf, drop_meta = _detect_drop_anchor_sec(flac_path, bpm_value)
-    else:
+    elif (not used_first_downbeat):
         drums_abs = _find_drums_stem_path(target_folder, track_names)
         drums_source_path = drums_abs if drums_abs and os.path.exists(drums_abs) else None
         if drums_abs and bpm_value:
             drop_sec, drop_conf, drop_meta = _detect_drop_anchor_sec(drums_abs, bpm_value)
+    elif track_names.get("drums"):
+        flac_path = os.path.join(FLAC_FOLDER, track_names["drums"])
+        drums_source_path = flac_path if os.path.exists(flac_path) else None
+        new_loop_end = get_duration_in_beats(flac_path, bpm_value)
 
     # Ground-truth lookup DB (built from manually-cued ALS projects).
-    if bpm_value and drums_source_path:
+    if (not use_rekordbox_cue_test) and bpm_value and drums_source_path:
         db_sec, db_conf, db_reason = _lookup_drop_from_db(drums_source_path, bpm_value)
         if db_sec is not None:
             drop_sec = float(db_sec)
             drop_conf = max(float(drop_conf), float(db_conf))
             used_db_anchor = True
+            if used_first_downbeat and first_downbeat_drums_sec is not None and role_anchor_map:
+                role_anchor_map = _shift_anchor_map(role_anchor_map, float(db_sec) - float(first_downbeat_drums_sec))
+            else:
+                role_anchor_map = _uniform_anchor_map(track_names, drop_sec)
             print(f"[WARP] Using drop DB anchor: {drop_sec:.3f}s ({db_reason})")
 
-    # Manual override from Ableton project (if user marked the desired pre-1.1.1 transient).
-    if bpm_value:
+    # Manual override from Ableton project (if user set the correct 1.1.1 on the drums clip).
+    if (not use_rekordbox_cue_test) and bpm_value:
         manual_sec = _manual_drop_from_project_als(target_folder, bpm_value)
         if manual_sec is not None:
             drop_sec = float(manual_sec)
             drop_conf = max(float(drop_conf), 0.99)
             used_manual_anchor = True
+            if used_first_downbeat and first_downbeat_drums_sec is not None and role_anchor_map:
+                role_anchor_map = _shift_anchor_map(role_anchor_map, float(manual_sec) - float(first_downbeat_drums_sec))
+            else:
+                role_anchor_map = _uniform_anchor_map(track_names, drop_sec)
             if drums_source_path:
                 if _upsert_drop_db_label(drums_source_path, float(manual_sec), bpm_value, source="manual_ch1_project"):
                     print("[WARP] Learned manual marker into drop DB.")
-            print(f"[WARP] Using manual drop marker from CH1 Project: {drop_sec:.3f}s")
+            print(f"[WARP] Using manual 1.1.1 from CH1 Project: {drop_sec:.3f}s")
+
+    if (not use_rekordbox_cue_test) and bpm_value:
+        fusion_sec, fusion_conf, fusion_meta = _detect_drop_with_fusion(
+            target_folder,
+            track_names,
+            bpm_value,
+            output_als=output_als,
+            src_audio_path=src_audio_path,
+        )
+        if fusion_sec is not None:
+            if used_manual_anchor and not bool(DROP_FUSION_OVERRIDE_MANUAL_ANCHOR):
+                print("[FUSION] Manual CH1 marker kept; fusion override of manual anchors is disabled.")
+            elif used_db_anchor and not bool(DROP_FUSION_OVERRIDE_DB_ANCHOR):
+                print("[FUSION] Drop DB marker kept; fusion override of DB anchors is disabled.")
+            else:
+                previous_drop_sec = _as_float(drop_sec)
+                drop_sec = float(fusion_sec)
+                drop_conf = max(float(drop_conf), float(fusion_conf))
+                drop_meta = dict(drop_meta or {})
+                drop_meta["drop_fusion_source"] = 1.0
+                drop_meta["drop_fusion_confidence"] = float(fusion_conf)
+                drop_meta["drop_fusion_score"] = float(_as_float((fusion_meta or {}).get("score")) or 0.0)
+                drop_meta["drop_fusion_margin"] = float(_as_float((fusion_meta or {}).get("margin_from_runner_up")) or 0.0)
+                drop_meta["drop_fusion_report_path"] = str((fusion_meta or {}).get("report_path") or "")
+                if role_anchor_map and previous_drop_sec is not None:
+                    role_anchor_map = _shift_anchor_map(role_anchor_map, float(drop_sec) - float(previous_drop_sec))
+                else:
+                    role_anchor_map = _uniform_anchor_map(track_names, float(drop_sec))
+                used_fusion_anchor = True
+                used_first_downbeat = True
+                print(f"[FUSION] Using fused 1.1.1 anchor: {drop_sec:.3f}s")
 
     # Self-learning model on unseen tracks:
     # 1) waveform signature shift (preferred), 2) detector-feature kNN fallback.
-    if bpm_value and drop_sec is not None and (not used_db_anchor) and (not used_manual_anchor):
+    if (not use_rekordbox_cue_test) and bpm_value and drop_sec is not None and (not used_db_anchor) and (not used_manual_anchor) and (not used_first_downbeat) and (not used_fusion_anchor):
         if float(_as_float(drop_meta.get("alsdrop_source")) or 0.0) >= 0.5:
             pass
         else:
@@ -2409,8 +3443,8 @@ def modify_als_file(input_path: Optional[str], target_folder: str, track_names: 
                             drop_sec = shifted
                             drop_conf = max(float(drop_conf), min(0.95, 0.55 + (0.35 * float(ml_conf))))
 
-    if bpm_value and drop_sec is not None:
-        if bool(DROP_STAGE2_ENABLE):
+    if (not use_rekordbox_cue_test) and bpm_value and drop_sec is not None:
+        if bool(DROP_STAGE2_ENABLE) and (not used_first_downbeat) and (not used_fusion_anchor):
             allow_db = bool(DROP_STAGE2_APPLY_ON_DB_ANCHOR)
             allow_manual = bool(DROP_STAGE2_APPLY_ON_MANUAL_ANCHOR)
             blocked = (used_db_anchor and (not allow_db)) or (used_manual_anchor and (not allow_manual))
@@ -2432,7 +3466,15 @@ def modify_als_file(input_path: Optional[str], target_folder: str, track_names: 
         off = _drop_anchor_offset_for_track(target_folder)
         if off:
             drop_sec = max(0.0, float(drop_sec) + off)
+            if role_anchor_map:
+                role_anchor_map = _shift_anchor_map(role_anchor_map, off)
         phi_beats = _compute_phase_to_drop_bar_one(drop_sec, bpm_value)
+
+    if use_rekordbox_cue_test and bpm_value and drop_sec is not None:
+        phi_beats = _compute_phase_to_drop_bar_one(drop_sec, bpm_value)
+
+    if (not role_anchor_map) and drop_sec is not None:
+        role_anchor_map = _uniform_anchor_map(track_names, drop_sec)
 
     # Read + parse
     with gzip.open(output_als, "rb") as f:
@@ -2440,35 +3482,58 @@ def modify_als_file(input_path: Optional[str], target_folder: str, track_names: 
     tree = ET.parse(BytesIO(als_data))
     root = tree.getroot()
 
-    # Mirror manual workflow:
-    # 1) place a marker on drums drop transient
-    # 2) set that marker to 1.1.1
-    # 3) apply same phase to all clips so drums/inst/vocals launch in sync
-    stamped = _stamp_drop_anchor_warpmarkers(root, bpm_value, drop_sec, end_sec)
-    if stamped and drop_sec is not None:
-        print(f"[WARP] Drop anchor set at {drop_sec:.3f}s (1.1.1), confidence={drop_conf:.2f}.")
-        if drop_conf < 0.45:
-            print("[WARP] Low-confidence drop; consider adjusting DROP_ANCHOR_OFFSET_SEC for this track.")
+    if use_rekordbox_cue_test:
+        stamped = _stamp_rekordbox_cues(root, rekordbox_cues_sec, bpm_value, anchor_map=role_anchor_map if drop_sec is not None else None)
+        if stamped:
+            print(f"[MIK] Stamped {len(rekordbox_cues_sec)} Mixed In Key cue(s) into ALS warp markers.")
+            if drop_sec is not None:
+                print(f"[MIK] 1.1.1 anchor set from ASD at {float(drop_sec):.3f}s.")
+    else:
+        # Mirror manual workflow:
+        # 1) place a marker on drums drop transient
+        # 2) set that marker to 1.1.1
+        # 3) apply role-specific anchors so drums/inst/vocals hit the same musical 1.1.1
+        stamped = _stamp_drop_anchor_warpmarkers(root, bpm_value, role_anchor_map, role_end_sec_map, end_sec)
+        if stamped and drop_sec is not None:
+            print(f"[WARP] Drop anchor set at {drop_sec:.3f}s (1.1.1), confidence={drop_conf:.2f}.")
+            if drop_conf < 0.45:
+                print("[WARP] Low-confidence drop; consider adjusting DROP_ANCHOR_OFFSET_SEC for this track.")
+            if role_anchor_map:
+                role_bits = ", ".join(f"{role}={float(sec):.3f}s" for role, sec in sorted(role_anchor_map.items()))
+                print(f"[WARP] Role anchors: {role_bits}")
 
     # Update loop/time markers from real end marker in warped timeline.
     if end_sec and bpm_value:
-        end_beats = _sec_to_beats(end_sec, bpm_value) + phi_beats
-        end_beats_str = f"{end_beats:.6f}"
+        phi_map = _phi_map_from_anchor_map(role_anchor_map, bpm_value) if role_anchor_map else {}
+        drums_phi = float(phi_map.get("drums", phi_beats))
         loop_updates = 0
         out_updates = 0
         for clip in root.iter("AudioClip"):
+            role = _clip_role_from_audio_clip(clip)
+            clip_end_sec = _as_float(role_end_sec_map.get(role or "")) or float(end_sec)
+            clip_anchor = _as_float(role_anchor_map.get(role or "")) if role_anchor_map else None
+            if clip_anchor is None and drop_sec is not None:
+                clip_anchor = float(drop_sec)
+            clip_phi = float(phi_map.get(role or "", drums_phi))
+            end_beats_str = f"{(_sec_to_beats(float(clip_end_sec), bpm_value) + float(clip_phi)):.6f}"
             for loop_node in clip.iter("LoopEnd"):
                 loop_node.set("Value", end_beats_str)
                 loop_updates += 1
             for out_node in clip.iter("OutMarker"):
                 out_node.set("Value", end_beats_str)
                 out_updates += 1
+            if clip_anchor is not None:
+                _normalize_audio_clip_launch_timing(clip, bpm_value, float(clip_anchor), float(clip_end_sec))
 
         # Fallback in case template structure differs.
         if loop_updates == 0:
+            end_beats = _sec_to_beats(end_sec, bpm_value) + drums_phi
+            end_beats_str = f"{end_beats:.6f}"
             for loop_node in root.iter("LoopEnd"):
                 loop_node.set("Value", end_beats_str)
         if out_updates == 0:
+            end_beats = _sec_to_beats(end_sec, bpm_value) + drums_phi
+            end_beats_str = f"{end_beats:.6f}"
             for out_node in root.iter("OutMarker"):
                 out_node.set("Value", end_beats_str)
     elif new_loop_end:
@@ -2506,7 +3571,7 @@ def modify_als_file(input_path: Optional[str], target_folder: str, track_names: 
     print(f"✅ ALS saved: {output_als}")
 
 # ========= MOVES =========
-def move_folder_to_target(stems_folder_abs: str, bpm: int, cam: str, energy: Optional[int], src_basename: Optional[str], allow_rename: bool) -> Tuple[str, bool, bool, bool]:
+def move_folder_to_target(stems_folder_abs: str, bpm: int, cam: str, energy: Optional[int], src_basename: Optional[str], allow_rename: bool, src_audio_path: Optional[str]=None) -> Tuple[str, bool, bool, bool]:
     track_name = os.path.basename(stems_folder_abs)
     desired_name = desired_track_folder_name(track_name, src_basename, allow_rename)
     bpm_folder = os.path.join(destination_folder, str(bpm))
@@ -2539,9 +3604,9 @@ def move_folder_to_target(stems_folder_abs: str, bpm: int, cam: str, energy: Opt
 
     # If no template available, but an ALS exists, modify in place
     if blank_als is None and os.path.exists(output_als):
-        modify_als_file(output_als, dest_path, track_names, bpm, force=True)
+        modify_als_file(output_als, dest_path, track_names, bpm, force=True, src_audio_path=src_audio_path)
     else:
-        modify_als_file(blank_als, dest_path, track_names, bpm, force=force_regen)
+        modify_als_file(blank_als, dest_path, track_names, bpm, force=force_regen, src_audio_path=src_audio_path)
 
     return dest_path, moved, energy_added, True
 
@@ -2571,7 +3636,7 @@ def process_new_stems_from_toBeOrganized(idx_exact: Dict[str,str]) -> None:
             continue
 
         src_base = os.path.splitext(os.path.basename(src_audio))[0]
-        move_folder_to_target(stems_abs, bpm, cam, energy, src_base, allow_rename=True)
+        move_folder_to_target(stems_abs, bpm, cam, energy, src_base, allow_rename=True, src_audio_path=src_audio)
 
 def _snapshot_tracks(dest_folder: str):
     items = []
@@ -2591,24 +3656,115 @@ def _snapshot_tracks(dest_folder: str):
                     items.append((int(bpm_dir), cam_dir, track_folder, track_abs))
     return items
 
-def reconcile_existing_stems(idx_exact: Dict[str,str]) -> None:
-    moved = regenerated = 0
-    for cur_bpm, cur_cam, track_folder, track_abs in _snapshot_tracks(destination_folder):
+
+def _analysis_worker_count(task_count: int) -> int:
+    if task_count <= 1 or not TRACK_ORGANIZER_PARALLEL:
+        return 1
+    return max(1, min(int(task_count), int(TRACK_ORGANIZER_MAX_WORKERS)))
+
+
+def _reset_analysis_activity() -> None:
+    global _ACTIVE_ANALYSIS_TASKS, _PEAK_ANALYSIS_TASKS
+    with _ACTIVE_ANALYSIS_LOCK:
+        _ACTIVE_ANALYSIS_TASKS = 0
+        _PEAK_ANALYSIS_TASKS = 0
+
+
+def _enter_analysis_activity() -> Tuple[int, int]:
+    global _ACTIVE_ANALYSIS_TASKS, _PEAK_ANALYSIS_TASKS
+    with _ACTIVE_ANALYSIS_LOCK:
+        _ACTIVE_ANALYSIS_TASKS += 1
+        if _ACTIVE_ANALYSIS_TASKS > _PEAK_ANALYSIS_TASKS:
+            _PEAK_ANALYSIS_TASKS = _ACTIVE_ANALYSIS_TASKS
+        return int(_ACTIVE_ANALYSIS_TASKS), int(_PEAK_ANALYSIS_TASKS)
+
+
+def _leave_analysis_activity() -> int:
+    global _ACTIVE_ANALYSIS_TASKS
+    with _ACTIVE_ANALYSIS_LOCK:
+        _ACTIVE_ANALYSIS_TASKS = max(0, int(_ACTIVE_ANALYSIS_TASKS) - 1)
+        return int(_ACTIVE_ANALYSIS_TASKS)
+
+
+def _analysis_activity_snapshot() -> Tuple[int, int]:
+    with _ACTIVE_ANALYSIS_LOCK:
+        return int(_ACTIVE_ANALYSIS_TASKS), int(_PEAK_ANALYSIS_TASKS)
+
+
+def _reconcile_existing_track(cur_bpm: int, cur_cam: str, track_folder: str, track_abs: str, idx_exact: Dict[str, str]) -> Tuple[int, int, int]:
+    _enter_analysis_activity()
+    try:
+        repaired_in_place = 0
         src_audio = find_source_for_track(idx_exact, track_folder)
         if not src_audio:
-            continue  # silent if no match
+            if _repair_track_als_from_library(track_abs, cur_bpm, force=(not SKIP_EXISTING)):
+                repaired_in_place = 1
+                return 0, 1, repaired_in_place
+            return 0, 0, repaired_in_place
 
         bpm, key, energy = get_bpm_key_energy(src_audio)
         cam = to_camelot(key or "")
         if bpm is None or cam == "Unknown Key":
-            continue
+            if _repair_track_als_from_library(track_abs, cur_bpm, force=(not SKIP_EXISTING)):
+                repaired_in_place = 1
+                return 0, 1, repaired_in_place
+            return 0, 0, repaired_in_place
 
         src_base = os.path.splitext(os.path.basename(src_audio))[0]
-        _, did_move, added_energy, wrote_als = move_folder_to_target(track_abs, bpm, cam, energy, src_base, allow_rename=False)
-        if did_move: moved += 1
-        if wrote_als: regenerated += 1
+        _, did_move, _added_energy, wrote_als = move_folder_to_target(
+            track_abs,
+            bpm,
+            cam,
+            energy,
+            src_base,
+            allow_rename=False,
+            src_audio_path=src_audio,
+        )
+        return int(bool(did_move)), int(bool(wrote_als)), repaired_in_place
+    finally:
+        _leave_analysis_activity()
 
-    print(f"[INFO] Reconcile complete. Moved: {moved}, ALS updated: {regenerated}")
+def reconcile_existing_stems(idx_exact: Dict[str,str]) -> None:
+    moved = regenerated = repaired_in_place = 0
+    tasks = _snapshot_tracks(destination_folder)
+    worker_count = _analysis_worker_count(len(tasks))
+    completed = 0
+    _reset_analysis_activity()
+
+    if worker_count <= 1:
+        for cur_bpm, cur_cam, track_folder, track_abs in tasks:
+            did_move, wrote_als, repaired = _reconcile_existing_track(cur_bpm, cur_cam, track_folder, track_abs, idx_exact)
+            moved += int(did_move)
+            regenerated += int(wrote_als)
+            repaired_in_place += int(repaired)
+    else:
+        print(f"[INFO] Reconcile using {worker_count} worker(s); ALSDrop device={ALSDROP_DEVICE}.")
+        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="track-analysis") as executor:
+            future_map = {
+                executor.submit(_reconcile_existing_track, cur_bpm, cur_cam, track_folder, track_abs, idx_exact): track_folder
+                for cur_bpm, cur_cam, track_folder, track_abs in tasks
+            }
+            for future in as_completed(future_map):
+                track_folder = future_map[future]
+                try:
+                    did_move, wrote_als, repaired = future.result()
+                except Exception as exc:
+                    print(f"[ERROR] Reconcile failed for {track_folder}: {exc}")
+                    raise
+                completed += 1
+                moved += int(did_move)
+                regenerated += int(wrote_als)
+                repaired_in_place += int(repaired)
+                active_now, peak_now = _analysis_activity_snapshot()
+                print(
+                    f"[INFO] Reconcile progress: {completed}/{len(tasks)} complete; "
+                    f"active={active_now}, peak={peak_now}"
+                )
+
+    _active_now, peak_now = _analysis_activity_snapshot()
+    if worker_count > 1:
+        print(f"[INFO] Reconcile peak in-flight analyses: {peak_now}")
+    print(f"[INFO] Reconcile complete. Moved: {moved}, ALS updated: {regenerated}, In-place template repairs: {repaired_in_place}")
 
 def undo_renamed_folders(idx_exact: Dict[str,str]) -> None:
     source_names = set(idx_exact.keys())
@@ -2640,7 +3796,8 @@ if __name__ == "__main__":
         index_exact = index_source_library(mp3_source_folder)     # exact base-name index (NFC)
         if ONE_TIME_UNDO_RENAME:
             undo_renamed_folders(index_exact)
-        process_new_stems_from_toBeOrganized(index_exact)         # place new folders
+        if not REPAIR_EXISTING_LIBRARY_ONLY:
+            process_new_stems_from_toBeOrganized(index_exact)     # place new folders
         reconcile_existing_stems(index_exact)                     # fix existing folders (force-regens if SKIP_EXISTING=False)
         _write_alsdrop_review_queue_exports()
         print("🎵 Done.")

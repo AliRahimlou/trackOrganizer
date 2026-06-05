@@ -19,6 +19,7 @@ htmlcov/
 .venv/
 venv/
 venv311/
+node_modules/
 
 # Local logs/temp
 *.log

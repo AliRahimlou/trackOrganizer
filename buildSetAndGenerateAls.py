@@ -35,11 +35,13 @@ BPM_RANGE_MAX     = 150
 # If True, ignore BPM/harmonic/energy settings and use all tracks in DATE_RANGE (by CH1.als mtime)
 USE_NEWEST_TRACKS = True
 # Required when USE_NEWEST_TRACKS=True. Format: "12-19-25--12-21-25" or "2025-12-19--2025-12-21"
-DATE_RANGE = "2-14-26--2-18-26"
+DATE_RANGE = "2-20-26--4-18-26"
 # If True, rename "Artist - Title" to "Title - Artist" in scene/clip names
 RENAME_TRACKS = False
 # If True, duplicate tracks found in the target ALS are replaced instead of skipped
 OVERWRITE_DUPLICATES = True
+# If True, insert corrected per-track DROP_ALIGNED ALS rows when available.
+PREFER_DROP_ALIGNED_SOURCES = True
 
 # strict → same key, ±1 (same letter), relative (A↔B)
 # energy → strict + energy boost/drop (±2, same letter)
@@ -662,6 +664,21 @@ def source_clip_names(src_path: Path) -> Dict[int, str]:
             out[ch_idx] = nm
     return out
 
+def preferred_source_als(src_path: Path) -> Path:
+    if not PREFER_DROP_ALIGNED_SOURCES:
+        return src_path
+    folder = src_path.parent
+    if not folder.exists():
+        return src_path
+    candidates = [
+        p for p in folder.glob("*_DROP_ALIGNED.als")
+        if p.is_file() and ".previous" not in p.name
+    ]
+    if not candidates:
+        return src_path
+    candidates.sort(key=lambda p: (p.stat().st_mtime, p.name), reverse=True)
+    return candidates[0]
+
 def existing_clip_names(ch_map: dict[int, ET.Element], chs=(1,2,3)) -> Dict[int, Set[str]]:
     out: Dict[int, Set[str]] = {}
     for ch in chs:
@@ -938,7 +955,8 @@ def combine_in_order(chosen_tracks: List[Dict[str, Any]], base_als: Path, out_fi
             scene_name = f"{t['bpm']}_{t['key']}_{energy}-{folder_name}"
         else:
             scene_name = f"{t['bpm']}_{t['key']}-{folder_name}"
-        src_names = source_clip_names(Path(t["src"]))
+        src_als = preferred_source_als(Path(t["src"]))
+        src_names = source_clip_names(src_als)
         dup_rows = duplicate_row_indices(ch_map, src_names, chs=(1,2,3))
         if dup_rows and not OVERWRITE_DUPLICATES:
             print(f"[SKIP] Duplicate found, skipping: {scene_name}")
@@ -949,7 +967,7 @@ def combine_in_order(chosen_tracks: List[Dict[str, Any]], base_als: Path, out_fi
             print(f"[OVERWRITE] Replacing {len(dup_rows)} duplicate row(s): {scene_name}")
         insert_idx = find_insert_index(scenes_node(master_root), reference_track, scene_sort_key_from_track(t))
         insert_idx = adjust_insert_index_for_blocks(insert_idx, locked_row_blocks(ch_map))
-        insert_scene(master_root, all_tracks, ch_map, Path(t["src"]), scene_name, insert_idx)
+        insert_scene(master_root, all_tracks, ch_map, src_als, scene_name, insert_idx)
 
     if RENAME_TRACKS:
         sc = scenes_node(master_root)

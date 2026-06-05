@@ -8,6 +8,22 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 
+def _patch_legacy_madmom_runtime() -> None:
+    """Keep madmom 0.16 usable on modern Python/NumPy runtimes."""
+    try:
+        import collections
+        import collections.abc
+
+        for name in ("MutableSequence", "MutableMapping", "Mapping", "Sequence", "Iterable"):
+            if not hasattr(collections, name):
+                setattr(collections, name, getattr(collections.abc, name))
+    except Exception:
+        pass
+    for name, value in {"float": float, "int": int, "complex": complex}.items():
+        if not hasattr(np, name):
+            setattr(np, name, value)
+
+
 def nearest_frame_idx(frame_times: np.ndarray, sec: float) -> int:
     if frame_times.size == 0:
         return 0
@@ -27,6 +43,7 @@ def _peak_indices(x: np.ndarray, q: float = 85.0) -> np.ndarray:
 
 def madmom_downbeats(audio_path: str) -> np.ndarray:
     try:
+        _patch_legacy_madmom_runtime()
         from madmom.features.downbeats import RNNDownBeatProcessor, DBNDownBeatTrackingProcessor  # type: ignore
     except Exception:
         return np.asarray([], dtype=np.float32)
@@ -144,4 +161,3 @@ def snap_to_nearest_downbeat(pred_sec: float, downbeat_times: Sequence[float]) -
         return float(pred_sec)
     best = min(downbeat_times, key=lambda t: abs(float(t) - float(pred_sec)))
     return float(best)
-

@@ -292,13 +292,44 @@ def replace_warp_markers_with_anchor(
 
     # Keep loop/out markers consistent with warped endpoint.
     end_beat = ((max(0.0, float(end_sec)) * float(bpm)) / 60.0) + phase
-    for tag in ("LoopEnd", "OutMarker"):
-        for node in clip.iter(tag):
-            node.set("Value", f"{end_beat:.6f}")
+    current_start = clip.find("CurrentStart")
+    if current_start is not None:
+        current_start.set("Value", "0")
+    current_end = clip.find("CurrentEnd")
+    if current_end is not None:
+        current_end.set("Value", f"{end_beat:.6f}")
+
+    loop = clip.find("Loop")
+    if loop is not None:
+        for tag, value in (
+            ("LoopStart", 0.0),
+            ("LoopEnd", end_beat),
+            ("OutMarker", end_beat),
+            ("HiddenLoopStart", phase),
+            ("HiddenLoopEnd", phase + 4.0),
+        ):
+            node = loop.find(tag)
+            if node is not None:
+                node.set("Value", f"{float(value):.6f}")
+
+    scroller = clip.find("ScrollerTimePreserver")
+    if scroller is not None:
+        left = scroller.find("LeftTime")
+        if left is not None:
+            left.set("Value", f"{phase:.6f}")
+        right = scroller.find("RightTime")
+        if right is not None:
+            right.set("Value", f"{end_beat:.6f}")
+
+    selection = clip.find("TimeSelection")
+    if selection is not None:
+        for tag in ("AnchorTime", "OtherTime"):
+            node = selection.find(tag)
+            if node is not None:
+                node.set("Value", f"{phase:.6f}")
 
 
 def nearest_time(value: float, candidates: List[float]) -> float:
     if not candidates:
         return float(value)
     return min(candidates, key=lambda t: abs(float(t) - float(value)))
-
