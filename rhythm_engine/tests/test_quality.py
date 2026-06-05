@@ -45,3 +45,36 @@ def test_assess_grid_quality_flags_unstable_single_provider_grid_low() -> None:
     assert "single_provider" in report.warnings
     assert "unstable_tempo" in report.warnings
     assert "large_micro_refine_offset" in report.warnings
+
+
+def test_assess_grid_quality_flags_fusion_duplicate_pressure() -> None:
+    beats = tuple(0.5 * idx for idx in range(80))
+    final = RhythmEstimate(
+        provider="final",
+        beats=beats,
+        downbeats=beats[::4],
+        confidence=0.9,
+        metadata={
+            "hypothesis_selector_score": {"final_score": 0.80},
+            "grid_repair_tempo_stability": 0.98,
+        },
+    )
+    fused = RhythmEstimate(
+        provider="fusion",
+        beats=beats,
+        confidence=0.8,
+        metadata={
+            "provider_count": 3,
+            "beat_clusters": [
+                {"time_sec": 0.0, "suppressed": False},
+                {"time_sec": 0.07, "suppressed": True},
+                {"time_sec": 0.5, "suppressed": False},
+                {"time_sec": 0.57, "suppressed": True},
+            ],
+        },
+    )
+
+    report = assess_grid_quality(final, fused=fused)
+
+    assert report.fusion_suppressed_cluster_ratio == 0.5
+    assert "fusion_duplicate_pressure" in report.warnings

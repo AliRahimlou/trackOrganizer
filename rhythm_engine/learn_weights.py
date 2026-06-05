@@ -35,9 +35,40 @@ def _score_report(report: Mapping[str, Any]) -> Optional[float]:
         return None
     if not np.isfinite([median, p95, hit20, hit70, continuity]).all():
         return None
+    f1_20 = _finite_metric(report.get("f1_20ms"), default=hit20)
+    f1_70 = _finite_metric(report.get("f1_70ms"), default=hit70)
+    precision_70 = _finite_metric(report.get("precision_70ms"), default=hit70)
+    recall_70 = _finite_metric(report.get("recall_70ms"), default=hit70)
+    false_positives = max(0.0, _finite_metric(report.get("false_positive_count_70ms"), default=0.0))
+    missed = max(0.0, _finite_metric(report.get("missed_count_70ms"), default=0.0))
+    estimated = max(1.0, _finite_metric(report.get("estimated_count"), default=1.0))
+    reference = max(1.0, _finite_metric(report.get("reference_count"), default=1.0))
+    duplicate_penalty = min(0.22, 0.12 * (false_positives / estimated) + 0.14 * (missed / reference))
     precision = 1.0 / (1.0 + max(0.0, median) / 12.0)
     tail = 1.0 / (1.0 + max(0.0, p95) / 45.0)
-    return float((0.34 * precision) + (0.25 * hit20) + (0.18 * hit70) + (0.13 * continuity) + (0.10 * tail))
+    return float(
+        np.clip(
+            (0.24 * precision)
+            + (0.18 * hit20)
+            + (0.20 * f1_20)
+            + (0.12 * f1_70)
+            + (0.08 * precision_70)
+            + (0.08 * recall_70)
+            + (0.06 * continuity)
+            + (0.04 * tail)
+            - duplicate_penalty,
+            0.0,
+            1.0,
+        )
+    )
+
+
+def _finite_metric(value: Any, *, default: float) -> float:
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    return out if np.isfinite(out) else float(default)
 
 
 def learn_provider_weights_from_payloads(payloads: Iterable[Mapping[str, Any]]) -> Dict[str, float]:

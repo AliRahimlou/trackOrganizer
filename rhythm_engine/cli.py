@@ -32,6 +32,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--reference-downbeats", help="Optional newline-separated reference downbeat seconds")
     parser.add_argument("--fusion-radius-ms", type=float, default=45.0)
     parser.add_argument("--downbeat-fusion-radius-ms", type=float, default=90.0)
+    parser.add_argument("--no-fusion-dedupe", action="store_true", help="Disable tempo-aware duplicate event suppression after fusion")
+    parser.add_argument("--fusion-min-beat-gap-ratio", type=float, default=0.45)
+    parser.add_argument("--fusion-min-downbeat-gap-ratio", type=float, default=0.55)
     parser.add_argument("--sample-rate", type=int, default=22050)
     parser.add_argument("--no-micro-refine", action="store_true", help="Disable sample-level attack refinement")
     parser.add_argument("--no-stem-aware-micro-refine", action="store_true", help="Do not prefer sibling drum/bass stems for micro-refinement")
@@ -46,6 +49,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-hypotheses", action="store_true", help="Do not emit half/double-time and phase hypotheses")
     parser.add_argument("--no-hypothesis-selector", action="store_true", help="Use fused grid directly instead of full-song hypothesis selection")
     parser.add_argument("--no-grid-repair", action="store_true", help="Disable steady-grid continuity repair")
+    parser.add_argument("--no-repair-lattice-snap", action="store_true", help="Disable stable-lattice snapping during grid repair")
+    parser.add_argument("--repair-lattice-snap-ratio", type=float, default=0.28)
     parser.add_argument("--click-wav", help="Write an audio+click overlay for the final grid")
     parser.add_argument("--click-only", action="store_true", help="Write clicks without original audio when rendering click tracks")
     parser.add_argument("--hypothesis-click-dir", help="Write click overlays for top hypotheses into this directory")
@@ -61,6 +66,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         sample_rate=int(args.sample_rate),
         fusion_radius_ms=float(args.fusion_radius_ms),
         downbeat_fusion_radius_ms=float(args.downbeat_fusion_radius_ms),
+        fusion_dedupe_events=not bool(args.no_fusion_dedupe),
+        fusion_min_beat_gap_ratio=float(args.fusion_min_beat_gap_ratio),
+        fusion_min_downbeat_gap_ratio=float(args.fusion_min_downbeat_gap_ratio),
         micro_refine=not bool(args.no_micro_refine),
         micro_refine_stem_aware=not bool(args.no_stem_aware_micro_refine),
         beat_this_device=str(args.beat_this_device),
@@ -74,6 +82,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         preserve_hypotheses=not bool(args.no_hypotheses),
         use_hypothesis_selector=not bool(args.no_hypothesis_selector),
         repair_steady_grid=not bool(args.no_grid_repair),
+        repair_lattice_snap=not bool(args.no_repair_lattice_snap),
+        repair_lattice_snap_ratio=float(args.repair_lattice_snap_ratio),
     )
     result = analyze_rhythm(
         args.audio,

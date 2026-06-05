@@ -78,7 +78,12 @@ def analyze_rhythm(
             "micro_refine": bool(cfg.micro_refine),
             "hypothesis_selector": bool(cfg.use_hypothesis_selector),
             "grid_repair": bool(cfg.repair_steady_grid),
+            "repair_lattice_snap": bool(cfg.repair_lattice_snap),
+            "repair_lattice_snap_ratio": float(cfg.repair_lattice_snap_ratio),
             "fusion_radius_ms": float(cfg.fusion_radius_ms),
             "downbeat_fusion_radius_ms": float(cfg.downbeat_fusion_radius_ms),
+            "fusion_dedupe_events": bool(cfg.fusion_dedupe_events),
+            "fusion_min_beat_gap_ratio": float(cfg.fusion_min_beat_gap_ratio),
+            "fusion_min_downbeat_gap_ratio": float(cfg.fusion_min_downbeat_gap_ratio),
         },
     )

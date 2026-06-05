@@ -53,6 +53,25 @@ def test_fuse_estimates_applies_provider_weight_json(tmp_path) -> None:
     assert fused.metadata["provider_weights"] == {"a": 0.2, "b": 3.0}
 
 
+def test_fuse_estimates_suppresses_off_phase_duplicate_clusters() -> None:
+    estimates = [
+        RhythmEstimate(provider="good", beats=(1.000, 1.500, 2.000), downbeats=(1.000,), bpm=120.0, confidence=0.95),
+        RhythmEstimate(provider="late", beats=(1.070, 1.570, 2.070), downbeats=(1.070,), bpm=120.0, confidence=0.40),
+    ]
+    cfg = RhythmEngineConfig(
+        providers=("good", "late"),
+        fusion_radius_ms=35.0,
+        downbeat_fusion_radius_ms=35.0,
+    )
+
+    fused = fuse_estimates(estimates, cfg)
+
+    assert fused.beats == (1.0, 1.5, 2.0)
+    assert fused.downbeats == (1.0,)
+    assert any(row["suppressed"] for row in fused.metadata["beat_clusters"])
+    assert abs(fused.metadata["fusion_beat_min_gap_sec"] - 0.225) < 1e-12
+
+
 def test_provider_weight_for_name_matches_nested_provider_names() -> None:
     weights = {"stem_ensemble:drums": 2.0, "librosa": 0.4}
 

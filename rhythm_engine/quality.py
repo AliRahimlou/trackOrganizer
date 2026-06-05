@@ -19,6 +19,7 @@ class GridQualityReport:
     beat_count: int
     downbeat_count: int
     inserted_beat_ratio: float
+    fusion_suppressed_cluster_ratio: float
     median_micro_offset_ms: float
     warnings: tuple[str, ...]
 
@@ -32,6 +33,7 @@ class GridQualityReport:
             "beat_count": int(self.beat_count),
             "downbeat_count": int(self.downbeat_count),
             "inserted_beat_ratio": float(self.inserted_beat_ratio),
+            "fusion_suppressed_cluster_ratio": float(self.fusion_suppressed_cluster_ratio),
             "median_micro_offset_ms": float(self.median_micro_offset_ms),
             "warnings": list(self.warnings),
         }
@@ -73,6 +75,13 @@ def assess_grid_quality(final: RhythmEstimate, *, fused: RhythmEstimate | None =
     provider_count = 0
     if fused is not None and isinstance(fused.metadata, Mapping):
         provider_count = int(_finite_float(fused.metadata.get("provider_count"), 0.0))
+    suppressed_ratio = 0.0
+    if fused is not None and isinstance(fused.metadata, Mapping):
+        clusters = fused.metadata.get("beat_clusters")
+        if isinstance(clusters, Sequence) and not isinstance(clusters, (str, bytes)):
+            total = len(clusters)
+            suppressed = sum(1 for row in clusters if isinstance(row, Mapping) and bool(row.get("suppressed")))
+            suppressed_ratio = float(suppressed / max(1, total))
     beat_count = len(final.beats)
     downbeat_count = len(final.downbeats)
     input_beats = int(_finite_float(metadata.get("grid_repair_input_beats"), beat_count))
@@ -93,6 +102,8 @@ def assess_grid_quality(final: RhythmEstimate, *, fused: RhythmEstimate | None =
         warnings.append("unstable_tempo")
     if inserted_ratio > 0.12:
         warnings.append("many_repaired_beats")
+    if suppressed_ratio > 0.18:
+        warnings.append("fusion_duplicate_pressure")
     if micro_offset > 28.0:
         warnings.append("large_micro_refine_offset")
 
@@ -104,6 +115,7 @@ def assess_grid_quality(final: RhythmEstimate, *, fused: RhythmEstimate | None =
             + (0.14 * np.clip(beat_count / 64.0, 0.0, 1.0))
             + (0.10 * np.clip(downbeat_count / 16.0, 0.0, 1.0))
             + (0.08 * (1.0 - np.clip(inserted_ratio / 0.20, 0.0, 1.0)))
+            - (0.06 * np.clip(suppressed_ratio / 0.35, 0.0, 1.0))
             + (0.04 * (1.0 - np.clip(micro_offset / 45.0, 0.0, 1.0))),
             0.0,
             1.0,
@@ -125,6 +137,7 @@ def assess_grid_quality(final: RhythmEstimate, *, fused: RhythmEstimate | None =
         beat_count=int(beat_count),
         downbeat_count=int(downbeat_count),
         inserted_beat_ratio=float(inserted_ratio),
+        fusion_suppressed_cluster_ratio=float(suppressed_ratio),
         median_micro_offset_ms=float(micro_offset),
         warnings=tuple(warnings),
     )

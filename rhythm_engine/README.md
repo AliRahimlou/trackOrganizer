@@ -13,6 +13,8 @@ Goal: build a DJ-usable, millisecond-accurate, any-genre beat/downbeat engine.
 2. Multi-hypothesis fusion
    - Cluster beats/downbeats across providers with ms-level radii.
    - Apply learned provider weights to both event timing and fused BPM.
+   - Suppress duplicate off-phase clusters inside a tempo-derived beat/downbeat
+     gap, keeping the best-supported event in each slot.
    - Keep provider support, spread, and confidence in JSON for audit/debug.
    - Preserve parallel half/double-time and downbeat-phase hypotheses instead of
      collapsing to one grid too early.
@@ -20,6 +22,9 @@ Goal: build a DJ-usable, millisecond-accurate, any-genre beat/downbeat engine.
      evidence before selecting the final grid.
    - Fill missing beats and rebuild downbeat phase for stable-tempo grids while
      skipping repair on unstable/expressive material.
+   - Snap stable grids to an inferred tempo lattice before filling missing
+     beats, removing off-grid duplicates while preserving the nearest event per
+     beat slot.
    - Bound repaired grids to the detected audio duration so exports do not
      include phantom beats after the file ends.
 
@@ -50,6 +55,8 @@ Goal: build a DJ-usable, millisecond-accurate, any-genre beat/downbeat engine.
    - When reference beats are provided, every provider and hypothesis is
      evaluated so `python -m rhythm_engine.learn_weights` can learn fusion
      weights from the resulting JSON files.
+   - Weight learning uses strict one-to-one F1 and duplicate/missed-beat
+     penalties when those metrics are present.
 
 ## CLI
 
@@ -69,6 +76,12 @@ Optional reference beat files are newline-separated seconds:
 python -m rhythm_engine track.wav \
   --reference-beats beats.txt \
   --reference-downbeats downbeats.txt
+```
+
+Tune fusion behavior during benchmark sweeps:
+
+```bash
+python -m rhythm_engine track.wav --fusion-radius-ms 35 --fusion-min-beat-gap-ratio 0.42
 ```
 
 Render an audition click overlay:

@@ -51,6 +51,62 @@ def _fill_missing_beats(beats: Sequence[float], period: float) -> tuple[list[flo
     return out, inserted
 
 
+def _infer_lattice_origin(beats: Sequence[float], period: float) -> float | None:
+    arr = np.asarray(list(beats), dtype=np.float64)
+    if arr.size < 3 or period <= 0.0:
+        return None
+    phases = np.mod(arr, float(period)) / float(period)
+    vectors = np.exp(2j * np.pi * phases)
+    mean_vector = np.mean(vectors)
+    if abs(mean_vector) < 0.30:
+        return None
+    phase = float(np.angle(mean_vector) / (2.0 * np.pi))
+    if phase < 0.0:
+        phase += 1.0
+    origin_mod = phase * float(period)
+    first = float(np.min(arr))
+    origin = origin_mod + (round((first - origin_mod) / float(period)) * float(period))
+    while origin > first + (0.5 * float(period)):
+        origin -= float(period)
+    while origin + float(period) <= first - (0.5 * float(period)):
+        origin += float(period)
+    return float(max(0.0, origin))
+
+
+def _snap_to_lattice(
+    beats: Sequence[float],
+    period: float,
+    *,
+    snap_ratio: float,
+) -> tuple[list[float], int, int, float | None]:
+    origin = _infer_lattice_origin(beats, period)
+    if origin is None:
+        return list(float(t) for t in beats), 0, 0, None
+    tolerance = max(0.020, float(snap_ratio) * float(period))
+    slots: dict[int, tuple[float, float, float]] = {}
+    removed = 0
+    snapped = 0
+    for beat in sorted(float(t) for t in beats if float(t) >= 0.0):
+        idx = int(round((beat - origin) / float(period)))
+        target = origin + (idx * float(period))
+        if target < 0.0:
+            target = 0.0
+        residual = abs(beat - target)
+        if residual > tolerance:
+            removed += 1
+            continue
+        if residual > 0.001:
+            snapped += 1
+        previous = slots.get(idx)
+        if previous is None or residual < previous[0]:
+            if previous is not None:
+                removed += 1
+            slots[idx] = (float(residual), float(target), float(beat))
+        else:
+            removed += 1
+    return [float(row[1]) for _idx, row in sorted(slots.items())], int(snapped), int(removed), float(origin)
+
+
 def _trim_to_duration(beats: Sequence[float], duration_sec: float, period: float) -> tuple[list[float], int]:
     tolerance = min(0.010, max(0.001, 0.02 * float(period)))
     kept = [float(beat) for beat in beats if float(beat) <= float(duration_sec) + tolerance]
@@ -85,7 +141,19 @@ def repair_steady_grid(estimate: RhythmEstimate, config: RhythmEngineConfig | No
         metadata["grid_repair_status"] = "skipped_unstable_tempo"
         return estimate.with_updates(metadata=metadata)
 
-    deduped = _dedupe_close_beats(estimate.beats, period)
+    snapped = 0
+    removed = 0
+    lattice_origin = None
+    if bool(cfg.repair_lattice_snap):
+        deduped, snapped, removed, lattice_origin = _snap_to_lattice(
+            estimate.beats,
+            period,
+            snap_ratio=float(cfg.repair_lattice_snap_ratio),
+        )
+        if lattice_origin is None:
+            deduped = _dedupe_close_beats(estimate.beats, period)
+    else:
+        deduped = _dedupe_close_beats(estimate.beats, period)
     filled, inserted = _fill_missing_beats(deduped, period)
     duration = estimate.duration_sec
     trimmed = 0
@@ -103,6 +171,9 @@ def repair_steady_grid(estimate: RhythmEstimate, config: RhythmEngineConfig | No
     metadata["grid_repair_period_sec"] = float(period)
     metadata["grid_repair_inserted_beats"] = int(inserted)
     metadata["grid_repair_trimmed_beats"] = int(trimmed)
+    metadata["grid_repair_snapped_beats"] = int(snapped)
+    metadata["grid_repair_removed_beats"] = int(removed)
+    metadata["grid_repair_lattice_origin_sec"] = None if lattice_origin is None else float(lattice_origin)
     metadata["grid_repair_input_beats"] = int(len(estimate.beats))
     metadata["grid_repair_output_beats"] = int(len(filled))
     metadata["grid_repair_downbeat_phase"] = int(phase)

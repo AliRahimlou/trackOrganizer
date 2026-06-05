@@ -31,6 +31,9 @@ class RhythmEngineConfig:
     beats_per_bar: int = 4
     fusion_radius_ms: float = 45.0
     downbeat_fusion_radius_ms: float = 90.0
+    fusion_dedupe_events: bool = True
+    fusion_min_beat_gap_ratio: float = 0.45
+    fusion_min_downbeat_gap_ratio: float = 0.55
     min_provider_confidence: float = 0.05
     micro_refine: bool = True
     micro_refine_stem_aware: bool = True
@@ -50,6 +53,8 @@ class RhythmEngineConfig:
     selector_sample_rate: int = 22050
     repair_steady_grid: bool = True
     repair_min_tempo_stability: float = 0.72
+    repair_lattice_snap: bool = True
+    repair_lattice_snap_ratio: float = 0.28
 
 
 @dataclass(frozen=True)

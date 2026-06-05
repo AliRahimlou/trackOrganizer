@@ -112,6 +112,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--provider", action="append", help="Provider to run. Repeat to set order.")
     parser.add_argument("--provider-weights-json", help="Provider weights JSON")
     parser.add_argument("--no-micro-refine", action="store_true")
+    parser.add_argument("--no-grid-repair", action="store_true")
+    parser.add_argument("--no-repair-lattice-snap", action="store_true")
+    parser.add_argument("--repair-lattice-snap-ratio", type=float, default=0.28)
+    parser.add_argument("--fusion-radius-ms", type=float, default=45.0)
+    parser.add_argument("--downbeat-fusion-radius-ms", type=float, default=90.0)
+    parser.add_argument("--no-fusion-dedupe", action="store_true")
+    parser.add_argument("--fusion-min-beat-gap-ratio", type=float, default=0.45)
+    parser.add_argument("--fusion-min-downbeat-gap-ratio", type=float, default=0.55)
     parser.add_argument("--limit", type=int)
     return parser
 
@@ -122,6 +130,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         providers=tuple(args.provider) if args.provider else RhythmEngineConfig().providers,
         provider_weights_json=args.provider_weights_json,
         micro_refine=not bool(args.no_micro_refine),
+        repair_steady_grid=not bool(args.no_grid_repair),
+        repair_lattice_snap=not bool(args.no_repair_lattice_snap),
+        repair_lattice_snap_ratio=float(args.repair_lattice_snap_ratio),
+        fusion_radius_ms=float(args.fusion_radius_ms),
+        downbeat_fusion_radius_ms=float(args.downbeat_fusion_radius_ms),
+        fusion_dedupe_events=not bool(args.no_fusion_dedupe),
+        fusion_min_beat_gap_ratio=float(args.fusion_min_beat_gap_ratio),
+        fusion_min_downbeat_gap_ratio=float(args.fusion_min_downbeat_gap_ratio),
     )
     output = run_benchmark(read_manifest(args.manifest), config=cfg, output_jsonl=args.output, limit=args.limit)
     print(json.dumps({"output": output}, indent=2, ensure_ascii=True))

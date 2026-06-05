@@ -56,3 +56,20 @@ def test_repair_steady_grid_does_not_extend_beyond_duration() -> None:
     assert repaired.beats == (0.0, 0.5, 1.0, 1.5)
     assert max(repaired.beats) <= estimate.duration_sec
     assert repaired.metadata["grid_repair_trimmed_beats"] == 1
+
+
+def test_repair_steady_grid_keeps_best_lattice_candidate_for_duplicate_slot() -> None:
+    estimate = RhythmEstimate(
+        provider="test",
+        beats=(0.0, 0.5, 0.88, 1.0, 1.5, 2.0),
+        downbeats=(0.0,),
+        bpm=120.0,
+        confidence=0.8,
+        duration_sec=2.0,
+    )
+
+    repaired = repair_steady_grid(estimate, RhythmEngineConfig(beats_per_bar=4))
+
+    assert repaired.beats == (0.0, 0.5, 1.0, 1.5, 2.0)
+    assert repaired.metadata["grid_repair_removed_beats"] >= 1
+    assert abs(repaired.metadata["grid_repair_lattice_origin_sec"]) < 1e-12
