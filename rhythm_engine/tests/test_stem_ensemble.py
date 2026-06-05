@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
+
 from rhythm_engine import providers
+from rhythm_engine.providers import _beatnet_output_to_arrays
 from rhythm_engine.types import RhythmEngineConfig, RhythmEstimate
 
 
@@ -40,3 +43,21 @@ def test_stem_ensemble_fuses_role_specific_provider_estimates(tmp_path: Path, mo
     assert abs(estimate.beats[0] - 1.0) < 1e-9
     assert estimate.metadata["stem_roles"] == ["bass", "drums", "vocals"]
     assert any(row["provider"].startswith("stem_ensemble:drums") for row in estimate.metadata["role_estimates"])
+
+
+def test_beatnet_output_parser_extracts_downbeat_labels() -> None:
+    beats, downbeats = _beatnet_output_to_arrays(
+        np.asarray(
+            [
+                [0.50, 1.0],
+                [1.00, 2.0],
+                [1.50, 2.0],
+                [2.00, 1.0],
+            ],
+            dtype=np.float64,
+        ),
+        beats_per_bar=4,
+    )
+
+    assert beats.tolist() == [0.5, 1.0, 1.5, 2.0]
+    assert downbeats.tolist() == [0.5, 2.0]

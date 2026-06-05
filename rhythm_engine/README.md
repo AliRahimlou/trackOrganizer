@@ -7,7 +7,7 @@ Goal: build a DJ-usable, millisecond-accurate, any-genre beat/downbeat engine.
 1. Provider ensemble
    - Run multiple beat/downbeat sources instead of trusting one model.
    - Current adapters: `librosa`, `track_organizer`, `stem_ensemble`,
-     optional `madmom`, optional `beat_this`.
+     optional `madmom`, optional `beat_this`, optional `beatnet`.
    - `stem_ensemble` detects sibling Demucs stems and fuses role-specific grids.
 
 2. Multi-hypothesis fusion
@@ -37,6 +37,8 @@ Goal: build a DJ-usable, millisecond-accurate, any-genre beat/downbeat engine.
 5. Millisecond evaluation
    - Report median, mean, p90, p95, max absolute error in ms.
    - Report hit rates at 5ms, 10ms, 20ms, and 70ms.
+   - Report one-to-one precision/recall/F1 at 20ms and 70ms so duplicate or
+     missing beats are visible.
    - Report continuity so a mostly-right grid with one bad section is visible.
 
 6. Active learning
@@ -53,6 +55,12 @@ Goal: build a DJ-usable, millisecond-accurate, any-genre beat/downbeat engine.
 
 ```bash
 python -m rhythm_engine /path/to/audio.wav --provider librosa --json rhythm.json
+```
+
+Run BeatNet when installed:
+
+```bash
+python -m rhythm_engine track.wav --provider beatnet --beatnet-mode offline --beatnet-inference-model DBN
 ```
 
 Optional reference beat files are newline-separated seconds:

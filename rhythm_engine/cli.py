@@ -38,6 +38,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--beat-this-device", default="auto")
     parser.add_argument("--beat-this-checkpoint", default="final0")
     parser.add_argument("--beat-this-dbn", action="store_true")
+    parser.add_argument("--beatnet-model", type=int, default=1, help="BeatNet pretrained model id when BeatNet is installed")
+    parser.add_argument("--beatnet-mode", default="offline", help="BeatNet mode: offline, online, realtime, or stream")
+    parser.add_argument("--beatnet-inference-model", default="DBN", help="BeatNet inference model, usually DBN offline or PF online")
+    parser.add_argument("--beatnet-device", default="auto", help="BeatNet device when supported, e.g. cpu or cuda")
     parser.add_argument("--provider-weights-json", help="JSON mapping of provider names to learned fusion weights")
     parser.add_argument("--no-hypotheses", action="store_true", help="Do not emit half/double-time and phase hypotheses")
     parser.add_argument("--no-hypothesis-selector", action="store_true", help="Use fused grid directly instead of full-song hypothesis selection")
@@ -62,6 +66,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         beat_this_device=str(args.beat_this_device),
         beat_this_checkpoint=str(args.beat_this_checkpoint),
         use_beat_this_dbn=bool(args.beat_this_dbn),
+        beatnet_model=int(args.beatnet_model),
+        beatnet_mode=str(args.beatnet_mode),
+        beatnet_inference_model=str(args.beatnet_inference_model),
+        beatnet_device=str(args.beatnet_device),
         provider_weights_json=args.provider_weights_json,
         preserve_hypotheses=not bool(args.no_hypotheses),
         use_hypothesis_selector=not bool(args.no_hypothesis_selector),

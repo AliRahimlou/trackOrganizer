@@ -24,7 +24,7 @@ def _clean_times(values: Sequence[float]) -> Tuple[float, ...]:
 
 @dataclass(frozen=True)
 class RhythmEngineConfig:
-    providers: Tuple[str, ...] = ("beat_this", "madmom", "stem_ensemble", "track_organizer", "librosa")
+    providers: Tuple[str, ...] = ("beat_this", "beatnet", "madmom", "stem_ensemble", "track_organizer", "librosa")
     sample_rate: int = 22050
     min_bpm: float = 35.0
     max_bpm: float = 260.0
@@ -39,6 +39,10 @@ class RhythmEngineConfig:
     beat_this_device: str = "auto"
     beat_this_checkpoint: str = "final0"
     use_beat_this_dbn: bool = False
+    beatnet_model: int = 1
+    beatnet_mode: str = "offline"
+    beatnet_inference_model: str = "DBN"
+    beatnet_device: str = "auto"
     provider_weights_json: Optional[str] = None
     preserve_hypotheses: bool = True
     max_hypotheses: int = 24

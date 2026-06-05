@@ -193,6 +193,71 @@ def beat_this_provider(audio_path: str, config: RhythmEngineConfig) -> RhythmEst
         return RhythmEstimate.failed("beat_this", str(exc) or exc.__class__.__name__)
 
 
+def _beatnet_output_to_arrays(output: object, beats_per_bar: int) -> tuple[np.ndarray, np.ndarray]:
+    seq = np.asarray(output, dtype=np.float64)
+    if seq.size == 0:
+        return np.asarray([], dtype=np.float64), np.asarray([], dtype=np.float64)
+    if seq.ndim == 1:
+        seq = seq.reshape(-1, 1)
+    if seq.ndim != 2 or seq.shape[1] < 1:
+        raise ValueError("invalid_beatnet_output_shape")
+
+    times = np.asarray(seq[:, 0], dtype=np.float64)
+    mask = np.isfinite(times) & (times >= 0.0)
+    times = times[mask]
+    if times.size == 0:
+        return np.asarray([], dtype=np.float64), np.asarray([], dtype=np.float64)
+
+    if seq.shape[1] >= 2:
+        labels = np.asarray(seq[:, 1], dtype=np.float64)[mask]
+        downbeats = times[np.isclose(labels, 1.0)]
+    else:
+        downbeats = times[:: max(1, int(beats_per_bar))]
+    return times, downbeats
+
+
+def beatnet_provider(audio_path: str, config: RhythmEngineConfig) -> RhythmEstimate:
+    try:
+        from BeatNet.BeatNet import BeatNet  # type: ignore
+    except Exception as exc:
+        return RhythmEstimate.unavailable("beatnet", str(exc) or exc.__class__.__name__)
+
+    try:
+        kwargs = {
+            "mode": str(config.beatnet_mode),
+            "inference_model": str(config.beatnet_inference_model),
+            "plot": [],
+            "thread": False,
+        }
+        if str(config.beatnet_device) != "auto":
+            kwargs["device"] = str(config.beatnet_device)
+        try:
+            estimator = BeatNet(int(config.beatnet_model), **kwargs)
+        except TypeError:
+            kwargs.pop("device", None)
+            estimator = BeatNet(int(config.beatnet_model), **kwargs)
+        output = estimator.process(audio_path)
+        beat_arr, downbeat_arr = _beatnet_output_to_arrays(output, config.beats_per_bar)
+        if beat_arr.size == 0:
+            return RhythmEstimate.failed("beatnet", "empty_sequence")
+        return RhythmEstimate(
+            provider="beatnet",
+            beats=tuple(float(t) for t in beat_arr),
+            downbeats=tuple(float(t) for t in downbeat_arr),
+            bpm=_estimate_bpm_from_beats(beat_arr),
+            confidence=0.88,
+            metadata={
+                "model": int(config.beatnet_model),
+                "mode": str(config.beatnet_mode),
+                "inference_model": str(config.beatnet_inference_model),
+                "beat_count": int(len(beat_arr)),
+                "downbeat_count": int(len(downbeat_arr)),
+            },
+        )
+    except Exception as exc:
+        return RhythmEstimate.failed("beatnet", str(exc) or exc.__class__.__name__)
+
+
 def stem_ensemble_provider(audio_path: str, config: RhythmEngineConfig) -> RhythmEstimate:
     try:
         from drop_aligner.multistem import find_stem_group
@@ -286,6 +351,7 @@ def stem_ensemble_provider(audio_path: str, config: RhythmEngineConfig) -> Rhyth
 
 PROVIDERS: Dict[str, ProviderFn] = {
     "beat_this": beat_this_provider,
+    "beatnet": beatnet_provider,
     "librosa": librosa_provider,
     "madmom": madmom_provider,
     "stem_ensemble": stem_ensemble_provider,
