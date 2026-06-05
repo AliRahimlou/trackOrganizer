@@ -1,0 +1,54 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import rhythm_engine.benchmark as benchmark_module
+from rhythm_engine.benchmark import read_manifest, run_benchmark
+from rhythm_engine.types import RhythmAnalysisResult, RhythmEngineConfig, RhythmEstimate
+
+
+def test_read_manifest_resolves_relative_csv_paths(tmp_path: Path) -> None:
+    manifest = tmp_path / "manifest.csv"
+    manifest.write_text(
+        "audio,reference_beats,reference_downbeats,genre\n"
+        "audio.wav,beats.txt,downbeats.txt,house\n",
+        encoding="utf-8",
+    )
+
+    items = read_manifest(str(manifest))
+
+    assert len(items) == 1
+    assert items[0].audio == str(tmp_path / "audio.wav")
+    assert items[0].reference_beats == str(tmp_path / "beats.txt")
+    assert items[0].reference_downbeats == str(tmp_path / "downbeats.txt")
+    assert items[0].metadata == {"genre": "house"}
+
+
+def test_run_benchmark_writes_jsonl_results(tmp_path: Path, monkeypatch) -> None:
+    audio = tmp_path / "audio.wav"
+    beats = tmp_path / "beats.txt"
+    downbeats = tmp_path / "downbeats.txt"
+    output = tmp_path / "out.jsonl"
+    audio.write_bytes(b"stub")
+    beats.write_text("1.0\n1.5\n", encoding="utf-8")
+    downbeats.write_text("1.0\n", encoding="utf-8")
+    items = [benchmark_module.BenchmarkItem(str(audio), str(beats), str(downbeats), {"id": "x"})]
+
+    def fake_analyze(audio_path: str, *, config: RhythmEngineConfig, reference_beats, reference_downbeats):
+        return RhythmAnalysisResult(
+            audio_path=audio_path,
+            final=RhythmEstimate(provider="fake", beats=(1.0, 1.5), downbeats=(1.0,), confidence=1.0),
+            fused=RhythmEstimate(provider="fake", beats=(1.0, 1.5), downbeats=(1.0,), confidence=1.0),
+            selected=RhythmEstimate(provider="fake", beats=(1.0, 1.5), downbeats=(1.0,), confidence=1.0),
+            providers=tuple(),
+            evaluation={"beats": {"median_abs_error_ms": 0.0}},
+        )
+
+    monkeypatch.setattr(benchmark_module, "analyze_rhythm", fake_analyze)
+
+    written = run_benchmark(items, config=RhythmEngineConfig(providers=("fake",)), output_jsonl=str(output))
+
+    assert written == str(output)
+    text = output.read_text(encoding="utf-8").strip()
+    assert '"audio_path":"' in text
+    assert '"benchmark_item":' in text
