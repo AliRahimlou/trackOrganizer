@@ -14,6 +14,7 @@ from mutagen.wave import WAVE
 from mutagen.aiff import AIFF
 
 import trackTime  # your module for duration
+from project_config import ALS_TEMPLATES_DIR, PLAYLISTS_BY_DATE_DIR, REKORDBOX_XML, STEMS_INBOX_DIR, STEMS_ROOT_DIR
 
 try:
     import numpy as np
@@ -59,10 +60,10 @@ except Exception:
     drop_fusion_json_default = None
 
 # ========= USER SETTINGS =========
-mp3_source_folder        = "/Users/alirahimlou/Desktop/MUSIC/PlaylistsByDate"
-htdemucs_source_folder   = "/Users/alirahimlou/Desktop/MUSIC/STEMS/toBeOrganized"
-destination_folder       = "/Users/alirahimlou/Desktop/MUSIC/STEMS"
-ALS_FILES_FOLDER         = os.path.join(os.path.dirname(os.path.abspath(__file__)), "alsFiles")  # folder containing <BPM>.als templates
+mp3_source_folder        = str(PLAYLISTS_BY_DATE_DIR)
+htdemucs_source_folder   = str(STEMS_INBOX_DIR)
+destination_folder       = str(STEMS_ROOT_DIR)
+ALS_FILES_FOLDER         = str(ALS_TEMPLATES_DIR)  # folder containing <BPM>.als templates
 FLAC_FOLDER              = destination_folder
 SKIP_EXISTING            = str(os.environ.get("SKIP_EXISTING", "1")).strip().lower() not in {"0", "false", "no", "off"}   # when False, force-regenerate ALS for every track folder
 REPAIR_EXISTING_LIBRARY_ONLY = str(os.environ.get("REPAIR_EXISTING_LIBRARY_ONLY", "0")).strip().lower() in {"1", "true", "yes", "on"}  # when True, skip new inbox stems and only repair/rebuild CH1.als inside destination_folder
@@ -100,7 +101,7 @@ MIK_FIRST_DROP_EARLY_IGNORE_SEC = float(os.environ.get("MIK_FIRST_DROP_EARLY_IGN
 MIK_FIRST_DROP_LOCALITY_BEATS = float(os.environ.get("MIK_FIRST_DROP_LOCALITY_BEATS", "1.5"))
 MIK_FIRST_DROP_MIN_CONFIDENCE = float(os.environ.get("MIK_FIRST_DROP_MIN_CONFIDENCE", "0.25"))
 MIK_FIRST_DROP_MAX_CUES_TO_TRY = int(str(os.environ.get("MIK_FIRST_DROP_MAX_CUES_TO_TRY", "6")).strip() or "6")
-REKORDBOX_XML_PATH       = (os.environ.get("REKORDBOX_XML_PATH") or "/Users/alirahimlou/Documents/rekordbox.xml").strip()
+REKORDBOX_XML_PATH       = str(REKORDBOX_XML)
 REKORDBOX_FIRST_DROP_HOTCUE_NUM = int(str(os.environ.get("REKORDBOX_FIRST_DROP_HOTCUE_NUM", "1")).strip() or "1")
 REKORDBOX_PRIOR_CONFIDENCE = float(os.environ.get("REKORDBOX_PRIOR_CONFIDENCE", "0.98"))
 REKORDBOX_CUE_SNAP_NEAR_INT_TOL = float(os.environ.get("REKORDBOX_CUE_SNAP_NEAR_INT_TOL", "0.125"))

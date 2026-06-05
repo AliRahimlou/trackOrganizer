@@ -3,8 +3,10 @@ import re
 import shutil
 from datetime import datetime, date
 
+from project_config import STEMS_ROOT_DIR
+
 # ================== CONFIG ==================
-ROOT_DIR = "/Users/alirahimlou/Desktop/MUSIC/STEMS"
+ROOT_DIR = str(STEMS_ROOT_DIR)
 DRY_RUN = False
 
 # If True: in addition to incomplete track folders, also delete loose audio files

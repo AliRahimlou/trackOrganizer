@@ -16,9 +16,10 @@ from drop_aligner.exclusions import row_has_excluded_path
 from drop_aligner.microalign import microalign_candidate_dicts
 from drop_aligner.multistem import generate_multistem_candidates
 from drop_aligner.pipeline import run_drop_candidate_pipeline
+from project_config import DROP_BATCH_SUMMARY
 
 
-DEFAULT_SUMMARY = Path.home() / "Desktop" / "MUSIC" / "STEMS" / "drop_batch_summary.csv"
+DEFAULT_SUMMARY = DROP_BATCH_SUMMARY
 DEFAULT_CORRECTIONS = Path("models/multistem_training_corrections.jsonl")
 FALLBACK_CORRECTIONS = Path("drop_corrections.jsonl")
 DEFAULT_JSON = Path("models/oracle_diagnostics.json")

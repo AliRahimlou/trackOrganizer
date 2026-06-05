@@ -15,10 +15,11 @@ from drop_aligner.candidate_chooser import candidate_effective_time
 from drop_aligner.exclusions import row_has_excluded_path
 from drop_aligner.multistem import choose_multistem_candidate
 from verify_als import verify_als
+from project_config import DEFAULT_ALS_TEMPLATE, DROP_BATCH_SUMMARY
 
 
-DEFAULT_SUMMARY = Path.home() / "Desktop" / "MUSIC" / "STEMS" / "drop_batch_summary.csv"
-DEFAULT_TEMPLATE = Path(__file__).resolve().parent / "alsFiles" / "128.als"
+DEFAULT_SUMMARY = DROP_BATCH_SUMMARY
+DEFAULT_TEMPLATE = DEFAULT_ALS_TEMPLATE
 EXTRA_COLUMNS = ["micro_confidence", "snap_offset_ms", "microaligned_time"]
 
 

@@ -7,6 +7,8 @@ import re
 import argparse
 from typing import Optional, Tuple, Dict, Any, List
 
+from project_config import MUSIC_ROOT
+
 # --- Mutagen formats ---
 from mutagen.id3 import ID3, ID3NoHeaderError
 from mutagen.flac import FLAC
@@ -351,7 +353,7 @@ def main():
         description="Read BPM and Key (and Camelot) from audio file metadata (Rekordbox/Serato-compatible tags)."
     )
     parser.add_argument("path", nargs="?", help="Path to an audio file. If omitted, enter interactive search.")
-    parser.add_argument("--root", default="/Users/alirahimlou/Desktop/MUSIC",
+    parser.add_argument("--root", default=str(MUSIC_ROOT),
                         help="Root folder for interactive search (default: ~/Desktop/MUSIC)")
     parser.add_argument("--no-camelot", action="store_true", help="Do not show Camelot conversion.")
     args = parser.parse_args()

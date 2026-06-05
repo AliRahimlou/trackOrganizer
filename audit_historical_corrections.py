@@ -11,10 +11,11 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 from drop_aligner.multistem import find_stem_group, infer_bpm_from_path
 from drop_aligner.musical_clock import bpm_clock_for_time
+from project_config import DROP_BATCH_SUMMARY
 
 
 DEFAULT_CORRECTIONS = Path("drop_corrections.jsonl")
-DEFAULT_SUMMARY = Path.home() / "Desktop" / "MUSIC" / "STEMS" / "drop_batch_summary.csv"
+DEFAULT_SUMMARY = DROP_BATCH_SUMMARY
 DEFAULT_JSON = Path("models/historical_data_quality_audit.json")
 DEFAULT_CSV = Path("models/historical_data_quality_bad_rows.csv")
 AUDIO_ROLES = ("drums", "instrumental", "vocals", "bass")

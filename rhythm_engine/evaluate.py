@@ -11,6 +11,8 @@ class BeatEvaluationReport:
     reference_count: int
     estimated_count: int
     matched_count: int
+    median_error_ms: float
+    mean_error_ms: float
     median_abs_error_ms: float
     mean_abs_error_ms: float
     p90_abs_error_ms: float
@@ -37,6 +39,8 @@ class BeatEvaluationReport:
             "reference_count": int(self.reference_count),
             "estimated_count": int(self.estimated_count),
             "matched_count": int(self.matched_count),
+            "median_error_ms": float(self.median_error_ms),
+            "mean_error_ms": float(self.mean_error_ms),
             "median_abs_error_ms": float(self.median_abs_error_ms),
             "mean_abs_error_ms": float(self.mean_abs_error_ms),
             "p90_abs_error_ms": float(self.p90_abs_error_ms),
@@ -129,6 +133,12 @@ def evaluate_beat_grid(reference_beats: Sequence[float], estimated_beats: Sequen
     abs_errors_ms = np.abs(errors_ms)
     finite_abs = abs_errors_ms[np.isfinite(abs_errors_ms)]
 
+    if finite.size == 0:
+        signed_median = signed_mean = float("inf") if reference.size else 0.0
+    else:
+        signed_median = float(np.median(finite))
+        signed_mean = float(np.mean(finite))
+
     if finite_abs.size == 0:
         median = mean = p90 = p95 = max_err = float("inf") if reference.size else 0.0
     else:
@@ -145,6 +155,8 @@ def evaluate_beat_grid(reference_beats: Sequence[float], estimated_beats: Sequen
         reference_count=int(reference.size),
         estimated_count=int(estimated.size),
         matched_count=int(matched_70),
+        median_error_ms=signed_median,
+        mean_error_ms=signed_mean,
         median_abs_error_ms=median,
         mean_abs_error_ms=mean,
         p90_abs_error_ms=p90,

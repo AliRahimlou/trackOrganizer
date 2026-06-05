@@ -3,8 +3,10 @@ import os
 import re
 import shutil
 
-stems_dir  = "/Users/alirahimlou/Desktop/MUSIC/STEMS"
-output_dir = "/Users/alirahimlou/Desktop/MUSIC/GeneratedSet/stuff"
+from project_config import GENERATED_SET_DIR, STEMS_ROOT_DIR
+
+stems_dir  = str(STEMS_ROOT_DIR)
+output_dir = str(GENERATED_SET_DIR / "stuff")
 
 # If you want the prefix (drums_/inst_/vocals_) in the ALS filename, keep this True
 INCLUDE_ROLE_PREFIX = False

@@ -20,10 +20,12 @@ try:
 except Exception:  # pragma: no cover - handled at runtime
     np = None  # type: ignore[assignment]
 
+from project_config import REKORDBOX_XML
+
 
 AUDIO_EXTENSIONS = {".wav", ".flac", ".aiff", ".aif", ".mp3", ".m4a"}
 ROLE_NAMES = ("drums", "instrumental", "vocals", "bass", "full", "unknown")
-REKORDBOX_XML_DEFAULT = "/Users/alirahimlou/Documents/rekordbox.xml"
+REKORDBOX_XML_DEFAULT = str(REKORDBOX_XML)
 ANALYSIS_VERSION = "drop_fusion_audit_v1"
 
 

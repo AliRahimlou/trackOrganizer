@@ -5,9 +5,11 @@ import os, shutil, random, re, csv, sys, datetime
 from pathlib import Path
 from typing import List, Dict, Any, Set, Optional, Tuple
 
+from project_config import GENERATED_SET_DIR, STEMS_ROOT_DIR
+
 # ---------- CONFIG ----------
-STEMS_DIR        = "/Users/alirahimlou/Desktop/MUSIC/STEMS"
-OUTPUT_ROOT_DIR  = "/Users/alirahimlou/Desktop/MUSIC/GeneratedSet/Set_Festival"  # parent folder for per-run subfolders
+STEMS_DIR        = str(STEMS_ROOT_DIR)
+OUTPUT_ROOT_DIR  = str(GENERATED_SET_DIR / "Set_Festival")  # parent folder for per-run subfolders
 
 SET_LEN          = 85                 # how many tracks to pick
 START_BPM        = None               # None = random start; or int like 124

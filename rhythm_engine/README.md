@@ -100,5 +100,13 @@ Benchmark a reference manifest:
 
 ```bash
 python -m rhythm_engine.benchmark manifest.csv --output rhythm_benchmark.jsonl
+python -m rhythm_engine.benchmark manifest.csv \
+  --output rhythm_benchmark.jsonl \
+  --summary-output rhythm_benchmark_summary.json
 python -m rhythm_engine.learn_weights rhythm_benchmark.jsonl --output provider_weights.json
 ```
+
+The summary JSON aggregates final beat/downbeat grids, individual provider
+reports, per-genre reports when the manifest includes `genre`, recommended
+provider weights, and strict millisecond scores for tuning fusion/micro-refine
+parameters.

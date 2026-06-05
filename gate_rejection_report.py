@@ -9,8 +9,9 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
+from project_config import DROP_BATCH_SUMMARY
 
-DEFAULT_SUMMARY = Path.home() / "Desktop" / "MUSIC" / "STEMS" / "drop_batch_summary.csv"
+DEFAULT_SUMMARY = DROP_BATCH_SUMMARY
 DEFAULT_JSON = Path("models/gate_rejection_report.json")
 DEFAULT_CSV = Path("models/gate_rejection_report.csv")
 

@@ -20,9 +20,10 @@ from web_review import (
     _normalize_tier,
     _read_json,
 )
+from project_config import DROP_BATCH_SUMMARY
 
 
-DEFAULT_SUMMARY = "/Users/alirahimlou/Desktop/MUSIC/STEMS/drop_batch_summary.csv"
+DEFAULT_SUMMARY = str(DROP_BATCH_SUMMARY)
 
 
 def _fmt_time(seconds: Optional[float]) -> str:

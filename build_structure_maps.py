@@ -13,10 +13,11 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from drop_aligner.exclusions import EXCLUDED_DIR_NAMES, is_excluded_path, row_has_excluded_path
 from drop_aligner.structure_map import analyze_track_structure
+from project_config import DROP_BATCH_SUMMARY
 
 
 AUDIO_EXTENSIONS = {".wav", ".flac", ".aiff", ".aif", ".mp3", ".m4a"}
-DEFAULT_SUMMARY = Path.home() / "Desktop" / "MUSIC" / "STEMS" / "drop_batch_summary.csv"
+DEFAULT_SUMMARY = DROP_BATCH_SUMMARY
 DEFAULT_OUTPUT_DIR = Path("models") / "structure_maps"
 SUMMARY_COLUMNS = (
     "structure_map_json",

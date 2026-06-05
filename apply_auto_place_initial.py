@@ -14,10 +14,11 @@ from drop_aligner.als import modify_als
 from drop_aligner.exclusions import row_has_excluded_path
 from drop_aligner.microalign import choose_microaligned_candidate, microalign_candidate_dicts
 from verify_als import verify_als
+from project_config import DEFAULT_ALS_TEMPLATE, DROP_BATCH_SUMMARY
 
 
-DEFAULT_SUMMARY = Path.home() / "Desktop" / "MUSIC" / "STEMS" / "drop_batch_summary.csv"
-DEFAULT_TEMPLATE = Path(__file__).resolve().parent / "alsFiles" / "128.als"
+DEFAULT_SUMMARY = DROP_BATCH_SUMMARY
+DEFAULT_TEMPLATE = DEFAULT_ALS_TEMPLATE
 SUMMARY_EXTRA_COLUMNS = [
     "micro_confidence",
     "snap_offset_ms",

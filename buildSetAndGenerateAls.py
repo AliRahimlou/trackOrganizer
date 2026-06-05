@@ -7,20 +7,22 @@ from io import BytesIO
 from pathlib import Path
 from typing import List, Dict, Any, Set, Optional, Tuple
 
+from project_config import ALS_TEMPLATES_DIR, GENERATED_SET_DIR, STEMS_ROOT_DIR, env_path
+
 # =========================
 # ========== CONFIG =======
 # =========================
-STEMS_DIR         = "/Users/alirahimlou/Desktop/MUSIC/STEMS"
+STEMS_DIR         = str(STEMS_ROOT_DIR)
 
 # Final combined file + CSV live here (no per-track copies)
-OUTPUT_DIR        = Path("/Users/alirahimlou/Desktop/MUSIC/GeneratedSet/Set_Festival")
+OUTPUT_DIR        = env_path("TRACK_ORGANIZER_SET_OUTPUT_DIR", GENERATED_SET_DIR / "Set_Festival")
 
 # Base ALS that contains CH1/CH2/CH3(/CH4) tracks
-BASE_ALS          = Path("/Users/alirahimlou/myapps/trackOrganizer/alsFiles/CH1.als")
+BASE_ALS          = env_path("TRACK_ORGANIZER_SET_BASE_ALS", ALS_TEMPLATES_DIR / "CH1.als")
 
 # Optional: inject into an existing ALS that already has tracks/scenes
 INJECT_INTO_EXISTING = True
-INJECT_ALS          = Path("/Users/alirahimlou/Desktop/X1 TEMPLATE v2 Project/OG123-158 01-07-26.als")
+INJECT_ALS          = env_path("TRACK_ORGANIZER_INJECT_ALS", "~/Desktop/X1 TEMPLATE v2 Project/OG123-158 01-07-26.als")
 
 SET_LEN           = 90           # how many tracks to pick
 START_BPM         = 90         # None = random start; or int like 124

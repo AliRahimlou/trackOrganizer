@@ -12,6 +12,8 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
+from project_config import DROP_BATCH_SUMMARY
+
 
 def _reexec_with_local_venv() -> None:
     venv_python = Path(__file__).resolve().parent / "venv" / "bin" / "python"
@@ -43,7 +45,7 @@ from web_review import (
 
 
 DEFAULT_CORRECTIONS = Path("drop_corrections.jsonl")
-DEFAULT_SUMMARY = Path.home() / "Desktop" / "MUSIC" / "STEMS" / "drop_batch_summary.csv"
+DEFAULT_SUMMARY = DROP_BATCH_SUMMARY
 DEFAULT_REVIEW_STATE = DEFAULT_SUMMARY.parent / "review_state.json"
 DEFAULT_JSON = Path("models/historical_auto_place_regression.json")
 DEFAULT_CSV = Path("models/historical_auto_place_regression.csv")

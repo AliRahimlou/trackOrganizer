@@ -31,9 +31,11 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
+from project_config import PLAYLISTS_BY_DATE_DIR, STEMS_INBOX_DIR, env_path
+
 # ---------- PATHS ----------
-SRC_DIR  = Path("/Users/alirahimlou/Desktop/MUSIC/PlaylistsByDate/music2")
-DEST_DIR = Path("/Users/alirahimlou/Desktop/MUSIC/STEMS/toBeOrganized")
+SRC_DIR  = env_path("TRACK_ORGANIZER_DEMUCS_SRC_DIR", PLAYLISTS_BY_DATE_DIR / "music2")
+DEST_DIR = STEMS_INBOX_DIR
 
 # ---------- DEMUCS (matches GUI) ----------
 BASE_CMD = [

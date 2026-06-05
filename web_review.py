@@ -57,9 +57,10 @@ from drop_aligner.summary_rerank import rerank_summary_with_model
 from drop_aligner.waveform import WaveformCache
 from review import _run_retrain
 from verify_als import verify_als
+from project_config import STEMS_ROOT_DIR
 
 
-DEFAULT_LIBRARY_DIR = Path.home() / "Desktop" / "MUSIC" / "STEMS"
+DEFAULT_LIBRARY_DIR = STEMS_ROOT_DIR
 DEFAULT_SUMMARY_NAME = "drop_batch_summary.csv"
 BPM_RE = re.compile(r"^(?:drums|drum|inst|instrumental|vocals|vocal|bass|other|full)_(\d{2,3})_", re.IGNORECASE)
 TIER_ORDER = {"LOW": 0, "MEDIUM": 1, "HIGH": 2, "UNKNOWN": 3}

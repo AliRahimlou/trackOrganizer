@@ -10,10 +10,11 @@ from drop_aligner.exclusions import row_has_excluded_path
 from drop_aligner.multistem import choose_multistem_candidate
 from train_candidate_chooser import train_candidate_chooser
 from web_review import _apply_structure_map_prior, _candidate_marker_time, _float_or_none
+from project_config import DROP_BATCH_SUMMARY
 
 
 DEFAULT_CORRECTIONS = Path("drop_corrections.jsonl")
-DEFAULT_SUMMARY = Path.home() / "Desktop" / "MUSIC" / "STEMS" / "drop_batch_summary.csv"
+DEFAULT_SUMMARY = DROP_BATCH_SUMMARY
 DEFAULT_REVIEW_STATE = DEFAULT_SUMMARY.parent / "review_state.json"
 DEFAULT_OUTPUT_CORRECTIONS = Path("models/post_structure_training_corrections.jsonl")
 DEFAULT_MODEL = Path("models/drop_post_structure_candidate_chooser.pkl")

@@ -14,10 +14,12 @@ from mutagen.id3 import ID3, ID3NoHeaderError
 from mutagen.flac import FLAC
 from mutagen.wave import WAVE
 
+from project_config import PLAYLISTS_BY_DATE_DIR, STEMS_ROOT_DIR, env_path
+
 # ========= USER SETTINGS =========
-mp3_source_folder        = "/Users/alirahimlou/Desktop/MUSIC/PlaylistsByDate"
-htdemucs_source_folder   = "/Users/alirahimlou/Desktop/MUSIC/PlaylistsByDate/JujuVocals copy"
-destination_folder       = "/Users/alirahimlou/Desktop/MUSIC/STEMS"
+mp3_source_folder        = str(PLAYLISTS_BY_DATE_DIR)
+htdemucs_source_folder   = str(env_path("TRACK_ORGANIZER_VOCALS_SOURCE_DIR", PLAYLISTS_BY_DATE_DIR / "JujuVocals copy"))
+destination_folder       = str(STEMS_ROOT_DIR)
 
 DRY_RUN = False
 

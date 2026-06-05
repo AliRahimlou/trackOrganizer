@@ -50,6 +50,13 @@ node_modules/
 # Project-generated databases/state
 drop_marker_db.json
 drop_self_learning_model.json
+drop_corrections*.jsonl
+review_state.json
+overrides/
+.waveform_cache/
+.review_previews/
+eval_reports/
+models/
 
 # ALSDrop generated assets (keep source code under alsdrop/)
 alsdrop/data/
@@ -65,3 +72,4 @@ als_detector/outputs/
 
 # Optional local helper binaries
 bin/
+tools/ableton-warp-probe/vendor/

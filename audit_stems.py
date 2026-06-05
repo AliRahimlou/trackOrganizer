@@ -10,9 +10,10 @@ from typing import Any, Dict, List, Mapping, Optional
 
 from drop_aligner.exclusions import row_has_excluded_path
 from drop_aligner.multistem import find_stem_group
+from project_config import DROP_BATCH_SUMMARY
 
 
-DEFAULT_SUMMARY = Path.home() / "Desktop" / "MUSIC" / "STEMS" / "drop_batch_summary.csv"
+DEFAULT_SUMMARY = DROP_BATCH_SUMMARY
 
 
 def _read_summary(path: Path) -> List[Dict[str, str]]:

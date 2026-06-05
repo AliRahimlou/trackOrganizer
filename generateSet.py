@@ -16,10 +16,12 @@ import xml.etree.ElementTree as ET
 from io import BytesIO
 from pathlib import Path
 
-# --------- hard-coded paths ---------
-SRC_DIR  = Path("/Users/alirahimlou/Desktop/MUSIC/GeneratedSet/stuff")
-OUT_FILE = Path("/Users/alirahimlou/Desktop/MUSIC/GeneratedSet/Sets/Combined_CH_Scenes.als")
-BASE_ALS = Path("/Users/alirahimlou/myapps/trackOrganizer/alsFiles/CH1.als")  # point to your base
+from project_config import ALS_TEMPLATES_DIR, GENERATED_SET_DIR, env_path
+
+# --------- paths ---------
+SRC_DIR  = env_path("TRACK_ORGANIZER_GENERATE_SET_SRC_DIR", GENERATED_SET_DIR / "stuff")
+OUT_FILE = env_path("TRACK_ORGANIZER_GENERATE_SET_OUT_FILE", GENERATED_SET_DIR / "Sets" / "Combined_CH_Scenes.als")
+BASE_ALS = env_path("TRACK_ORGANIZER_GENERATE_SET_BASE_ALS", ALS_TEMPLATES_DIR / "CH1.als")
 
 MAX_FILES = 0
 VERBOSE   = True

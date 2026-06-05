@@ -18,11 +18,12 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from drop_fusion_audit import _json_default, build_audit
+from project_config import REKORDBOX_XML
 
 
 ROLE_RE = re.compile(r"^(drums|inst|vocals)_", re.I)
 BPM_RE = re.compile(r"^(?:drums|inst|vocals)_(\d{2,3})_", re.I)
-DEFAULT_REKORDBOX_XML = "/Users/alirahimlou/Documents/rekordbox.xml"
+DEFAULT_REKORDBOX_XML = str(REKORDBOX_XML)
 
 
 def _value(node: Optional[ET.Element]) -> str:

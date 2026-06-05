@@ -11,9 +11,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Sequence
 
+from project_config import DEFAULT_ALS_TEMPLATE, DROP_BATCH_SUMMARY
 
-DEFAULT_SUMMARY = Path.home() / "Desktop" / "MUSIC" / "STEMS" / "drop_batch_summary.csv"
-DEFAULT_TEMPLATE = Path(__file__).resolve().parent / "alsFiles" / "128.als"
+
+DEFAULT_SUMMARY = DROP_BATCH_SUMMARY
+DEFAULT_TEMPLATE = DEFAULT_ALS_TEMPLATE
 MODE_MAP = {
     "safe": "conservative",
     "balanced": "normal",

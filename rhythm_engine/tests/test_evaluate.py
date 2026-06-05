@@ -11,6 +11,8 @@ def test_evaluate_beat_grid_reports_ms_precision_metrics() -> None:
 
     assert report.reference_count == 4
     assert report.estimated_count == 4
+    assert round(report.median_error_ms, 3) == 10.5
+    assert round(report.mean_error_ms, 3) == 18.25
     assert round(report.median_abs_error_ms, 3) == 13.0
     assert report.hit_rate_5ms == 0.25
     assert report.hit_rate_10ms == 0.50
