@@ -256,6 +256,21 @@ Progress is saved to `review_state.json` beside the batch summary. Audio stays
 local; if `ffmpeg` is available the server makes a short WAV preview around the
 detected marker for browser compatibility.
 
+Visual-first review:
+
+```bash
+python3 web_review.py "/path/to/drop_batch_summary.csv" \
+  --template "alsFiles/128.als" \
+  --visual-first \
+  --regenerate-als-on-correction
+```
+
+This opens each track on the full waveform instead of the AI marker window.
+The waveform draws darker sustained-energy chunks so the first big visual block
+is easier to spot. Double-click a block to zoom into it, repeat until the edge is
+clear, place `1.1.1`, optionally run `AI REFINE`, then save the marker through
+the normal ALS regeneration and verification path.
+
 Automatic MicroSnap suggestions:
 
 ```bash

@@ -13,6 +13,18 @@ STEM_PREFIX_RE = re.compile(
     re.IGNORECASE,
 )
 
+HUMAN_REVIEW_SOURCES = {
+    "web_review",
+    "web_manual_marker",
+    "web_candidate_pick",
+    "web_accept_grid_marker",
+    "web_accept_knee_marker",
+    "web_accept_attack_marker",
+    "web_accept_asd_marker",
+    "web_accept_micro_marker",
+    "web_ai_refined_accept",
+}
+
 
 def _float_or_none(value: Any) -> Optional[float]:
     try:
@@ -40,6 +52,11 @@ def slug_for_path(path: Any) -> str:
     stem = exact_key_for_path(path)
     stem = STEM_PREFIX_RE.sub("", stem)
     return " ".join(re.sub(r"[^a-z0-9]+", " ", stem.lower()).split())
+
+
+def is_human_review_source(value: Any) -> bool:
+    source = str(value or "").strip().lower()
+    return source in HUMAN_REVIEW_SOURCES
 
 
 @dataclass(frozen=True)
@@ -168,6 +185,8 @@ def _load_correction_log(index: HistoricalMarkerIndex, correction_path: Path) ->
     for row in _iter_jsonl(correction_path):
         marker = _float_or_none(row.get("user_pick"))
         if marker is None or marker <= 0.0:
+            continue
+        if not is_human_review_source(row.get("reviewed_from")):
             continue
         track = str(row.get("track") or row.get("filename") or "")
         if not track:

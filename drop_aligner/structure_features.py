@@ -15,7 +15,7 @@ from .detector import DropDetectorConfig, FeatureBundle, extract_features
 from .multistem import find_stem_group, infer_bpm_from_path
 
 
-STRUCTURE_FEATURE_VERSION = 3
+STRUCTURE_FEATURE_VERSION = 4
 
 
 def _clip01(value: Any) -> float:
@@ -56,10 +56,20 @@ def _density(values: np.ndarray, times: np.ndarray, start: float, end: float, *,
     return _clip01(count / max(1.0, segment.size * 0.30))
 
 
+def _occupancy(values: np.ndarray, times: np.ndarray, start: float, end: float, *, threshold: float = 0.32) -> float:
+    segment = _window(values, times, start, end)
+    if segment.size < 2:
+        return 0.0
+    return _clip01(float(np.mean(segment >= float(threshold))))
+
+
 def _role_bar_features(features: FeatureBundle, start: float, end: float) -> Dict[str, float]:
     return {
         "low_energy": _mean(features.low_energy, features.frame_times, start, end),
         "rms": _mean(features.rms, features.frame_times, start, end),
+        "rms_occupancy": _occupancy(features.rms, features.frame_times, start, end, threshold=0.32),
+        "rms_mid_occupancy": _occupancy(features.rms, features.frame_times, start, end, threshold=0.24),
+        "low_occupancy": _occupancy(features.low_energy, features.frame_times, start, end, threshold=0.16),
         "spectral_flux": _mean(features.spectral_flux, features.frame_times, start, end),
         "onset": _mean(features.onset, features.frame_times, start, end),
         "combined_attack": _mean(features.combined_attack, features.frame_times, start, end),

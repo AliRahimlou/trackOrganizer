@@ -13,7 +13,7 @@ import soundfile as sf
 from PIL import Image, ImageDraw
 
 
-CACHE_VERSION = 6
+CACHE_VERSION = 7
 RAW_SAMPLE_LIMIT = 96_000
 RAW_SAMPLES_PER_PIXEL = 16.0
 MAX_TILE_WIDTH = 48_000
@@ -178,7 +178,8 @@ class WaveformCache:
     def _raw_tile(self, path: Path, start_sample: int, end_sample: int, width: int) -> Dict[str, Any]:
         data = self._read_frames(path, start_sample, end_sample)
         mono = _mono_preserve_peak(data)
-        rms = _rms_bins_from_mono(mono, width)
+        rms_width = max(1, min(int(width), int(mono.size) if mono.size else 1))
+        rms = _rms_bins_from_mono(mono, rms_width)
         return {
             "mode": "samples",
             "sample_start": int(start_sample),

@@ -123,6 +123,10 @@ def _has_drop_anchor_111(clip: ET.Element, min_drop_sec: float = 1.0) -> bool:
     return has_neg
 
 
+def _row_has_drop_anchor_111(row: Dict[str, ET.Element], min_drop_sec: float = 1.0) -> bool:
+    return any(_has_drop_anchor_111(clip, min_drop_sec=min_drop_sec) for clip in row.values())
+
+
 def _clip_current_end_sec(clip: ET.Element) -> Optional[float]:
     n = clip.find("./CurrentEnd")
     if n is not None:
@@ -147,11 +151,25 @@ def _sec_to_beats(sec: float, bpm: int) -> float:
     return (float(sec) * float(bpm)) / 60.0
 
 
+def _set_value(node: Optional[ET.Element], value: object) -> None:
+    if node is not None:
+        node.set("Value", str(value))
+
+
+def _fmt(value: float) -> str:
+    text = f"{float(value):.9f}".rstrip("0").rstrip(".")
+    return "0" if text in {"-0", "-0.0", ""} else text
+
+
 def _apply_triplet_warp_markers(clips: Sequence[ET.Element], bpm: int, drop_sec: float, end_sec: float) -> None:
     phi = -_sec_to_beats(drop_sec, bpm)
     points = sorted(set(round(max(0.0, x), 6) for x in [0.0, float(drop_sec), float(end_sec)]))
     if len(points) < 2:
         return
+    end_beat = _sec_to_beats(max(float(end_sec), float(drop_sec) + 0.01), bpm) + phi
+    end_beat = max(0.01, float(end_beat))
+    hidden_start = _fmt(phi)
+    hidden_end = _fmt(phi + 4.0)
 
     for clip in clips:
         old = clip.find("./WarpMarkers")
@@ -178,6 +196,27 @@ def _apply_triplet_warp_markers(clips: Sequence[ET.Element], bpm: int, drop_sec:
             clip.insert(0, iw)
         else:
             iw.set("Value", "true")
+
+        _set_value(clip.find("./CurrentStart"), "0")
+        _set_value(clip.find("./CurrentEnd"), _fmt(end_beat))
+
+        loop = clip.find("./Loop")
+        if loop is not None:
+            _set_value(loop.find("./LoopStart"), "0")
+            _set_value(loop.find("./LoopEnd"), _fmt(end_beat))
+            _set_value(loop.find("./OutMarker"), _fmt(end_beat))
+            _set_value(loop.find("./HiddenLoopStart"), hidden_start)
+            _set_value(loop.find("./HiddenLoopEnd"), hidden_end)
+
+        scroller = clip.find("./ScrollerTimePreserver")
+        if scroller is not None:
+            _set_value(scroller.find("./LeftTime"), hidden_start)
+            _set_value(scroller.find("./RightTime"), _fmt(end_beat))
+
+        selection = clip.find("./TimeSelection")
+        if selection is not None:
+            _set_value(selection.find("./AnchorTime"), hidden_start)
+            _set_value(selection.find("./OtherTime"), hidden_start)
 
 
 def _choose_tracks_for_rows(root: ET.Element) -> List[ET.Element]:
@@ -525,7 +564,7 @@ def process_als(
             print(f"[SKIP] slot={slot_idx} missing BPM in drums name: {_clip_name(drums)}")
             continue
 
-        already = _has_drop_anchor_111(drums, min_drop_sec=min_drop_sec_existing)
+        already = _row_has_drop_anchor_111(row, min_drop_sec=min_drop_sec_existing)
         if already and not force:
             continue
 

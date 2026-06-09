@@ -13,6 +13,8 @@ import unicodedata
 import xml.etree.ElementTree as ET
 from typing import Dict, List, Optional, Tuple
 
+from drop_aligner.als import _duration_info
+
 
 ROLE_RE = re.compile(r"^(drums|inst|vocals)_", re.I)
 BPM_RE = re.compile(r"^(?:drums|inst|vocals)_(\d{2,3})_", re.I)
@@ -230,6 +232,29 @@ def _last_marker_sec(clip: ET.Element) -> Optional[float]:
     return max(vals) if vals else None
 
 
+def _clip_duration_sec(clip: ET.Element, als_path: str) -> Optional[float]:
+    audio_path = _resolve_clip_audio_path(clip, als_path)
+    if not audio_path:
+        return None
+    try:
+        _, _, duration = _duration_info(audio_path)
+    except Exception:
+        return None
+    return float(duration) if duration and duration > 0.0 else None
+
+
+def _row_end_sec(row: Dict[str, ET.Element], als_path: str, drop_sec: float) -> float:
+    values: List[float] = [float(drop_sec) + 1.0]
+    for clip in row.values():
+        marker_sec = _last_marker_sec(clip)
+        if marker_sec is not None:
+            values.append(float(marker_sec))
+        duration = _clip_duration_sec(clip, als_path)
+        if duration is not None:
+            values.append(float(duration))
+    return max(values)
+
+
 def _current_anchor_sec(clip: ET.Element) -> Optional[float]:
     anchors: List[float] = []
     for marker in clip.findall("./WarpMarkers/WarpMarker"):
@@ -336,8 +361,7 @@ def apply_local_candidates(
         if current is not None and abs(float(current) - float(drop_sec)) < float(min_delta_sec):
             continue
 
-        end_sec = max((_last_marker_sec(clip) or 0.0) for clip in row.values())
-        end_sec = max(float(end_sec), float(drop_sec) + 1.0)
+        end_sec = _row_end_sec(row, als_in, float(drop_sec))
         if not dry_run:
             for role in ("drums", "inst", "vocals"):
                 _replace_warp_markers(row[role], int(bpm), float(drop_sec), float(end_sec))

@@ -4,9 +4,10 @@ import tempfile
 from pathlib import Path
 
 import numpy as np
+import pytest
 from scipy.io import wavfile
 
-from drop_aligner.microalign import choose_microaligned_candidate, microalign_marker
+from drop_aligner.microalign import choose_microaligned_candidate, microalign_candidate_dicts, microalign_marker
 
 
 def _write_wav(y: np.ndarray, sr: int) -> str:
@@ -183,6 +184,18 @@ def test_microalign_keeps_correct_marker_close() -> None:
     assert abs(result["snap_offset_ms"]) < 12.0
 
 
+def test_microalign_keeps_input_boundary_when_visual_markers_bracket_real_stem() -> None:
+    path = Path("/Users/alirahimlou/Desktop/MUSIC/STEMS/140/4A/smith. - Crisp/drums_140_4A_6-smith. - Crisp.flac")
+    if not path.exists():
+        pytest.skip("local review stem is not available")
+    boundary = 27.428571428571427
+    result = microalign_marker(str(path), boundary)
+    assert result["input_boundary_used"] == 1.0
+    assert result["impact_body_used"] == 0.0
+    assert abs(result["microaligned_time"] - boundary) < 0.0001
+    assert abs(result["snap_offset_ms"]) < 0.1
+
+
 def test_microalign_prefers_visual_knee_before_big_lobe() -> None:
     sr = 44100
     boundary = 1.0
@@ -223,6 +236,29 @@ def test_microalign_keeps_asd_reference_but_prefers_first_centerline() -> None:
     assert result["centerline_boundary_used"] is True
     assert result["visual_onset_knee_used"] == 0.0
     assert result["ableton_asd_quality"] > 0.80
+
+
+def test_existing_microalign_keeps_strong_visual_onset_over_clock_lock() -> None:
+    candidate = {
+        "timestamp": 1.0,
+        "bpm_clock": {"on_one": True, "nearest_one_time": 1.0},
+        "microalign": {
+            "ok": True,
+            "microaligned_time": 1.080,
+            "snap_offset_ms": 80.0,
+            "micro_confidence": 0.78,
+            "centerline_boundary_used": True,
+            "centerline_boundary_quality": 0.86,
+            "impact_boundary_confidence": 0.82,
+        },
+    }
+
+    [result] = microalign_candidate_dicts("unused.wav", [candidate], limit=1)
+    micro = result["microalign"]
+
+    assert micro["microaligned_time"] == 1.080
+    assert micro["clock_lock_skipped"] is True
+    assert "clock_locked" not in micro
 
 
 def test_auto_place_returns_review_suggestion_for_low_confidence_tracks() -> None:

@@ -176,6 +176,14 @@ h2 {
   cursor: crosshair;
 }
 
+.waveWrapper.directPlace {
+  cursor: crosshair;
+}
+
+body.visualFirst .waveWrapper {
+  min-height: 422px;
+}
+
 #waveCanvas {
   display: block;
   width: 100%;
@@ -308,6 +316,19 @@ h2 {
   top: 48px;
 }
 
+.marker.grid {
+  background: var(--accent);
+  width: 3px;
+  z-index: 4;
+}
+
+.marker.grid span {
+  background: #e8f2fb;
+  color: var(--accentDark);
+  font-weight: 800;
+  top: 24px;
+}
+
 .marker.asd {
   background: var(--asd);
   width: 3px;
@@ -339,6 +360,20 @@ h2 {
 
 .marker.playhead span {
   top: 44px;
+}
+
+.marker.placementPreview {
+  background: var(--user);
+  opacity: 0.78;
+  width: 3px;
+  z-index: 6;
+}
+
+.marker.placementPreview span {
+  background: var(--user);
+  color: #fff;
+  font-weight: 900;
+  top: 78px;
 }
 
 .gridLine {
@@ -568,7 +603,7 @@ h2 {
 }
 
 .acceptActions {
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
 }
 
 .toolActions {
@@ -624,6 +659,18 @@ button.markerAccept.knee:hover {
   border-color: #006f60;
 }
 
+button.markerAccept.grid {
+  background: var(--accent);
+  border-color: var(--accent);
+  border-left-color: var(--accent);
+  color: #fff;
+}
+
+button.markerAccept.grid:hover {
+  background: var(--accentDark);
+  border-color: var(--accentDark);
+}
+
 button.markerAccept.attack {
   border-left-color: #6a3d9a;
 }
@@ -634,6 +681,52 @@ button.markerAccept.zero {
 
 button.markerAccept.asd {
   border-left-color: var(--asd);
+}
+
+body.visualFirst #placeBtn {
+  background: var(--user);
+  border-color: var(--user);
+  color: #fff;
+  font-weight: 800;
+}
+
+body.visualFirst #placeBtn:hover {
+  background: #115a34;
+  border-color: #115a34;
+}
+
+body.visualFirst #saveCorrectionBtn:not(.disabled) {
+  background: var(--user);
+  border-color: var(--user);
+  color: #fff;
+  font-weight: 900;
+}
+
+body.visualFirst #saveCorrectionBtn:not(.disabled):hover {
+  background: #115a34;
+  border-color: #115a34;
+}
+
+body.visualFirst button.markerAccept {
+  background: #f8fafc;
+  border-color: var(--border);
+  color: var(--muted);
+}
+
+body.visualFirst button.markerAccept:not(.disabled):hover {
+  border-color: #9aa8b6;
+  color: var(--text);
+}
+
+body.visualFirst button.markerAccept.primary.ai {
+  background: #f8fafc;
+  border-color: rgba(194, 53, 43, 0.35);
+  color: var(--danger);
+}
+
+body.visualFirst button.markerAccept.primary.ai:hover {
+  background: #fbe7e5;
+  border-color: var(--danger);
 }
 
 .detailPanel {
@@ -846,7 +939,7 @@ button.markerAccept.asd {
   }
 
   .acceptActions {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
+    grid-template-columns: repeat(4, minmax(0, 1fr));
   }
 
   .toolActions {

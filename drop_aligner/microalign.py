@@ -36,6 +36,8 @@ MICROALIGN_FEATURE_KEYS = [
     "visual_onset_knee_offset_ms",
     "visual_onset_knee_quality",
     "visual_onset_knee_used",
+    "input_boundary_quality",
+    "input_boundary_used",
     "ableton_asd_time",
     "ableton_asd_offset_ms",
     "ableton_asd_quality",
@@ -775,6 +777,60 @@ def _ableton_asd_anchor_before_peak(
     return best_idx, best_quality, best_time
 
 
+def _input_boundary_anchor_when_bracketed(
+    *,
+    candidate_idx: int,
+    attack_idx: int,
+    zero_idx: int,
+    zero_quality: float,
+    center_idx: Optional[int],
+    center_quality: float,
+    knee_idx: Optional[int],
+    knee_quality: float,
+    sr: int,
+) -> tuple[Optional[int], float]:
+    if center_idx is None or knee_idx is None:
+        return None, 0.0
+    if center_quality < 0.80 or knee_quality < 0.80:
+        return None, 0.0
+
+    candidate_idx = int(candidate_idx)
+    center_idx = int(center_idx)
+    knee_idx = int(knee_idx)
+    low = min(center_idx, knee_idx)
+    high = max(center_idx, knee_idx)
+    bracket_width = high - low
+    if bracket_width <= 0 or bracket_width > max(1, int(round(0.0060 * sr))):
+        return None, 0.0
+
+    bracket_slack = max(1, int(round(0.00035 * sr)))
+    if candidate_idx < low - bracket_slack or candidate_idx > high + bracket_slack:
+        return None, 0.0
+
+    nearest_visual = min(abs(candidate_idx - center_idx), abs(candidate_idx - knee_idx))
+    if nearest_visual > max(1, int(round(0.0022 * sr))):
+        return None, 0.0
+
+    attack_support = abs(candidate_idx - int(attack_idx)) <= max(1, int(round(0.0025 * sr)))
+    zero_support = zero_quality >= 0.55 and abs(candidate_idx - int(zero_idx)) <= max(1, int(round(0.0025 * sr)))
+    if not attack_support and not zero_support:
+        return None, 0.0
+
+    bracket_quality = 1.0 - _clip01(float(bracket_width) / max(1.0, 0.0060 * sr))
+    proximity_quality = 1.0 - _clip01(float(nearest_visual) / max(1.0, 0.0022 * sr))
+    source_quality = min(float(center_quality), float(knee_quality))
+    support_quality = max(0.82 if attack_support else 0.0, float(zero_quality) if zero_support else 0.0)
+    quality = _clip01(
+        (0.35 * source_quality)
+        + (0.24 * bracket_quality)
+        + (0.21 * proximity_quality)
+        + (0.20 * support_quality)
+    )
+    if quality < 0.72:
+        return None, 0.0
+    return candidate_idx, float(quality)
+
+
 def _impact_body_anchor_after_tail(
     y: np.ndarray,
     curves: Mapping[str, np.ndarray],
@@ -989,6 +1045,18 @@ def microalign_marker(
     asd_eligible = bool(asd_idx is not None and asd_quality >= 0.52)
     centerline_eligible = bool(center_idx is not None and center_quality >= 0.55)
     selected_micro_source = "zero" if prefer_zero_crossing and zero_quality >= 0.35 else "attack"
+    input_boundary_idx, input_boundary_quality = _input_boundary_anchor_when_bracketed(
+        candidate_idx=candidate_idx,
+        attack_idx=attack_idx,
+        zero_idx=zero_idx,
+        zero_quality=zero_quality,
+        center_idx=center_idx,
+        center_quality=center_quality,
+        knee_idx=knee_idx,
+        knee_quality=knee_quality,
+        sr=sr,
+    )
+    input_boundary_eligible = bool(input_boundary_idx is not None)
     asd_matches_knee = bool(
         knee_eligible
         and asd_eligible
@@ -1006,6 +1074,9 @@ def microalign_marker(
     if asd_matches_knee:
         aligned_idx = int(asd_idx)
         selected_micro_source = "asd"
+    elif input_boundary_eligible:
+        aligned_idx = int(input_boundary_idx)
+        selected_micro_source = "input_boundary"
     elif centerline_matches_knee and center_quality >= knee_quality - 0.08:
         aligned_idx = int(center_idx)
         selected_micro_source = "centerline"
@@ -1028,6 +1099,8 @@ def microalign_marker(
         selected_quality = float(asd_quality)
     elif selected_micro_source == "centerline":
         selected_quality = float(center_quality)
+    elif selected_micro_source == "input_boundary":
+        selected_quality = float(input_boundary_quality)
     elif selected_micro_source == "zero":
         selected_quality = float(zero_quality)
     impact_body_idx, impact_body_quality = _impact_body_anchor_after_tail(
@@ -1042,7 +1115,7 @@ def microalign_marker(
     )
     tail_bypass_ms = 0.0
     high_quality_start = bool(
-        selected_micro_source in {"knee", "asd", "centerline"}
+        selected_micro_source in {"knee", "asd", "centerline", "input_boundary"}
         and selected_quality >= 0.74
     )
     allow_tail_bypass = bool(
@@ -1063,6 +1136,7 @@ def microalign_marker(
     knee_used = selected_micro_source == "knee"
     asd_used = selected_micro_source == "asd"
     centerline_used = selected_micro_source == "centerline"
+    input_boundary_used = selected_micro_source == "input_boundary"
     impact_body_used = selected_micro_source == "impact_body"
 
     peak_time = window_start + (float(best_idx) / float(sr))
@@ -1130,6 +1204,8 @@ def microalign_marker(
         boundary_quality = max(boundary_quality, float(asd_quality))
     if centerline_used:
         boundary_quality = max(boundary_quality, float(center_quality))
+    if input_boundary_used:
+        boundary_quality = max(boundary_quality, float(input_boundary_quality))
     if impact_body_used:
         boundary_quality = max(boundary_quality, float(impact_body_quality))
     if boundary_quality > 0.0:
@@ -1157,6 +1233,8 @@ def microalign_marker(
         reason = "Ableton ASD transient marker at quiet pre-attack boundary"
     elif centerline_used and micro_confidence >= 0.75 and abs(offset_ms) <= 120.0:
         reason = "quiet center-line departure before sustained attack"
+    elif input_boundary_used and micro_confidence >= 0.75 and abs(offset_ms) <= 120.0:
+        reason = "input boundary kept inside tight visual onset bracket"
     elif micro_confidence >= 0.80 and abs(offset_ms) <= 120.0:
         reason = "strong clean attack with sustained post-attack energy"
     elif abs(offset_ms) > 120.0:
@@ -1179,6 +1257,8 @@ def microalign_marker(
         "visual_onset_knee_offset_ms": 0.0 if knee_time is None else float((float(knee_time) - candidate) * 1000.0),
         "visual_onset_knee_quality": float(knee_quality),
         "visual_onset_knee_used": float(1.0 if knee_used else 0.0),
+        "input_boundary_quality": float(input_boundary_quality),
+        "input_boundary_used": float(1.0 if input_boundary_used else 0.0),
         "ableton_asd_time": 0.0 if asd_time is None else float(asd_time),
         "ableton_asd_offset_ms": 0.0 if asd_time is None else float((float(asd_time) - candidate) * 1000.0),
         "ableton_asd_quality": float(asd_quality),
@@ -1238,6 +1318,29 @@ def _lock_clock_microalign(candidate: Mapping[str, Any], micro: Mapping[str, Any
             lock_time = float(clock_time)
     snapped = _finite_float(locked.get("microaligned_time"), default=float(timestamp))
     if abs(float(snapped) - float(lock_time)) <= 0.040:
+        return locked
+
+    visual_sources = (
+        ("input_boundary_used", "input_boundary_quality"),
+        ("centerline_boundary_used", "centerline_boundary_quality"),
+        ("visual_onset_knee_used", "visual_onset_knee_quality"),
+        ("ableton_asd_used", "ableton_asd_quality"),
+        ("impact_body_used", "impact_body_quality"),
+    )
+    visual_quality = 0.0
+    for used_key, quality_key in visual_sources:
+        used = micro.get(used_key)
+        is_used = bool(used is True or _finite_float(used, default=0.0) > 0.0)
+        if is_used:
+            visual_quality = max(visual_quality, _finite_float(micro.get(quality_key), default=0.0))
+    impact_confidence = _finite_float(micro.get("impact_boundary_confidence"), default=0.0)
+    visual_offset = abs(float(snapped) - float(lock_time))
+    if visual_quality >= 0.72 and impact_confidence >= 0.66 and visual_offset <= 0.160:
+        locked["clock_lock_skipped"] = True
+        locked["clock_lock_skip_reason"] = "kept strong visual waveform onset instead of BPM-clock grid"
+        locked["clock_lock_candidate_time"] = float(lock_time)
+        locked["clock_lock_visual_offset_ms"] = float((float(snapped) - float(lock_time)) * 1000.0)
+        locked["micro_confidence"] = max(0.82, _finite_float(locked.get("micro_confidence"), default=0.0))
         return locked
 
     original_offset = _finite_float(locked.get("snap_offset_ms"), default=(snapped - float(timestamp)) * 1000.0)

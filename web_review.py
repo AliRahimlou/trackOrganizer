@@ -47,13 +47,14 @@ from lxml import etree
 from drop_aligner.als import modify_als
 from drop_aligner.candidate_chooser import choose_learned_candidate, load_candidate_chooser_payload, predict_candidate_errors
 from drop_aligner.exclusions import EXCLUDED_DIR_NAMES, row_has_excluded_path
-from drop_aligner.historical_markers import HistoricalMarker, load_historical_markers
+from drop_aligner.historical_markers import HistoricalMarker, is_human_review_source, load_historical_markers
 from drop_aligner.learning import closest_candidate_to_pick, log_correction
 from drop_aligner.microalign import choose_microaligned_candidate, microalign_candidate_dicts, microalign_marker, should_auto_accept
 from drop_aligner.musical_clock import bpm_clock_for_time, feature_grid_for_time, phrase_strength_for_bar
 from drop_aligner.multistem import choose_multistem_candidate, find_stem_group
 from drop_aligner.structure_map import analyze_track_structure
 from drop_aligner.summary_rerank import rerank_summary_with_model
+from drop_aligner.visual_first import visual_first_marker
 from drop_aligner.waveform import WaveformCache
 from review import _run_retrain
 from verify_als import verify_als
@@ -438,7 +439,7 @@ def _apply_even_bar_prior(
             rescue = rescue_pool[0] if rescue_pool else None
             rescue_time = _candidate_marker_time(rescue) if rescue else None
             beat_sec = 60.0 / max(1.0, float(bpm or 0.0))
-            max_rescue_jump_sec = max(0.35, min(0.55, 0.85 * beat_sec))
+            max_rescue_jump_sec = max(0.35, min(0.72, 1.15 * beat_sec))
             rescue_jump_sec = abs(float(rescue_time) - float(current_time)) if rescue_time is not None else None
             if rescue_jump_sec is not None and rescue_jump_sec > max_rescue_jump_sec:
                 summary["skipped_rescue_large_jump_ms"] = round(float(rescue_jump_sec * 1000.0), 3)
@@ -462,7 +463,7 @@ def _apply_even_bar_prior(
                         "suggested_time": float(rescue_time),
                         "score": float(rescue.get("bar_prior_adjusted_score", rescue.get("score", 0.0)) or 0.0),
                         "reason": (
-                            f"musical-clock rescue moved off-ONE pick back to bar "
+                            f"musical-clock rescue moved off-ONE pick to bar "
                             f"{int(rescue_prior.get('nearest_musical_bar', 0) or 0)}; "
                             f"{next_suggestion.get('reason') or 'audio evidence stayed within threshold'}"
                         ),
@@ -648,8 +649,16 @@ def _candidate_dedupe_priority(candidate: Mapping[str, Any]) -> float:
     source = str(candidate.get("source") or "")
     structure_role = str(candidate.get("structure_role") or "")
     priority = 0.0
+    if selected_by in {"historical_human_marker", "historical_review_memory"}:
+        priority = max(priority, 130.0)
     if selected_by == "post_structure_candidate_chooser":
         priority = max(priority, 110.0)
+    if selected_by == "visual_structure_section_guard":
+        priority = max(priority, 109.5)
+    if selected_by == "visual_gui_first_fat_block":
+        priority = max(priority, 109.0)
+    if selected_by == "visual_primary_phrase_prior":
+        priority = max(priority, 108.0)
     if selected_by == "candidate_chooser":
         priority = max(priority, 100.0)
     if _candidate_nested_value(candidate, "candidate_chooser_probability") is not None:
@@ -672,6 +681,183 @@ def _candidate_dedupe_priority(candidate: Mapping[str, Any]) -> float:
         priority = max(priority, 36.0)
     score = _candidate_nested_value(candidate, "score") or _candidate_nested_value(candidate, "confidence_score") or 0.0
     return float(priority + min(0.99, max(0.0, float(score))))
+
+
+def _is_historical_candidate(candidate: Mapping[str, Any]) -> bool:
+    selected_by = str(candidate.get("selected_by") or "")
+    source = str(candidate.get("source") or "")
+    reason = str(candidate.get("reason") or "")
+    return bool(
+        selected_by in {"historical_human_marker", "historical_review_memory"}
+        or source in {"historical_human_marker", "historical_review_memory"}
+        or reason.startswith("historical ")
+    )
+
+
+def _without_historical_candidates(candidates: Sequence[Any]) -> List[Dict[str, Any]]:
+    return [
+        dict(candidate)
+        for candidate in candidates
+        if isinstance(candidate, Mapping) and not _is_historical_candidate(candidate)
+    ]
+
+
+def _candidate_phrase_prior(candidate: Mapping[str, Any], bpm: Optional[float], *, bar_zero_sec: Optional[float] = None) -> Optional[Dict[str, Any]]:
+    prior = candidate.get("musical_bar_prior") if isinstance(candidate.get("musical_bar_prior"), Mapping) else None
+    if prior:
+        return dict(prior)
+    return _bar_prior_for_time(_candidate_marker_time(candidate), bpm, bar_zero_sec=bar_zero_sec)
+
+
+def _primary_visual_phrase_candidate(
+    candidates: List[Mapping[str, Any]],
+    current_candidate: Optional[Mapping[str, Any]],
+    *,
+    bpm: Optional[float],
+    bar_zero_sec: Optional[float] = None,
+) -> Optional[Dict[str, Any]]:
+    if not bpm:
+        return None
+    current_time = _candidate_marker_time(current_candidate) if isinstance(current_candidate, Mapping) else None
+    current_prior = _bar_prior_for_time(current_time, bpm, bar_zero_sec=bar_zero_sec)
+    current_bar = int((current_prior or {}).get("nearest_musical_bar", 0) or 0)
+    current_distance = _float_or_none((current_prior or {}).get("distance_beats"))
+    current_strength = float((current_prior or {}).get("phrase_strength", 0.0) or 0.0)
+    current_distance_value = current_distance if current_distance is not None else 99.0
+    current_is_primary = bool(
+        current_bar >= 25
+        and current_bar <= 49
+        and (current_bar - 1) % 32 == 0
+        and current_distance_value <= 0.16
+        and current_strength >= 0.94
+    )
+    if current_is_primary:
+        return None
+    current_evidence = _candidate_evidence_score(current_candidate) if isinstance(current_candidate, Mapping) else 0.0
+    current_score = (
+        _candidate_nested_value(current_candidate or {}, "score")
+        or _candidate_nested_value(current_candidate or {}, "confidence_score")
+        or 0.0
+    )
+    current_selected_by = str((current_candidate or {}).get("selected_by") or "")
+    current_visual_components = (
+        current_candidate.get("visual_components")
+        if isinstance(current_candidate, Mapping) and isinstance(current_candidate.get("visual_components"), Mapping)
+        else {}
+    )
+    current_visual_clock_bar = int(current_visual_components.get("clock_bar", current_bar) or current_bar)
+    current_visual_primary_bar = bool(
+        current_visual_clock_bar >= 25
+        and current_visual_clock_bar <= 49
+        and (current_visual_clock_bar - 1) % 32 == 0
+    )
+    current_visual_body_used = False
+    current_micro = 0.0
+    if isinstance(current_candidate, Mapping):
+        current_micro_map = current_candidate.get("microalign") if isinstance(current_candidate.get("microalign"), Mapping) else {}
+        current_micro = (
+            _float_or_none(current_micro_map.get("micro_confidence"))
+            or _float_or_none(current_candidate.get("micro_confidence"))
+            or 0.0
+        )
+        current_visual_body_used = bool(current_micro_map.get("visual_body_onset_used"))
+    if (
+        current_selected_by == "visual_gui_first_fat_block"
+        and (current_visual_primary_bar or 25 <= current_bar <= 49)
+        and float(current_score) >= 0.55
+        and (
+            current_visual_body_used
+            or _float_or_none(current_visual_components.get("post_bass8")) is not None
+            and (_float_or_none(current_visual_components.get("post_bass8")) or 0.0) >= 0.45
+            or (_float_or_none(current_visual_components.get("post_drum_cont8")) or 0.0) >= 0.86
+        )
+    ):
+        return None
+    if (
+        9 <= current_bar <= 21
+        and current_distance_value <= 0.16
+        and current_strength >= 0.75
+        and float(current_score) >= 0.68
+        and float(current_micro) >= 0.80
+    ):
+        return None
+    current_secondary_phrase = bool(
+        current_bar >= 25
+        and current_bar <= 49
+        and current_distance_value <= 0.16
+        and current_strength >= 0.86
+    )
+    current_early_or_weak = bool(
+        current_bar <= 21
+        or current_bar == 0
+        or current_distance_value > 0.25
+        or current_strength < 0.94
+    )
+
+    primary_rows: List[Dict[str, Any]] = []
+    for candidate in candidates:
+        if not isinstance(candidate, Mapping):
+            continue
+        marker = _candidate_marker_time(candidate)
+        if marker is None:
+            continue
+        prior = _candidate_phrase_prior(candidate, bpm, bar_zero_sec=bar_zero_sec)
+        if not prior:
+            continue
+        bar = int(prior.get("nearest_musical_bar", 0) or 0)
+        distance = _float_or_none(prior.get("distance_beats"))
+        strength = float(prior.get("phrase_strength", 0.0) or 0.0)
+        if bar < 25 or bar > 49 or (bar - 1) % 32 != 0:
+            continue
+        if (distance if distance is not None else 99.0) > 0.16 or strength < 0.94:
+            continue
+        evidence = _candidate_evidence_score(candidate)
+        micro = candidate.get("microalign") if isinstance(candidate.get("microalign"), Mapping) else {}
+        micro_conf = _float_or_none(micro.get("micro_confidence")) or _float_or_none(candidate.get("micro_confidence")) or 0.0
+        candidate_score = _candidate_nested_value(candidate, "score") or _candidate_nested_value(candidate, "confidence_score") or 0.0
+        clean_primary_phrase_rescue = bool(
+            current_secondary_phrase
+            and current_time is not None
+            and marker > current_time
+            and micro_conf >= 0.90
+            and candidate_score >= max(0.68, float(current_score) - 0.12)
+            and evidence >= current_evidence - 0.14
+        )
+        if evidence < max(0.46, current_evidence - 0.18) and micro_conf < 0.80 and not clean_primary_phrase_rescue:
+            continue
+        if not current_early_or_weak and evidence < current_evidence + 0.06 and not clean_primary_phrase_rescue:
+            continue
+        row = dict(candidate)
+        row["musical_bar_prior"] = dict(prior)
+        if isinstance(prior.get("bpm_clock"), Mapping):
+            row["bpm_clock"] = dict(prior.get("bpm_clock") or {})
+        row["bar_prior_evidence_score"] = float(evidence)
+        row["bar_prior_adjusted_score"] = float(evidence + (0.14 * float(prior.get("alignment_score", 0.0) or 0.0)))
+        row["_visual_primary_bar"] = bar
+        row["_visual_primary_micro"] = float(micro_conf)
+        primary_rows.append(row)
+    if not primary_rows:
+        return None
+
+    primary_rows.sort(
+        key=lambda row: (
+            -float((row.get("musical_bar_prior") or {}).get("phrase_strength", 0.0) or 0.0),
+            -float(row.get("_visual_primary_micro", 0.0) or 0.0),
+            -float(row.get("bar_prior_adjusted_score", 0.0) or 0.0),
+            int(row.get("rank", row.get("handcrafted_rank", 999999)) or 999999),
+        )
+    )
+    selected = dict(primary_rows[0])
+    selected.pop("_visual_primary_bar", None)
+    selected.pop("_visual_primary_micro", None)
+    selected["selected_by"] = "visual_primary_phrase_prior"
+    selected["structure_role"] = "first_drop"
+    selected["section_label"] = "first_drop"
+    selected["reason"] = (
+        f"visual 32-bar phrase prior selected over early/off-phrase marker; "
+        f"{selected.get('reason') or 'candidate at primary phrase start'}"
+    )
+    return selected
 
 
 def _dedupe_candidate_dicts(candidates: List[Mapping[str, Any]], *, radius_sec: float = 0.010) -> List[Dict[str, Any]]:
@@ -705,7 +891,6 @@ def _boundary_variant_candidates(
 ) -> List[Dict[str, Any]]:
     variants: List[Dict[str, Any]] = []
     fields = (
-        ("input_candidate_time", "clock_boundary", 0.72),
         ("attack_start_time", "attack_start", 0.82),
         ("peak_time", "rms_peak", 0.88),
         ("zero_crossing_time", "zero_crossing", 0.76),
@@ -719,7 +904,14 @@ def _boundary_variant_candidates(
         if marker is None or not isinstance(micro, Mapping):
             continue
         input_time = _float_or_none(micro.get("input_candidate_time")) or _float_or_none(candidate.get("coarse_timestamp")) or marker
-        for field, label, confidence_floor in fields:
+        input_boundary_time = _float_or_none(micro.get("input_candidate_time"))
+        input_boundary_quality = _float_or_none(micro.get("input_boundary_quality")) or 0.0
+        input_boundary_used = bool(float(micro.get("input_boundary_used") or 0.0) > 0.0)
+        if input_boundary_time is not None and (input_boundary_used or input_boundary_quality >= 0.72):
+            fields_to_emit = (("input_candidate_time", "input_boundary", 0.86),) + fields
+        else:
+            fields_to_emit = fields
+        for field, label, confidence_floor in fields_to_emit:
             value = _float_or_none(micro.get(field))
             if value is None or value <= 0.0:
                 continue
@@ -852,15 +1044,18 @@ def _track_zero_grid_variant_candidates(
         if not keep_source:
             continue
         sources_used += 1
-        start_index = int(math.floor((float(marker) - float(window_sec)) / step_sec))
-        end_index = int(math.ceil((float(marker) + float(window_sec)) / step_sec))
+        effective_window_sec = float(window_sec)
+        if structure_role or selected_by.startswith("structure_map"):
+            effective_window_sec = min(effective_window_sec, 0.120)
+        start_index = int(math.floor((float(marker) - effective_window_sec) / step_sec))
+        end_index = int(math.ceil((float(marker) + effective_window_sec) / step_sec))
         for grid_index in range(start_index, end_index + 1):
             if len(out) >= int(max_variants):
                 break
             grid_time = float(grid_index) * step_sec
             if grid_time < 0.0:
                 continue
-            if abs(grid_time - float(marker)) > float(window_sec):
+            if abs(grid_time - float(marker)) > effective_window_sec:
                 continue
             if any(abs(grid_time - existing) <= 0.010 for existing in seen):
                 continue
@@ -908,6 +1103,534 @@ def _merge_structure_candidates(structure: Mapping[str, Any], candidates: List[M
     merged.extend(_boundary_variant_candidates([candidate for candidate in merged if isinstance(candidate, Mapping)]))
     merged.extend(_track_zero_grid_variant_candidates(structure, [candidate for candidate in merged if isinstance(candidate, Mapping)]))
     return _dedupe_candidate_dicts(merged)
+
+
+def _structure_component(candidate: Mapping[str, Any], key: str) -> Optional[float]:
+    components = candidate.get("structure_components") if isinstance(candidate.get("structure_components"), Mapping) else {}
+    return _float_or_none(components.get(key))
+
+
+def _primary_structure_first_drop_override(
+    learned: Mapping[str, Any],
+    candidates: List[Mapping[str, Any]],
+    beatgrid: Mapping[str, Any],
+) -> Optional[Dict[str, Any]]:
+    selected = learned.get("candidate") if isinstance(learned.get("candidate"), Mapping) else None
+    if not isinstance(selected, Mapping):
+        return None
+    selected_time = _candidate_boundary_time(selected)
+    if selected_time is None:
+        return None
+
+    bpm_value = _float_or_none(beatgrid.get("bpm"))
+    clock_zero_sec = _float_or_none(beatgrid.get("bar_zero_sec")) or 0.0
+    selected_clock = _bpm_clock_for_time(selected_time, bpm_value, clock_zero_sec=clock_zero_sec)
+    selected_bar = int((selected_clock or {}).get("nearest_one_bar", 0) or 0)
+    selected_prob = _clip01(learned.get("selection_probability", learned.get("chooser_score", 0.0)))
+    if selected_bar > 17 or selected_prob >= 0.80:
+        return None
+    visual_primary = _primary_visual_phrase_candidate(candidates, selected, bpm=bpm_value, bar_zero_sec=clock_zero_sec)
+    if visual_primary is not None:
+        replacement = dict(learned)
+        replacement["candidate"] = visual_primary
+        replacement["selection_probability"] = max(selected_prob, 0.42)
+        replacement["chooser_score"] = max(_clip01(replacement.get("chooser_score")), 0.42)
+        replacement["selection_confidence"] = max(_clip01(replacement.get("selection_confidence")), 0.58)
+        replacement["probability_margin"] = max(0.0, float(replacement["selection_probability"]) - float(selected_prob))
+        replacement["prediction_margin_sec"] = float(replacement["probability_margin"])
+        replacement["post_structure_guard_reason"] = (
+            "post-structure guard used 32-bar visual phrase candidate over early phrase probe"
+        )
+        return replacement
+
+    selected_components = selected.get("structure_components") if isinstance(selected.get("structure_components"), Mapping) else {}
+    selected_sustain = float(selected_components.get("sustained_groove", 0.0) or 0.0)
+    selected_structure_score = _float_or_none(selected.get("score")) if selected_components else None
+    primary_rows: List[Dict[str, Any]] = []
+    for candidate in candidates:
+        if not isinstance(candidate, Mapping):
+            continue
+        if str(candidate.get("structure_role") or "") != "first_drop":
+            continue
+        marker = _candidate_boundary_time(candidate)
+        if marker is None or float(marker) <= float(selected_time) + (3.0 if selected_bar < 9 else 8.0):
+            continue
+        clock = _bpm_clock_for_time(marker, bpm_value, clock_zero_sec=clock_zero_sec)
+        clock_bar = int((clock or {}).get("nearest_one_bar", 0) or 0)
+        if selected_bar < 9:
+            if clock_bar < 9 or clock_bar > 49:
+                continue
+        elif clock_bar < 25 or clock_bar > 49 or (clock_bar - 1) % 32 != 0:
+            continue
+        phrase_prior = _structure_component(candidate, "phrase_prior") or 0.0
+        sustained = _structure_component(candidate, "sustained_groove") or 0.0
+        structure_score = _float_or_none(candidate.get("score")) or 0.0
+        if selected_bar < 9:
+            if phrase_prior < 0.45 or sustained < max(0.54, selected_sustain + 0.04):
+                continue
+        else:
+            if phrase_prior < 0.94 or sustained < max(0.48, selected_sustain + 0.06):
+                continue
+        if selected_structure_score is not None and structure_score < max(0.44, selected_structure_score - 0.16):
+            continue
+        if selected_structure_score is None and structure_score < 0.44:
+            continue
+        row = dict(candidate)
+        row["_primary_override_clock_bar"] = clock_bar
+        row["_primary_override_sustained"] = sustained
+        row["_primary_override_score"] = structure_score
+        primary_rows.append(row)
+    if not primary_rows:
+        return None
+
+    primary_rows.sort(
+        key=lambda row: (
+            -float(row.get("_primary_override_sustained", 0.0) or 0.0),
+            -float(row.get("_primary_override_score", 0.0) or 0.0),
+            int(row.get("_primary_override_clock_bar", 999999) or 999999),
+        )
+    )
+    selected_primary = dict(primary_rows[0])
+    selected_primary.pop("_primary_override_clock_bar", None)
+    selected_primary.pop("_primary_override_sustained", None)
+    selected_primary.pop("_primary_override_score", None)
+    replacement = dict(learned)
+    replacement["candidate"] = selected_primary
+    replacement["selection_probability"] = max(selected_prob, 0.36)
+    replacement["chooser_score"] = max(_clip01(replacement.get("chooser_score")), 0.36)
+    replacement["selection_confidence"] = max(_clip01(replacement.get("selection_confidence")), 0.54)
+    replacement["probability_margin"] = max(0.0, float(replacement["selection_probability"]) - float(selected_prob))
+    replacement["prediction_margin_sec"] = float(replacement["probability_margin"])
+    replacement["post_structure_guard_reason"] = (
+        "post-structure guard used stronger 32-bar visual first-drop over earlier 16-bar probe"
+    )
+    return replacement
+
+
+def _visual_first_drop_strength(candidate: Mapping[str, Any], bpm: Optional[float], clock_zero_sec: float) -> float:
+    marker = _candidate_boundary_time(candidate)
+    prior = _bar_prior_for_time(marker, bpm, bar_zero_sec=clock_zero_sec) if marker is not None else {}
+    components = candidate.get("structure_components") if isinstance(candidate.get("structure_components"), Mapping) else {}
+    block_height = _float_or_none(components.get("block_height")) or 0.0
+    sustain = _float_or_none(components.get("sustained_groove")) or 0.0
+    low_to_high = _float_or_none(components.get("low_to_high")) or 0.0
+    novelty = _float_or_none(components.get("timbre_novelty")) or _float_or_none(components.get("novelty")) or 0.0
+    phrase = _float_or_none(components.get("phrase_prior"))
+    if phrase is None:
+        phrase = _float_or_none((prior or {}).get("phrase_strength")) or 0.0
+    score = _float_or_none(candidate.get("score")) or _float_or_none(candidate.get("confidence_score")) or 0.0
+    micro = _candidate_nested_value(candidate, "micro_confidence") or 0.0
+    evidence = _candidate_evidence_score(candidate)
+    return (
+        (0.24 * _clip01(evidence))
+        + (0.18 * _clip01(score))
+        + (0.20 * _clip01(block_height))
+        + (0.14 * _clip01(sustain))
+        + (0.10 * _clip01(low_to_high))
+        + (0.07 * _clip01(novelty))
+        + (0.04 * _clip01(micro))
+        + (0.03 * _clip01(phrase))
+    )
+
+
+def _stronger_later_visual_block_override(
+    learned: Mapping[str, Any],
+    candidates: List[Mapping[str, Any]],
+    beatgrid: Mapping[str, Any],
+) -> Optional[Dict[str, Any]]:
+    selected = learned.get("candidate") if isinstance(learned.get("candidate"), Mapping) else None
+    if not isinstance(selected, Mapping):
+        return None
+    selected_time = _candidate_boundary_time(selected)
+    if selected_time is None:
+        return None
+    selected_by = str(selected.get("selected_by") or "")
+    selected_source = str(selected.get("source") or "")
+    if is_human_review_source(selected_by) or is_human_review_source(selected_source):
+        return None
+
+    bpm_value = _float_or_none(beatgrid.get("bpm"))
+    clock_zero_sec = _float_or_none(beatgrid.get("bar_zero_sec")) or 0.0
+    selected_prior = _bar_prior_for_time(selected_time, bpm_value, bar_zero_sec=clock_zero_sec) if selected_time is not None else {}
+    selected_bar = int((selected_prior or {}).get("nearest_musical_bar", 0) or 0)
+    selected_is_early = bool(float(selected_time) < 12.0 or (selected_bar > 0 and selected_bar <= 7))
+    if not selected_is_early:
+        return None
+
+    selected_score = max(
+        _candidate_nested_value(selected, "candidate_chooser_score") or 0.0,
+        _candidate_nested_value(selected, "confidence_score") or 0.0,
+        _candidate_nested_value(selected, "score") or 0.0,
+    )
+    selected_micro = _candidate_nested_value(selected, "micro_confidence") or 0.0
+    selected_strength = _visual_first_drop_strength(selected, bpm_value, clock_zero_sec)
+    selected_components = selected.get("structure_components") if isinstance(selected.get("structure_components"), Mapping) else {}
+    selected_height = _float_or_none(selected_components.get("block_height")) or 0.0
+    selected_sustain = _float_or_none(selected_components.get("sustained_groove")) or 0.0
+
+    min_gap = 3.5 if float(selected_time) < 8.0 else 5.5
+    rows: List[Dict[str, Any]] = []
+    for candidate in candidates:
+        if not isinstance(candidate, Mapping):
+            continue
+        marker = _candidate_boundary_time(candidate)
+        if marker is None:
+            continue
+        marker = float(marker)
+        if marker <= float(selected_time) + min_gap or marker < 12.0:
+            continue
+        prior = _candidate_phrase_prior(candidate, bpm_value, bar_zero_sec=clock_zero_sec)
+        bar = int((prior or {}).get("nearest_musical_bar", 0) or 0)
+        if bar > 0 and bar < 5:
+            continue
+        distance = _float_or_none((prior or {}).get("distance_beats"))
+        phrase_strength = _float_or_none((prior or {}).get("phrase_strength")) or 0.0
+        if (distance if distance is not None else 99.0) > 0.22 and phrase_strength < 0.55:
+            continue
+        components = candidate.get("structure_components") if isinstance(candidate.get("structure_components"), Mapping) else {}
+        score = max(
+            _candidate_nested_value(candidate, "candidate_chooser_score") or 0.0,
+            _candidate_nested_value(candidate, "confidence_score") or 0.0,
+            _candidate_nested_value(candidate, "score") or 0.0,
+        )
+        micro = _candidate_nested_value(candidate, "micro_confidence") or 0.0
+        height = _float_or_none(components.get("block_height")) or 0.0
+        sustain = _float_or_none(components.get("sustained_groove")) or 0.0
+        strength = _visual_first_drop_strength(candidate, bpm_value, clock_zero_sec)
+
+        score_lift = score >= selected_score + (0.045 if float(selected_time) < 8.0 else 0.085)
+        strength_lift = strength >= selected_strength + (0.030 if float(selected_time) < 8.0 else 0.050)
+        height_lift = height >= max(0.46, selected_height + 0.050)
+        sustain_lift = sustain >= max(0.44, selected_sustain + 0.040)
+        micro_lift = micro >= max(0.90, selected_micro + 0.035)
+        strong_saved_or_multistem = bool(
+            score >= 0.72
+            and micro >= 0.82
+            and any(token in str(candidate.get("reason") or "") for token in ("multistem_candidate", "saved"))
+        )
+        if not (
+            score_lift
+            or (strength_lift and (height_lift or sustain_lift or micro_lift))
+            or (strong_saved_or_multistem and (score >= selected_score - 0.035 or strength >= selected_strength + 0.020))
+        ):
+            continue
+        row = dict(candidate)
+        row["musical_bar_prior"] = dict(prior or {})
+        row["_later_visual_time"] = marker
+        row["_later_visual_score"] = float(score)
+        row["_later_visual_strength"] = float(strength)
+        row["_later_visual_micro"] = float(micro)
+        row["_later_visual_bar"] = int(bar)
+        rows.append(row)
+
+    if not rows:
+        return None
+
+    rows.sort(
+        key=lambda row: (
+            float(row.get("_later_visual_time", 999999.0) or 999999.0),
+            -float(row.get("_later_visual_score", 0.0) or 0.0),
+            -float(row.get("_later_visual_strength", 0.0) or 0.0),
+            -float(row.get("_later_visual_micro", 0.0) or 0.0),
+        )
+    )
+    replacement_candidate = dict(rows[0])
+    replacement_candidate.pop("_later_visual_time", None)
+    replacement_candidate.pop("_later_visual_score", None)
+    replacement_candidate.pop("_later_visual_strength", None)
+    replacement_candidate.pop("_later_visual_micro", None)
+    replacement_candidate.pop("_later_visual_bar", None)
+
+    selected_prob = _clip01(learned.get("selection_probability", learned.get("chooser_score", 0.0)))
+    replacement = dict(learned)
+    replacement["candidate"] = replacement_candidate
+    replacement["selection_probability"] = max(selected_prob, 0.50)
+    replacement["chooser_score"] = max(_clip01(replacement.get("chooser_score")), 0.50)
+    replacement["selection_confidence"] = max(_clip01(replacement.get("selection_confidence")), 0.62)
+    replacement["probability_margin"] = max(0.0, float(replacement["selection_probability"]) - float(selected_prob))
+    replacement["prediction_margin_sec"] = float(replacement["probability_margin"])
+    replacement["post_structure_guard_reason"] = (
+        "visual-first guard replaced an early smaller block with a stronger later visual block"
+    )
+    return replacement
+
+
+def _late_learned_first_drop_override(
+    learned: Mapping[str, Any],
+    candidates: List[Mapping[str, Any]],
+    beatgrid: Mapping[str, Any],
+) -> Optional[Dict[str, Any]]:
+    selected = learned.get("candidate") if isinstance(learned.get("candidate"), Mapping) else None
+    if not isinstance(selected, Mapping):
+        return None
+    selected_time = _candidate_boundary_time(selected)
+    if selected_time is None:
+        return None
+
+    bpm_value = _float_or_none(beatgrid.get("bpm"))
+    clock_zero_sec = _float_or_none(beatgrid.get("bar_zero_sec")) or 0.0
+    selected_prob = _clip01(learned.get("selection_probability", learned.get("chooser_score", 0.0)))
+    selected_strength = _visual_first_drop_strength(selected, bpm_value, clock_zero_sec)
+    rows: List[Dict[str, Any]] = []
+    for candidate in candidates:
+        if not isinstance(candidate, Mapping):
+            continue
+        if str(candidate.get("structure_role") or "") != "first_drop":
+            continue
+        marker = _candidate_boundary_time(candidate)
+        if marker is None:
+            continue
+        gap = float(selected_time) - float(marker)
+        if gap < 8.0 or float(marker) < 4.0:
+            continue
+        strength = _visual_first_drop_strength(candidate, bpm_value, clock_zero_sec)
+        score = _float_or_none(candidate.get("score")) or _float_or_none(candidate.get("confidence_score")) or 0.0
+        components = candidate.get("structure_components") if isinstance(candidate.get("structure_components"), Mapping) else {}
+        sustain = _float_or_none(components.get("sustained_groove")) or 0.0
+        phrase = _float_or_none(components.get("phrase_prior")) or 0.0
+        if strength < 0.34 and score < 0.44:
+            continue
+        if sustain < 0.42 and phrase < 0.55 and strength < 0.42:
+            continue
+        if selected_prob >= 0.80 and selected_strength > strength + 0.18 and gap < 48.0:
+            continue
+        row = dict(candidate)
+        row["_late_override_gap"] = float(gap)
+        row["_late_override_strength"] = float(strength)
+        row["_late_override_score"] = float(score)
+        rows.append(row)
+    if not rows:
+        return None
+
+    rows.sort(
+        key=lambda row: (
+            -float(row.get("_late_override_strength", 0.0) or 0.0),
+            -float(row.get("_late_override_score", 0.0) or 0.0),
+            float(_candidate_boundary_time(row) or 999999.0),
+        )
+    )
+    first_drop = dict(rows[0])
+    first_drop.pop("_late_override_gap", None)
+    first_drop.pop("_late_override_strength", None)
+    first_drop.pop("_late_override_score", None)
+    replacement = dict(learned)
+    replacement["candidate"] = first_drop
+    replacement["selection_probability"] = max(selected_prob, 0.46)
+    replacement["chooser_score"] = max(_clip01(replacement.get("chooser_score")), 0.46)
+    replacement["selection_confidence"] = max(_clip01(replacement.get("selection_confidence")), 0.60)
+    replacement["probability_margin"] = max(0.0, float(replacement["selection_probability"]) - float(selected_prob))
+    replacement["prediction_margin_sec"] = float(replacement["probability_margin"])
+    replacement["post_structure_guard_reason"] = (
+        "visual-first guard restored the earlier structure first_drop over a later learned pick"
+    )
+    return replacement
+
+
+def _far_later_nonvisual_first_drop_override(
+    learned: Mapping[str, Any],
+    candidates: List[Mapping[str, Any]],
+    beatgrid: Mapping[str, Any],
+) -> Optional[Dict[str, Any]]:
+    selected = learned.get("candidate") if isinstance(learned.get("candidate"), Mapping) else None
+    if not isinstance(selected, Mapping):
+        return None
+    selected_time = _candidate_boundary_time(selected)
+    if selected_time is None:
+        return None
+    selected_role = str(selected.get("structure_role") or "")
+    selected_by = str(selected.get("selected_by") or "")
+    selected_source = str(selected.get("source") or "")
+    selected_reason = str(selected.get("reason") or "")
+    if selected_role == "first_drop" or selected_by.startswith("structure_map_first_drop"):
+        return None
+    if is_human_review_source(selected_by) or is_human_review_source(selected_source):
+        return None
+
+    bpm_value = _float_or_none(beatgrid.get("bpm"))
+    bar_duration_sec = (240.0 / float(bpm_value)) if bpm_value and float(bpm_value) > 0.0 else None
+    min_gap = max(20.0, 8.0 * float(bar_duration_sec or 0.0))
+
+    first_rows: List[Dict[str, Any]] = []
+    for candidate in candidates:
+        if not isinstance(candidate, Mapping):
+            continue
+        role = str(candidate.get("structure_role") or "")
+        section = str(candidate.get("section_label") or "")
+        if role != "first_drop" and section != "first_drop":
+            continue
+        marker = _candidate_boundary_time(candidate)
+        if marker is None or float(marker) < 1.0:
+            continue
+        if float(selected_time) - float(marker) < min_gap:
+            continue
+        score = _float_or_none(candidate.get("score")) or _float_or_none(candidate.get("confidence_score")) or 0.0
+        components = candidate.get("structure_components") if isinstance(candidate.get("structure_components"), Mapping) else {}
+        sustain = _float_or_none(components.get("sustained_groove")) or 0.0
+        block_height = _float_or_none(components.get("block_height")) or 0.0
+        phrase = _float_or_none(components.get("phrase_prior")) or 0.0
+        if score < 0.50 and sustain < 0.48 and block_height < 0.42 and phrase < 0.75:
+            continue
+        first_rows.append(dict(candidate))
+    if not first_rows:
+        return None
+
+    first_time = min(float(_candidate_boundary_time(row) or selected_time) for row in first_rows)
+    cluster: List[Dict[str, Any]] = []
+    for candidate in candidates:
+        if not isinstance(candidate, Mapping):
+            continue
+        marker = _candidate_boundary_time(candidate)
+        if marker is None or abs(float(marker) - first_time) > 0.25:
+            continue
+        cluster.append(dict(candidate))
+    if not cluster:
+        cluster = [dict(row) for row in first_rows if abs(float(_candidate_boundary_time(row) or first_time) - first_time) <= 0.25]
+
+    def cluster_score(candidate: Mapping[str, Any]) -> tuple[float, float, float]:
+        marker = float(_candidate_boundary_time(candidate) or first_time)
+        score = max(
+            _candidate_nested_value(candidate, "candidate_chooser_score") or 0.0,
+            _candidate_nested_value(candidate, "confidence_score") or 0.0,
+            _candidate_nested_value(candidate, "score") or 0.0,
+        )
+        evidence = _candidate_evidence_score(candidate)
+        role_bonus = 0.08 if str(candidate.get("structure_role") or "") == "first_drop" else 0.0
+        saved_bonus = 0.04 if "saved_visual_batch_auto_marker" in str(candidate.get("selected_by") or "") else 0.0
+        return (
+            float(score) + (0.35 * float(evidence)) + role_bonus + saved_bonus,
+            -abs(marker - first_time),
+            -float(_float_or_none(candidate.get("rank")) or _float_or_none(candidate.get("handcrafted_rank")) or 9999.0),
+        )
+
+    restored = dict(max(cluster, key=cluster_score))
+    replacement = dict(learned)
+    replacement["candidate"] = restored
+    selected_prob = _clip01(learned.get("selection_probability", learned.get("chooser_score", 0.0)))
+    replacement["selection_probability"] = max(selected_prob, 0.48)
+    replacement["chooser_score"] = max(_clip01(replacement.get("chooser_score")), 0.48)
+    replacement["selection_confidence"] = max(_clip01(replacement.get("selection_confidence")), 0.62)
+    replacement["probability_margin"] = max(0.0, float(replacement["selection_probability"]) - float(selected_prob))
+    replacement["prediction_margin_sec"] = float(replacement["probability_margin"])
+    replacement["post_structure_guard_reason"] = (
+        "visual-first guard restored the first-drop cluster over a far-later non-visual pick"
+        f" ({selected_by or selected_source or selected_reason or 'learned candidate'})"
+    )
+    return replacement
+
+
+def _clean_visual_one_candidate_override(
+    learned: Mapping[str, Any],
+    candidates: List[Mapping[str, Any]],
+    beatgrid: Mapping[str, Any],
+) -> Optional[Dict[str, Any]]:
+    selected = learned.get("candidate") if isinstance(learned.get("candidate"), Mapping) else None
+    if not isinstance(selected, Mapping):
+        return None
+    selected_time = _candidate_boundary_time(selected)
+    if selected_time is None:
+        return None
+    selected_by = str(selected.get("selected_by") or "")
+    selected_source = str(selected.get("source") or "")
+    selected_reason = str(selected.get("reason") or "")
+    selected_original_by = str(selected.get("post_structure_original_selected_by") or "")
+    if is_human_review_source(selected_by) or is_human_review_source(selected_source):
+        return None
+
+    bpm_value = _float_or_none(beatgrid.get("bpm"))
+    clock_zero_sec = _float_or_none(beatgrid.get("bar_zero_sec")) or 0.0
+    selected_prior = _bar_prior_for_time(selected_time, bpm_value, bar_zero_sec=clock_zero_sec) if selected_time is not None else {}
+    selected_distance = _float_or_none((selected_prior or {}).get("distance_beats"))
+    selected_phrase = str((selected_prior or {}).get("phrase") or "")
+    selected_phrase_strength = _float_or_none((selected_prior or {}).get("phrase_strength")) or 0.0
+    selected_bar = int((selected_prior or {}).get("nearest_musical_bar", 0) or 0)
+    selected_prob = _clip01(learned.get("selection_probability", learned.get("chooser_score", 0.0)))
+    selected_primary_phrase = bool(
+        selected_by == "visual_primary_phrase_prior"
+        or selected_original_by == "visual_primary_phrase_prior"
+        or "visual 32-bar phrase prior" in selected_reason
+        or (selected_bar >= 25 and selected_phrase_strength >= 0.94 and selected_prob < 0.75)
+    )
+    selected_off_or_weak = bool(
+        selected_distance is None
+        or float(selected_distance) > 0.25
+        or selected_phrase in {"off-one", "off-phrase"}
+        or selected_phrase_strength < 0.45
+    )
+    if not selected_primary_phrase and not selected_off_or_weak and selected_prob >= 0.35:
+        return None
+
+    bar_duration_sec = (240.0 / float(bpm_value)) if bpm_value and float(bpm_value) > 0.0 else 0.0
+    nearby_window = max(4.50, 1.35 * float(bar_duration_sec or 0.0))
+    primary_min_gap = max(8.0, 1.75 * float(bar_duration_sec or 0.0))
+    rows: List[Dict[str, Any]] = []
+    for candidate in candidates:
+        if not isinstance(candidate, Mapping):
+            continue
+        marker = _candidate_boundary_time(candidate)
+        if marker is None or abs(float(marker) - float(selected_time)) <= 0.010:
+            continue
+        delta = float(marker) - float(selected_time)
+        if selected_primary_phrase:
+            if delta >= -0.25 or abs(delta) < primary_min_gap:
+                continue
+        elif abs(delta) > nearby_window:
+            continue
+        prior = _candidate_phrase_prior(candidate, bpm_value, bar_zero_sec=clock_zero_sec)
+        if not prior:
+            continue
+        bar = int(prior.get("nearest_musical_bar", prior.get("nearest_even_bar", 0)) or 0)
+        if bar < 9 or bar > (21 if selected_primary_phrase else 25):
+            continue
+        distance = _float_or_none(prior.get("distance_beats"))
+        phrase_strength = _float_or_none(prior.get("phrase_strength")) or 0.0
+        if (distance if distance is not None else 99.0) > 0.10 or phrase_strength < 0.75:
+            continue
+        score = max(
+            _candidate_nested_value(candidate, "candidate_chooser_score") or 0.0,
+            _candidate_nested_value(candidate, "confidence_score") or 0.0,
+            _candidate_nested_value(candidate, "score") or 0.0,
+        )
+        micro = candidate.get("microalign") if isinstance(candidate.get("microalign"), Mapping) else {}
+        micro_conf = _float_or_none(micro.get("micro_confidence")) or _float_or_none(candidate.get("micro_confidence")) or 0.0
+        snap_ms = abs(_float_or_none(micro.get("snap_offset_ms")) or _float_or_none(candidate.get("snap_offset_ms")) or 0.0)
+        if score < 0.68 and micro_conf < 0.88:
+            continue
+        if snap_ms > 140.0 and micro_conf < 0.92:
+            continue
+        row = dict(candidate)
+        row["musical_bar_prior"] = dict(prior)
+        row["_clean_visual_score"] = float(score)
+        row["_clean_visual_micro"] = float(micro_conf)
+        row["_clean_visual_bar"] = int(bar)
+        rows.append(row)
+    if not rows:
+        return None
+
+    rows.sort(
+        key=lambda row: (
+            -float(row.get("_clean_visual_score", 0.0) or 0.0),
+            -float(row.get("_clean_visual_micro", 0.0) or 0.0),
+            -float((row.get("musical_bar_prior") or {}).get("phrase_strength", 0.0) or 0.0),
+            int(row.get("_clean_visual_bar", 999999) or 999999),
+            int(row.get("rank", row.get("handcrafted_rank", 999999)) or 999999),
+        )
+    )
+    restored = dict(rows[0])
+    restored.pop("_clean_visual_score", None)
+    restored.pop("_clean_visual_micro", None)
+    restored.pop("_clean_visual_bar", None)
+    replacement = dict(learned)
+    replacement["candidate"] = restored
+    replacement["selection_probability"] = max(selected_prob, 0.52)
+    replacement["chooser_score"] = max(_clip01(replacement.get("chooser_score")), 0.52)
+    replacement["selection_confidence"] = max(_clip01(replacement.get("selection_confidence")), 0.64)
+    replacement["probability_margin"] = max(0.0, float(replacement["selection_probability"]) - float(selected_prob))
+    replacement["prediction_margin_sec"] = float(replacement["probability_margin"])
+    replacement["post_structure_guard_reason"] = (
+        "visual-first guard restored a clean on-ONE visual candidate over "
+        f"{'a later primary phrase' if selected_primary_phrase else 'an off-phrase/tail pick'}"
+    )
+    return replacement
 
 
 def _apply_post_structure_selection_guard(
@@ -959,6 +1682,21 @@ def _apply_post_structure_selection_guard(
     )
     selected_deferred_probe = bool(selected_time is not None and float(selected_time) < 16.0 and selected_prob < 0.16)
     bar_duration_sec = (240.0 / float(bpm_value)) if bpm_value and float(bpm_value) > 0.0 else None
+    stronger_later_visual_override = _stronger_later_visual_block_override(learned, candidates, beatgrid)
+    if stronger_later_visual_override is not None:
+        return stronger_later_visual_override
+    clean_visual_one_override = _clean_visual_one_candidate_override(learned, candidates, beatgrid)
+    if clean_visual_one_override is not None:
+        return clean_visual_one_override
+    primary_override = _primary_structure_first_drop_override(learned, candidates, beatgrid)
+    if primary_override is not None:
+        return primary_override
+    late_first_drop_override = _late_learned_first_drop_override(learned, candidates, beatgrid)
+    if late_first_drop_override is not None:
+        return late_first_drop_override
+    far_later_first_drop_override = _far_later_nonvisual_first_drop_override(learned, candidates, beatgrid)
+    if far_later_first_drop_override is not None:
+        return far_later_first_drop_override
     selected_suspicious = bool(
         selected_prob < 0.12
         or (
@@ -1687,6 +2425,9 @@ def _apply_post_structure_selection_guard(
         f"post-structure guard replaced weak/off-one candidate "
         f"(P {selected_prob:.3f})"
     )
+    far_later_first_drop_override = _far_later_nonvisual_first_drop_override(replacement, candidates, beatgrid)
+    if far_later_first_drop_override is not None:
+        return far_later_first_drop_override
     return replacement
 
 
@@ -1776,6 +2517,78 @@ def _post_structure_chooser_suggestion(
     }
 
 
+def _apply_final_visual_block_guard(
+    bar_prior_result: Mapping[str, Any],
+    beatgrid: Mapping[str, Any],
+    *,
+    confidence_tier: str,
+) -> Dict[str, Any]:
+    suggestion = dict(bar_prior_result.get("suggestion") if isinstance(bar_prior_result.get("suggestion"), Mapping) else {})
+    selected = suggestion.get("candidate") if isinstance(suggestion.get("candidate"), Mapping) else None
+    if not isinstance(selected, Mapping):
+        return dict(bar_prior_result)
+    candidates = [dict(candidate) for candidate in bar_prior_result.get("candidates", []) or [] if isinstance(candidate, Mapping)]
+    if not candidates:
+        return dict(bar_prior_result)
+    learned = {
+        "candidate": dict(selected),
+        "selection_probability": _float_or_none(suggestion.get("score"))
+        or _candidate_nested_value(selected, "candidate_chooser_probability")
+        or _candidate_nested_value(selected, "candidate_chooser_score")
+        or _candidate_nested_value(selected, "score")
+        or 0.0,
+        "chooser_score": _float_or_none(suggestion.get("score"))
+        or _candidate_nested_value(selected, "candidate_chooser_score")
+        or _candidate_nested_value(selected, "score")
+        or 0.0,
+        "selection_confidence": _candidate_nested_value(selected, "candidate_chooser_confidence") or 0.0,
+    }
+    override = _stronger_later_visual_block_override(learned, candidates, beatgrid)
+    if override is None:
+        return dict(bar_prior_result)
+    replacement = dict(override.get("candidate") if isinstance(override.get("candidate"), Mapping) else {})
+    marker = _candidate_boundary_time(replacement)
+    if marker is None:
+        return dict(bar_prior_result)
+
+    original_selected_by = str(replacement.get("selected_by") or "")
+    replacement["post_structure_original_selected_by"] = original_selected_by
+    replacement["selected_by"] = "post_structure_candidate_chooser"
+    replacement["timestamp"] = float(marker)
+    replacement["snapped_sec"] = float(marker)
+    replacement["microaligned_time"] = float(marker)
+    bpm_value = _float_or_none(beatgrid.get("bpm"))
+    clock_zero_sec = _float_or_none(beatgrid.get("bar_zero_sec")) or 0.0
+    clock = _bpm_clock_for_time(marker, bpm_value, clock_zero_sec=clock_zero_sec)
+    grid = feature_grid_for_time(marker, bpm_value, bar_zero_sec=beatgrid.get("bar_zero_sec"))
+    if clock:
+        replacement["bpm_clock"] = clock
+    if grid:
+        replacement["feature_grid_prior"] = grid
+
+    next_suggestion = dict(suggestion)
+    next_suggestion["candidate"] = replacement
+    next_suggestion["suggested_time"] = float(marker)
+    next_suggestion["score"] = max(
+        _clip01(next_suggestion.get("score")),
+        _clip01(override.get("selection_probability", override.get("chooser_score", 0.0))),
+    )
+    reason = str(next_suggestion.get("reason") or "")
+    guard_reason = str(override.get("post_structure_guard_reason") or "visual-first guard replaced early smaller block")
+    next_suggestion["reason"] = f"{reason}; {guard_reason}" if reason else guard_reason
+    next_suggestion["auto_accept"] = _review_required_auto_accept(
+        "post-structure chooser requires review",
+        replacement,
+        candidates,
+        _normalize_tier(confidence_tier),
+    )
+
+    out = dict(bar_prior_result)
+    out["suggestion"] = next_suggestion
+    out["candidates"] = _dedupe_candidate_dicts([replacement] + candidates)
+    return out
+
+
 def _apply_structure_map_prior(
     audio_path: str,
     candidates: List[Mapping[str, Any]],
@@ -1827,6 +2640,9 @@ def _apply_structure_map_prior(
         confidence_tier=confidence_tier,
     )
     if post_structure is not None:
+        post_candidate = post_structure.get("candidate") if isinstance(post_structure.get("candidate"), Mapping) else None
+        if post_candidate:
+            merged_candidates = _dedupe_candidate_dicts([dict(post_candidate)] + merged_candidates)
         return {
             "candidates": merged_candidates,
             "suggestion": post_structure,
@@ -2000,6 +2816,8 @@ def _load_review_memory(path: str) -> Dict[str, Dict[str, Any]]:
         user_pick = _float_or_none(row.get("user_pick"))
         if not track or user_pick is None:
             continue
+        if not is_human_review_source(row.get("reviewed_from")):
+            continue
         entry = dict(row)
         entry["user_pick"] = float(user_pick)
         entry["source"] = "historical_review_memory"
@@ -2082,6 +2900,7 @@ class ReviewApp:
         review_low_only: bool,
         review_medium_and_low: bool,
         regenerate_als_on_correction: bool,
+        visual_first: bool = False,
         review_queue: str = "",
     ) -> None:
         self.root = Path(__file__).resolve().parent
@@ -2095,6 +2914,7 @@ class ReviewApp:
         self.review_low_only = bool(review_low_only)
         self.review_medium_and_low = bool(review_medium_and_low)
         self.regenerate_als_on_correction = bool(regenerate_als_on_correction)
+        self.visual_first = bool(visual_first)
         self.review_queue = Path(review_queue).expanduser().resolve() if review_queue else None
         self.queue_order = self._load_queue_order(self.review_queue) if self.review_queue else {}
         self.state_path = self.summary_csv.parent / "review_state.json"
@@ -2159,7 +2979,11 @@ class ReviewApp:
                     continue
 
                 candidates = payload.get("top_10_candidates") if isinstance(payload.get("top_10_candidates"), list) else []
+                if self.visual_first:
+                    candidates = _without_historical_candidates(candidates)
                 selected_candidate = payload.get("selected_candidate") if isinstance(payload.get("selected_candidate"), Mapping) else {}
+                if self.visual_first and _is_historical_candidate(selected_candidate):
+                    selected_candidate = {}
                 drumprint_pattern_score = _candidate_metric(selected_candidate, feature_summary, "drumprint_pattern_score")
                 fake_hit_penalty = _candidate_metric(selected_candidate, feature_summary, "fake_hit_penalty")
                 post_stability = _candidate_metric(selected_candidate, feature_summary, "post_drop_pattern_stability")
@@ -2207,12 +3031,184 @@ class ReviewApp:
                     "row_status": row.get("status", ""),
                     "review": {},
                 }
+                if self.visual_first:
+                    self._prime_item_with_visual_candidate(item, scan=False)
+                else:
+                    self._prime_item_with_historical_marker(item)
                 out.append(item)
         if self.queue_order:
             out.sort(key=lambda item: (self.queue_order.get(item["filename"], 999999), item["track_name"].lower()))
         else:
             out.sort(key=lambda item: (TIER_ORDER.get(item["confidence_tier"], 3), item["track_name"].lower()))
         return out
+
+    def _prime_item_with_historical_marker(self, item: Dict[str, Any]) -> None:
+        result: Dict[str, Any] = {}
+        memory = self._review_memory_for_item(item)
+        if memory:
+            result = self._historical_review_auto_place(item, memory)
+        if not result:
+            historical = self.historical_markers.find(str(item.get("audio_path", "")), bpm=item.get("bpm"))
+            if historical:
+                result = self._historical_auto_place(
+                    item,
+                    historical,
+                    list(item.get("top_10_candidates") or []),
+                    confidence_tier=str(item.get("confidence_tier", "UNKNOWN")),
+                )
+        if not result:
+            visual_primary = _primary_visual_phrase_candidate(
+                list(item.get("top_10_candidates") or []),
+                item.get("selected_candidate") if isinstance(item.get("selected_candidate"), Mapping) else None,
+                bpm=_float_or_none(item.get("bpm")),
+            )
+            if visual_primary:
+                candidates = _dedupe_candidate_dicts([visual_primary] + [dict(row) for row in item.get("top_10_candidates") or []])
+                suggestion = {
+                    "candidate": dict(candidates[0]),
+                    "suggested_time": _candidate_marker_time(candidates[0]),
+                    "auto_accept": _review_required_auto_accept(
+                        "visual 32-bar phrase prior requires review",
+                        candidates[0],
+                        candidates,
+                        str(item.get("confidence_tier", "UNKNOWN")),
+                    ),
+                }
+                result = {
+                    "source": "visual_primary_phrase_prior",
+                    "candidates": candidates,
+                    "suggestion": suggestion,
+                }
+        if not result:
+            return
+
+        candidates = result.get("candidates") if isinstance(result.get("candidates"), list) else []
+        suggestion = result.get("suggestion") if isinstance(result.get("suggestion"), Mapping) else {}
+        selected = suggestion.get("candidate") if isinstance(suggestion.get("candidate"), Mapping) else None
+        if candidates:
+            item["top_10_candidates"] = [dict(candidate) for candidate in candidates[:10] if isinstance(candidate, Mapping)]
+            selected_time = _candidate_marker_time(selected) if isinstance(selected, Mapping) else None
+            if selected_time is not None:
+                for candidate in item["top_10_candidates"]:
+                    candidate_time = _candidate_marker_time(candidate)
+                    if candidate_time is not None and abs(float(candidate_time) - float(selected_time)) <= 0.010:
+                        selected = dict(candidate)
+                        break
+        if selected:
+            item["selected_candidate"] = dict(selected)
+            item["selected_by"] = str(selected.get("selected_by") or result.get("source") or item.get("selected_by") or "")
+        elif result.get("source"):
+            item["selected_by"] = str(result.get("source"))
+        if isinstance(suggestion.get("auto_accept"), Mapping):
+            item["auto_accept"] = dict(suggestion.get("auto_accept") or {})
+        item["initial_candidate_source"] = str(result.get("source") or "")
+        suggested_time = _float_or_none(suggestion.get("suggested_time"))
+        if suggested_time is not None:
+            item["initial_candidate_time"] = float(suggested_time)
+
+    def _apply_visual_first_result(self, item: Dict[str, Any], visual: Mapping[str, Any]) -> bool:
+        if not visual.get("ok"):
+            return False
+        selected = visual.get("selected_candidate") if isinstance(visual.get("selected_candidate"), Mapping) else {}
+        marker = _float_or_none(visual.get("marker")) or _candidate_marker_time(selected)
+        if marker is None:
+            return False
+        visual_candidates = [dict(row) for row in visual.get("candidates") or [] if isinstance(row, Mapping)]
+        candidates = _dedupe_candidate_dicts(
+            [dict(selected)] + visual_candidates + _without_historical_candidates(item.get("top_10_candidates") or [])
+        )
+        if not candidates:
+            return False
+        item["top_10_candidates"] = candidates[:10]
+        item["selected_candidate"] = dict(candidates[0])
+        item["selected_by"] = str(candidates[0].get("selected_by") or "visual_gui_first_fat_block")
+        item["ai_pick"] = float(marker)
+        item["ai_pick_label"] = _format_time(float(marker))
+        item["initial_candidate_time"] = float(marker)
+        item["initial_candidate_source"] = item["selected_by"]
+        item["visual_first_scan"] = {
+            "version": visual.get("version"),
+            "raw_visual_time": visual.get("raw_visual_time"),
+            "marker": float(marker),
+            "source": item["selected_by"],
+        }
+        item["auto_accept"] = _review_required_auto_accept(
+            "visual-first waveform marker requires review",
+            candidates[0],
+            candidates,
+            str(item.get("confidence_tier", "UNKNOWN")),
+        )
+        return True
+
+    def _apply_review_memory_result(self, item: Dict[str, Any], result: Mapping[str, Any]) -> bool:
+        suggestion = result.get("suggestion") if isinstance(result.get("suggestion"), Mapping) else {}
+        selected = suggestion.get("candidate") if isinstance(suggestion.get("candidate"), Mapping) else {}
+        marker = _float_or_none(suggestion.get("suggested_time")) or _candidate_marker_time(selected)
+        if marker is None:
+            return False
+        candidates = [dict(row) for row in result.get("candidates") or [] if isinstance(row, Mapping)]
+        if not candidates:
+            candidates = [dict(selected)]
+        item["top_10_candidates"] = _dedupe_candidate_dicts(candidates)[:10]
+        item["selected_candidate"] = dict(selected)
+        item["selected_by"] = "historical_review_memory"
+        item["ai_pick"] = float(marker)
+        item["ai_pick_label"] = _format_time(float(marker))
+        item["initial_candidate_time"] = float(marker)
+        item["initial_candidate_source"] = "historical_review_memory"
+        if isinstance(suggestion.get("auto_accept"), Mapping):
+            item["auto_accept"] = dict(suggestion.get("auto_accept") or {})
+        return True
+
+    def _prime_item_with_visual_candidate(self, item: Dict[str, Any], *, scan: bool = False) -> None:
+        item["top_10_candidates"] = _without_historical_candidates(item.get("top_10_candidates") or [])
+        selected = item.get("selected_candidate") if isinstance(item.get("selected_candidate"), Mapping) else {}
+        if _is_historical_candidate(selected):
+            item["selected_candidate"] = {}
+            item["selected_by"] = ""
+        if scan and not item.get("visual_first_scanned"):
+            item["visual_first_scanned"] = True
+            memory = self._review_memory_for_item(item)
+            if memory:
+                remembered = self._historical_review_auto_place(item, memory)
+                if remembered and self._apply_review_memory_result(item, remembered):
+                    return
+            audio_path = str(item.get("audio_path") or "")
+            if audio_path:
+                try:
+                    visual = visual_first_marker(audio_path, sample_rate=16000, use_cache=True)
+                except Exception as exc:
+                    item["visual_first_scan_error"] = str(exc) or exc.__class__.__name__
+                else:
+                    if self._apply_visual_first_result(item, visual):
+                        item.pop("visual_first_scan_error", None)
+                        return
+                    item["visual_first_scan_error"] = str(visual.get("error") or "visual_first_no_marker")
+        visual_primary = _primary_visual_phrase_candidate(
+            list(item.get("top_10_candidates") or []),
+            item.get("selected_candidate") if isinstance(item.get("selected_candidate"), Mapping) else None,
+            bpm=_float_or_none(item.get("bpm")),
+        )
+        if not visual_primary:
+            selected = item.get("selected_candidate") if isinstance(item.get("selected_candidate"), Mapping) else {}
+            selected_time = _candidate_marker_time(selected)
+            if selected_time is not None and not _is_historical_candidate(selected):
+                item["initial_candidate_time"] = float(selected_time)
+            return
+        candidates = _dedupe_candidate_dicts([visual_primary] + [dict(row) for row in item.get("top_10_candidates") or []])
+        item["top_10_candidates"] = candidates[:10]
+        item["selected_candidate"] = dict(candidates[0])
+        item["selected_by"] = str(candidates[0].get("selected_by") or "visual_primary_phrase_prior")
+        marker = _candidate_marker_time(candidates[0])
+        if marker is not None:
+            item["initial_candidate_time"] = float(marker)
+        item["auto_accept"] = _review_required_auto_accept(
+            "visual-first candidate requires review",
+            candidates[0],
+            candidates,
+            str(item.get("confidence_tier", "UNKNOWN")),
+        )
+        item["initial_candidate_source"] = str(item["selected_by"])
 
     def _load_state(self) -> Dict[str, Any]:
         if self.state_path.exists():
@@ -2281,6 +3277,8 @@ class ReviewApp:
     def _item_public(self, item: Optional[Mapping[str, Any]]) -> Optional[Dict[str, Any]]:
         if item is None:
             return None
+        if self.visual_first and isinstance(item, dict):
+            self._prime_item_with_visual_candidate(item, scan=True)
         preview = self._preview_info(item)
         out = dict(item)
         try:
@@ -2329,6 +3327,7 @@ class ReviewApp:
                 "auto_retrain_every": self.auto_retrain_every,
                 "new_reviews_since_retrain": int(self.state.get("new_reviews_since_retrain", 0)),
                 "regenerate_als_on_correction": self.regenerate_als_on_correction,
+                "visual_first": self.visual_first,
                 "current": self._item_public(current),
             }
 
@@ -2711,6 +3710,17 @@ class ReviewApp:
                 "score": 1.0,
             }
         )
+        micro = dict(candidate.get("microalign") if isinstance(candidate.get("microalign"), Mapping) else {})
+        micro.update(
+            {
+                "microaligned_time": float(user_pick),
+                "input_candidate_time": float(user_pick),
+                "snap_offset_ms": 0.0,
+                "reason": "historical approved/corrected marker from correction log",
+                "review_needed": False,
+            }
+        )
+        candidate["microalign"] = micro
         clock = _bpm_clock_for_time(user_pick, bpm)
         if clock:
             candidate["bpm_clock"] = clock
@@ -2989,7 +3999,53 @@ class ReviewApp:
                 return {"ok": False, "error": "unknown item"}
             item_snapshot = dict(item)
 
-        history_enabled = str(mode or "").strip().lower() not in {"raw", "detector", "no_history", "no-historical"}
+        mode_text = str(mode or "").strip().lower().replace("-", "_")
+        visual_only = mode_text in {"visual_only", "gui_visual", "visual_gui", "visual_first_only"}
+        if visual_only:
+            audio_path = str(item_snapshot.get("audio_path", ""))
+            try:
+                visual = visual_first_marker(audio_path, sample_rate=16000, use_cache=True)
+            except Exception as exc:
+                return {"ok": False, "error": str(exc) or exc.__class__.__name__, "source": "visual_gui_only"}
+            if not visual.get("ok"):
+                return {"ok": False, "error": visual.get("error") or "visual_only_failed", "source": "visual_gui_only"}
+            selected = dict(visual.get("selected_candidate") if isinstance(visual.get("selected_candidate"), Mapping) else {})
+            marker = _float_or_none(visual.get("marker")) or _candidate_marker_time(selected)
+            micro = selected.get("microalign") if isinstance(selected.get("microalign"), Mapping) else {}
+            candidates = [dict(row) for row in visual.get("candidates") or [] if isinstance(row, Mapping)]
+            gates = _review_required_auto_accept(
+                "visual-only marker requires review",
+                selected,
+                candidates,
+                _normalize_tier(str(item_snapshot.get("confidence_tier", "UNKNOWN"))),
+            )
+            return {
+                "ok": True,
+                "source": "visual_gui_only",
+                "source_info": {
+                    "visual_first": {
+                        "version": visual.get("version"),
+                        "raw_visual_time": visual.get("raw_visual_time"),
+                        "feature_map": visual.get("feature_map") or {},
+                    }
+                },
+                "candidates": candidates,
+                "suggestion": {
+                    "auto_place": False,
+                    "review_needed": True,
+                    "risk": True,
+                    "mode": "visual_only",
+                    "confidence_tier": _normalize_tier(str(item_snapshot.get("confidence_tier", "UNKNOWN"))),
+                    "candidate": selected,
+                    "microalign": dict(micro) if isinstance(micro, Mapping) else None,
+                    "suggested_time": None if marker is None else float(marker),
+                    "score": float(selected.get("score", 0.0) or 0.0),
+                    "reason": selected.get("reason") or "visual-only selected first fat waveform block",
+                    "auto_accept": gates,
+                },
+            }
+
+        history_enabled = mode_text not in {"raw", "detector", "no_history", "no_historical"}
         if history_enabled:
             memory = self._review_memory_for_item(item_snapshot)
             if memory:
@@ -3001,6 +4057,12 @@ class ReviewApp:
         source = "saved_candidates"
         source_info: Dict[str, Any] = {}
         base_candidates = item_snapshot.get("top_10_candidates") or []
+        if not history_enabled:
+            base_candidates = [
+                dict(candidate)
+                for candidate in base_candidates
+                if isinstance(candidate, Mapping) and not _is_historical_candidate(candidate)
+            ]
         effective_confidence_tier = str(item_snapshot.get("confidence_tier", "UNKNOWN"))
         if history_enabled:
             historical = self.historical_markers.find(audio_path, bpm=item_snapshot.get("bpm"))
@@ -3040,6 +4102,11 @@ class ReviewApp:
                     confidence_tier=effective_confidence_tier,
                     bar_zero_sec=_float_or_none(beatgrid.get("bar_zero_sec")),
                     allow_promotion=False,
+                )
+                bar_prior = _apply_final_visual_block_guard(
+                    bar_prior,
+                    beatgrid,
+                    confidence_tier=effective_confidence_tier,
                 )
                 return {
                     "ok": True,
@@ -3095,6 +4162,11 @@ class ReviewApp:
             confidence_tier=effective_confidence_tier,
             bar_zero_sec=_float_or_none(beatgrid.get("bar_zero_sec")),
             allow_promotion=False,
+        )
+        bar_prior = _apply_final_visual_block_guard(
+            bar_prior,
+            beatgrid,
+            confidence_tier=effective_confidence_tier,
         )
         source_info["bar_prior"] = bar_prior.get("bar_prior") or {}
         source_info["structure_map"] = {
@@ -3650,6 +4722,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--review-medium-and-low", action="store_true")
     parser.add_argument("--queue", default="", help="Optional active_learning_queue.csv; review only these tracks in queue order")
     parser.add_argument("--regenerate-als-on-correction", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--visual-first", action="store_true", help="Open each track on the full waveform so manual visual placement is the primary flow")
     parser.add_argument("--open-browser", action=argparse.BooleanOptionalAction, default=True)
     return parser
 
@@ -3682,6 +4755,7 @@ def main() -> int:
             review_low_only=bool(args.review_low_only),
             review_medium_and_low=bool(args.review_medium_and_low),
             regenerate_als_on_correction=bool(args.regenerate_als_on_correction),
+            visual_first=bool(args.visual_first),
             review_queue=str(args.queue or ""),
         )
     except (FileNotFoundError, ValueError) as exc:

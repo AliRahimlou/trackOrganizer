@@ -17,6 +17,7 @@ let refinedPick = null;
 let refinedInfo = null;
 let pendingAutoPlacePick = null;
 let pendingAutoPlaceCandidate = null;
+let blueAnchorCandidate = null;
 let waveDuration = 0;
 let viewportStart = 0;
 let viewportEnd = 1;
@@ -32,18 +33,23 @@ let pinchState = null;
 let gestureState = null;
 let waveDragState = null;
 let suppressWaveClick = false;
+let hoverPlaceTime = null;
 let detailPanelUserChanged = false;
 let syncingDetailPanel = false;
 const activePointers = new Map();
 const DESKTOP_WAVE_LANE_HEIGHT = 112;
 const MOBILE_WAVE_LANE_HEIGHT = 122;
+const VISUAL_FIRST_DESKTOP_WAVE_LANE_HEIGHT = 150;
+const VISUAL_FIRST_MOBILE_WAVE_LANE_HEIGHT = 138;
 const MIN_DESKTOP_WAVE_HEIGHT = 240;
 const MIN_MOBILE_WAVE_HEIGHT = 260;
+const VISUAL_FIRST_MIN_DESKTOP_WAVE_HEIGHT = 420;
+const VISUAL_FIRST_MIN_MOBILE_WAVE_HEIGHT = 300;
 const DEFAULT_WINDOW_BEFORE = 20;
 const DEFAULT_WINDOW_AFTER = 30;
 const MIN_VIEW_SAMPLES = 2;
-const WAVEFORM_DETAIL_MULTIPLIER = 8;
-const WAVEFORM_MAX_TILE_BINS = 48000;
+const WAVEFORM_DETAIL_MULTIPLIER = 2;
+const WAVEFORM_MAX_TILE_BINS = 8000;
 const HYPER_RMS_TARGET = 0.78;
 const HYPER_RMS_CEILING = 0.985;
 const HYPER_RMS_KNEE = 0.72;
@@ -57,7 +63,13 @@ const RMS_INSPECTION_MIN_SAMPLE_SPACING = 0.10;
 const RMS_INSPECTION_ZERO_CROSSING_SPACING = 0.65;
 const RMS_INSPECTION_PEAK_ALPHA = 0.30;
 const RMS_DROP_INSPECTION_RADIUS_SECONDS = 0.006;
-const TILE_REQUEST_DEBOUNCE_MS = 60;
+const VISUAL_CHUNK_MIN_ALPHA = 0.08;
+const VISUAL_CHUNK_MAX_ALPHA = 0.28;
+const VISUAL_CHUNK_MIN_WIDTH_PX = 3;
+const VISUAL_CHUNK_MAX_VIEW_SECONDS = 600;
+const VISUAL_CHUNK_CANDIDATE_MARKER_VIEW_SECONDS = 18;
+const VISUAL_DIRECT_PLACE_VIEW_SECONDS = 6;
+const TILE_REQUEST_DEBOUNCE_MS = 120;
 const RESIZE_TILE_DEBOUNCE_MS = 120;
 const WHEEL_ZOOM_SENSITIVITY = 0.009;
 const PINCH_ZOOM_ACCELERATION = 0.72;
@@ -68,6 +80,8 @@ const SEEK_PLAY_BEFORE_SECONDS = 5;
 const SEEK_PLAY_AFTER_SECONDS = 25;
 const CLICK_SEEK_AFTER_SECONDS = 30;
 const PLAYBACK_SEEK_DEBOUNCE_MS = 160;
+const BLUE_EXACT_MICRO_CONFIDENCE = 0.88;
+const BLUE_EXACT_MAX_SNAP_MS = 30;
 const STEM_STROKES = {
   drums: "#263746",
   instrumental: "#0f6fbf",
@@ -122,6 +136,14 @@ function usableWaveTiles() {
   return waveTiles.filter((tile) => tile && tile.ok !== false);
 }
 
+function visualFirstMode() {
+  return Boolean(appState?.visual_first);
+}
+
+function visualDirectPlaceReady() {
+  return Boolean(visualFirstMode() && currentItem && waveDuration && viewportDuration() <= VISUAL_DIRECT_PLACE_VIEW_SECONDS + 0.001);
+}
+
 function availableStemCount() {
   const loaded = usableWaveTiles().length;
   if (loaded) return loaded;
@@ -130,8 +152,20 @@ function availableStemCount() {
 }
 
 function waveCanvasHeight() {
-  const laneHeight = isMobileLayout() ? MOBILE_WAVE_LANE_HEIGHT : DESKTOP_WAVE_LANE_HEIGHT;
-  const minHeight = isMobileLayout() ? MIN_MOBILE_WAVE_HEIGHT : MIN_DESKTOP_WAVE_HEIGHT;
+  const laneHeight = visualFirstMode()
+    ? isMobileLayout()
+      ? VISUAL_FIRST_MOBILE_WAVE_LANE_HEIGHT
+      : VISUAL_FIRST_DESKTOP_WAVE_LANE_HEIGHT
+    : isMobileLayout()
+      ? MOBILE_WAVE_LANE_HEIGHT
+      : DESKTOP_WAVE_LANE_HEIGHT;
+  const minHeight = visualFirstMode()
+    ? isMobileLayout()
+      ? VISUAL_FIRST_MIN_MOBILE_WAVE_HEIGHT
+      : VISUAL_FIRST_MIN_DESKTOP_WAVE_HEIGHT
+    : isMobileLayout()
+      ? MIN_MOBILE_WAVE_HEIGHT
+      : MIN_DESKTOP_WAVE_HEIGHT;
   return Math.max(minHeight, availableStemCount() * laneHeight);
 }
 
@@ -173,12 +207,143 @@ function candidateTime(candidate) {
   return null;
 }
 
+function candidateMicroInfo(candidate) {
+  return candidate?.microalign && typeof candidate.microalign === "object" ? candidate.microalign : candidate || {};
+}
+
+function candidateMicroNumber(candidate, key) {
+  const micro = candidateMicroInfo(candidate);
+  const value = Number(micro?.[key] ?? candidate?.[key]);
+  return Number.isFinite(value) ? value : null;
+}
+
+function candidateFlag(candidate, key) {
+  const micro = candidateMicroInfo(candidate);
+  const value = micro?.[key] ?? candidate?.[key];
+  return value === true || value === 1 || value === "1" || String(value).toLowerCase() === "true";
+}
+
+function candidateStillCurrent(candidate, toleranceSeconds = 0.025) {
+  if (!candidate || !Array.isArray(currentItem?.top_10_candidates)) return false;
+  const rank = Number(candidate.rank);
+  if (!Number.isFinite(rank)) return false;
+  const time = candidateTime(candidate);
+  return currentItem.top_10_candidates.some((row) => {
+    if (Number(row?.rank) !== rank) return false;
+    const rowTime = candidateTime(row);
+    if (time === null || rowTime === null) return true;
+    return Math.abs(rowTime - time) <= toleranceSeconds;
+  });
+}
+
+function selectedVisualAnchorCandidate() {
+  if (!visualFirstMode() || !currentItem) return null;
+  const selected = currentItem.selected_candidate || closestCandidateNearTime(currentItem.ai_pick, 0.025);
+  const time = candidateTime(selected);
+  if (!selected || time === null) return null;
+  const selectedBy = String(selected.selected_by || "");
+  const reason = String(selected.reason || "").toLowerCase();
+  const aiPick = optionalMarkerTime(currentItem.ai_pick);
+  const isVisualFatBlock =
+    selectedBy === "visual_gui_first_fat_block" ||
+    selectedBy === "visual_structure_section_guard" ||
+    (selectedBy === "visual_gui_only" && reason.includes("first real fat waveform block"));
+  if (!isVisualFatBlock) return null;
+  if (aiPick !== null && Math.abs(time - aiPick) > 0.025) return null;
+  return selected;
+}
+
+function candidateSnapOffsetMs(candidate, exactTime) {
+  const explicit = candidateMicroNumber(candidate, "snap_offset_ms");
+  if (explicit !== null) return explicit;
+  const input = candidateMicroNumber(candidate, "input_candidate_time") || candidateMicroNumber(candidate, "coarse_timestamp");
+  if (input !== null && exactTime !== null) return (Number(exactTime) - input) * 1000;
+  return 0;
+}
+
+function blueExactCandidateTime(candidate, grid) {
+  const exact = candidateTime(candidate);
+  if (exact === null) return null;
+  if (!grid?.time) return exact;
+
+  const micro = candidateMicroInfo(candidate);
+  const reason = String(micro?.reason || candidate?.microalign_reason || candidate?.reason || "");
+  const microConfidence = candidateMicroNumber(candidate, "micro_confidence") || 0;
+  const attackCleanliness = candidateMicroNumber(candidate, "attack_cleanliness") || 0;
+  const zeroQuality = candidateMicroNumber(candidate, "zero_crossing_quality") || 0;
+  const snapMs = Math.abs(candidateSnapOffsetMs(candidate, exact));
+  const kneeTime = candidateMicroNumber(candidate, "visual_onset_knee_time");
+  const kneeUsed = Boolean(Number(micro?.visual_onset_knee_used ?? candidate?.visual_onset_knee_used ?? 0));
+  const exactIsKnee = kneeTime !== null && Math.abs(kneeTime - exact) <= 0.002;
+  const tailBypass =
+    /tail bypass|impact body|clock[_ -]?lock/i.test(reason) ||
+    Boolean(micro?.clock_locked) ||
+    (Number(micro?.impact_body_used || 0) > 0 && Math.abs(Number(micro?.impact_body_offset_ms || 0)) > 2);
+  const reliableKnee =
+    (kneeUsed || exactIsKnee) &&
+    microConfidence >= BLUE_EXACT_MICRO_CONFIDENCE &&
+    attackCleanliness >= 0.85 &&
+    zeroQuality >= 0.8 &&
+    snapMs <= BLUE_EXACT_MAX_SNAP_MS;
+  const cleanKnee =
+    /sample-level|centerline|knee|quiet pre-attack boundary/i.test(reason) &&
+    microConfidence >= BLUE_EXACT_MICRO_CONFIDENCE &&
+    attackCleanliness >= 0.9 &&
+    zeroQuality >= 0.85 &&
+    snapMs <= BLUE_EXACT_MAX_SNAP_MS;
+
+  if (tailBypass && !reliableKnee) return null;
+  if (cleanKnee || reliableKnee) return exact;
+  return null;
+}
+
 function barPriorForCandidate(candidate) {
   return candidate?.musical_bar_prior || candidate?.bar_prior || null;
 }
 
 function bpmClockForCandidate(candidate) {
   return candidate?.bpm_clock || candidate?.clock || null;
+}
+
+function bpmOneClockForTime(time) {
+  const bpm = Number(currentItem?.bpm || 0);
+  const anchor = optionalMarkerTime(time);
+  if (!Number.isFinite(bpm) || bpm <= 0 || anchor === null) return null;
+  const beatSeconds = 60 / bpm;
+  const barSeconds = beatSeconds * 4;
+  if (!Number.isFinite(beatSeconds) || beatSeconds <= 0 || !Number.isFinite(barSeconds) || barSeconds <= 0) return null;
+  const zero = barZeroSeconds();
+  const index = Math.max(0, Math.round((anchor - zero) / barSeconds));
+  const gridTime = zero + index * barSeconds;
+  const oneDistanceSec = Math.abs(anchor - gridTime);
+  return {
+    bpm,
+    beat_sec: beatSeconds,
+    bar_sec: barSeconds,
+    nearest_one_bar: index + 1,
+    nearest_one_time: gridTime,
+    one_distance_sec: oneDistanceSec,
+    one_distance_ms: oneDistanceSec * 1000,
+    one_distance_beats: oneDistanceSec / beatSeconds,
+    on_one_score: Math.max(0, 1 - (oneDistanceSec / beatSeconds / 0.5)),
+  };
+}
+
+function candidateBpmClock(candidate) {
+  return bpmClockForCandidate(candidate) || bpmOneClockForTime(candidateTime(candidate));
+}
+
+function isHistoricalCandidate(candidate) {
+  const selectedBy = String(candidate?.selected_by || "");
+  const source = String(candidate?.source || "");
+  const reason = String(candidate?.reason || "");
+  return (
+    selectedBy === "historical_human_marker" ||
+    selectedBy === "historical_review_memory" ||
+    source === "historical_human_marker" ||
+    source === "historical_review_memory" ||
+    reason.startsWith("historical ")
+  );
 }
 
 function structureMap() {
@@ -277,6 +442,7 @@ function renderAutoAcceptGate(gate) {
 function setCorrectionMode(enabled) {
   correctionMode = Boolean(enabled);
   $("waveWrapper")?.classList.toggle("placing", correctionMode);
+  $("waveWrapper")?.classList.toggle("directPlace", visualDirectPlaceReady() && correctionMode);
 }
 
 function sampleRate() {
@@ -328,10 +494,325 @@ function optionalMarkerTime(value) {
   return Number.isFinite(time) && time > 0 ? time : null;
 }
 
+function nearestBpmOne(time) {
+  const bpm = Number(currentItem?.bpm || 0);
+  if (!Number.isFinite(bpm) || bpm <= 0) return null;
+  const barSeconds = 4 * 60 / bpm;
+  if (!Number.isFinite(barSeconds) || barSeconds <= 0) return null;
+  const anchor = optionalMarkerTime(time);
+  if (anchor === null) return null;
+  const zero = barZeroSeconds();
+  const index = Math.max(0, Math.round((anchor - zero) / barSeconds));
+  const gridTime = zero + index * barSeconds;
+  return {
+    time: optionalMarkerTime(gridTime),
+    barNumber: index + 1,
+  };
+}
+
+function visualBoundaryScore(candidate, selectedTime) {
+  const time = candidateTime(candidate);
+  if (time === null) return null;
+  const distance = selectedTime === null ? 0 : Math.abs(time - selectedTime);
+  const score = Number(candidate?.confidence_score ?? candidate?.score ?? 0);
+  const micro = candidateMicroNumber(candidate, "micro_confidence") || 0;
+  const attack = candidateMicroNumber(candidate, "attack_cleanliness") || 0;
+  const zero = candidateMicroNumber(candidate, "zero_crossing_quality") || 0;
+  const snapMs = Math.abs(candidateSnapOffsetMs(candidate, time));
+  const roles = Array.isArray(candidate?.multistem_roles) ? candidate.multistem_roles.map(String) : [];
+  const sources = Array.isArray(candidate?.multistem_source_names) ? candidate.multistem_source_names.map(String) : [];
+  const sourceText = [...roles, ...sources, candidate?.reason || "", candidateMicroInfo(candidate)?.reason || ""].join(" ").toLowerCase();
+  const hasSaved = sourceText.includes("saved");
+  const hasTransition = /bar_transition|low_jump|drop|reentry/.test(sourceText);
+  const hasDrums = sourceText.includes("drums");
+  const sampleBoundary = /sample-level|knee|centerline/.test(sourceText);
+  const tailBypass = /tail bypass|impact body/.test(sourceText);
+  const strongBoundary = micro >= 0.92 || attack >= 0.90 || (hasSaved && hasTransition);
+  if (!strongBoundary || score < 0.66 || snapMs > 95 || distance > 2.25) return null;
+  const value =
+    score +
+    0.45 * micro +
+    0.25 * attack +
+    0.10 * zero +
+    (hasSaved ? 0.12 : 0) +
+    (hasTransition ? 0.12 : 0) +
+    (hasDrums ? 0.08 : 0) +
+    (sampleBoundary ? 0.08 : 0) -
+    (tailBypass ? 0.24 : 0) -
+    Math.min(0.18, snapMs / 1600) -
+    Math.min(0.16, distance / 25);
+  return { candidate, time, value, distance, micro, attack, sampleBoundary, tailBypass };
+}
+
+function selectedVisualEdgeIsLocked(selected, selectedTime) {
+  if (!visualFirstMode() || !selected || selectedTime === null) return false;
+  const selectedBy = String(selected.selected_by || "");
+  const reason = String(selected.reason || "").toLowerCase();
+  const micro = candidateMicroNumber(selected, "micro_confidence") || 0;
+  const snapMs = Math.abs(candidateSnapOffsetMs(selected, selectedTime));
+  const attack = candidateMicroNumber(selected, "attack_cleanliness") || 0;
+  if (selectedBy === "visual_gui_first_fat_block" && candidateFlag(selected, "visual_body_onset_used")) return true;
+  return (
+    selectedBy === "visual_gui_first_fat_block" &&
+    reason.includes("zoomed from visual block edge") &&
+    micro >= 0.95 &&
+    snapMs <= 8 &&
+    attack >= 0.85
+  );
+}
+
+function visualStrongBoundaryCandidate(selected, selectedTime) {
+  const candidates = Array.isArray(currentItem?.top_10_candidates) ? currentItem.top_10_candidates : [];
+  if (!candidates.length || selectedTime === null) return null;
+  const selectedRank = selected?.rank;
+  const selectedIsHistorical = isHistoricalCandidate(selected);
+  const selectedEdgeLocked = selectedVisualEdgeIsLocked(selected, selectedTime);
+  const selectedScore = visualBoundaryScore(selected, selectedTime)?.value ?? 0;
+  const best = candidates
+    .map((candidate) => visualBoundaryScore(candidate, selectedTime))
+    .filter((row) => {
+      if (!row || row.candidate?.rank === selectedRank) return false;
+      if (selectedEdgeLocked && row.time > selectedTime && row.distance <= 0.080) return false;
+      if (!selectedIsHistorical) return true;
+      return row.sampleBoundary && !row.tailBypass && row.micro >= 0.9 && row.attack >= 0.85;
+    })
+    .sort((a, b) => {
+      const valueDelta = b.value - a.value;
+      if (Math.abs(valueDelta) > 0.03) return valueDelta;
+      return a.distance - b.distance;
+    })[0];
+  const requiredGain = selectedIsHistorical ? 0.35 : 0.10;
+  if (!best || best.value < selectedScore + requiredGain) return null;
+  return best.candidate;
+}
+
+function phraseStrengthForBar(bar) {
+  const value = Math.round(Number(bar || 0));
+  if (!Number.isFinite(value) || value <= 0) return 0;
+  if ((value - 1) % 32 === 0) return 1.0;
+  if ((value - 1) % 24 === 0) return 0.96;
+  if ((value - 1) % 16 === 0) return 0.94;
+  if ((value - 1) % 8 === 0) return 0.86;
+  if ((value - 1) % 12 === 0) return 0.80;
+  if ((value - 1) % 4 === 0) return 0.66;
+  if ((value - 1) % 2 === 0) return 0.48;
+  return 0.18;
+}
+
+function candidateEvidenceValue(candidate) {
+  if (!candidate) return 0;
+  const score = Number(candidate?.confidence_score ?? candidate?.score ?? 0) || 0;
+  const micro = candidateMicroNumber(candidate, "micro_confidence") || 0;
+  const attack = candidateMicroNumber(candidate, "attack_cleanliness") || 0;
+  const zero = candidateMicroNumber(candidate, "zero_crossing_quality") || 0;
+  const snapMs = Math.abs(candidateSnapOffsetMs(candidate, candidateTime(candidate)));
+  const fake = Number(candidate?.fake_hit_penalty || 0) || 0;
+  return (
+    0.28 * Math.max(0, Math.min(1, micro)) +
+    0.20 * Math.max(0, Math.min(1, score)) +
+    0.08 * Math.max(0, Math.min(1, attack)) +
+    0.04 * Math.max(0, Math.min(1, zero)) -
+    0.08 * Math.max(0, Math.min(1, fake)) -
+    0.05 * Math.max(0, Math.min(1, snapMs / 220))
+  );
+}
+
+function clockPhraseStrength(clock, bar, offBeats) {
+  const explicit = Number(clock?.phrase_strength);
+  if (Number.isFinite(explicit) && explicit > 0) return explicit;
+  if (Number.isFinite(offBeats) && offBeats > 0.16) return 0;
+  return phraseStrengthForBar(bar);
+}
+
+function visualPrimaryPhraseCandidate(selected, selectedTime) {
+  if (!visualFirstMode() || !currentItem || selectedTime === null || isHistoricalCandidate(selected)) return null;
+  const candidates = Array.isArray(currentItem.top_10_candidates) ? currentItem.top_10_candidates : [];
+  if (!candidates.length) return null;
+  const selectedClock = selected ? candidateBpmClock(selected) : bpmOneClockForTime(selectedTime);
+  const selectedBar = Number(selectedClock?.nearest_one_bar || selectedClock?.bar_number || selectedClock?.phrase_bar || 0);
+  const selectedOffBeats = Number(selectedClock?.one_distance_beats ?? selectedClock?.distance_beats);
+  const selectedStrength = clockPhraseStrength(selectedClock, selectedBar, selectedOffBeats);
+  const selectedIsPrimary =
+    selectedBar >= 25 &&
+    selectedBar <= 49 &&
+    (selectedBar - 1) % 32 === 0 &&
+    Number.isFinite(selectedOffBeats) &&
+    selectedOffBeats <= 0.16 &&
+    selectedStrength >= 0.94;
+  if (selectedIsPrimary) return null;
+  const selectedSecondaryPhrase =
+    selectedBar >= 25 &&
+    selectedBar <= 49 &&
+    Number.isFinite(selectedOffBeats) &&
+    selectedOffBeats <= 0.16 &&
+    selectedStrength >= 0.86;
+  const selectedScore = Number(selected?.confidence_score ?? selected?.score ?? 0) || 0;
+  const selectedEvidence = candidateEvidenceValue(selected);
+  const rows = candidates
+    .map((candidate) => {
+      const time = candidateTime(candidate);
+      const clock = candidateBpmClock(candidate);
+      const bar = Number(clock?.nearest_one_bar || clock?.bar_number || clock?.phrase_bar || 0);
+      const offBeats = Number(clock?.one_distance_beats ?? clock?.distance_beats);
+      const strength = clockPhraseStrength(clock, bar, offBeats);
+      const score = Number(candidate?.confidence_score ?? candidate?.score ?? 0) || 0;
+      const micro = candidateMicroNumber(candidate, "micro_confidence") || 0;
+      const evidence = candidateEvidenceValue(candidate);
+      return { candidate, time, bar, offBeats, strength, score, micro, evidence };
+    })
+    .filter((row) => {
+      if (row.time === null || row.time <= selectedTime + 0.5) return false;
+      if (!Number.isFinite(row.bar) || row.bar < 25 || row.bar > 49 || (row.bar - 1) % 32 !== 0) return false;
+      if (!Number.isFinite(row.offBeats) || row.offBeats > 0.16 || row.strength < 0.94) return false;
+      if (!selectedSecondaryPhrase && selectedBar > 21 && selectedStrength >= 0.94) return false;
+      if (row.micro < 0.90) return false;
+      if (row.score < Math.max(0.68, selectedScore - 0.12)) return false;
+      if (row.evidence < selectedEvidence - 0.14) return false;
+      return true;
+    })
+    .sort((a, b) => {
+      const barDelta = a.bar - b.bar;
+      if (barDelta) return barDelta;
+      const strengthDelta = b.strength - a.strength;
+      if (Math.abs(strengthDelta) > 0.01) return strengthDelta;
+      const microDelta = b.micro - a.micro;
+      if (Math.abs(microDelta) > 0.02) return microDelta;
+      return (a.candidate.rank || 9999) - (b.candidate.rank || 9999);
+    });
+  return rows[0]?.candidate || null;
+}
+
+function visualPreferredAnchorCandidate() {
+  if (!visualFirstMode() || !currentItem) return null;
+  if (selectedVisualAnchorCandidate()) return null;
+  const candidates = Array.isArray(currentItem.top_10_candidates) ? currentItem.top_10_candidates : [];
+  if (!candidates.length) return null;
+  const selected = currentItem.selected_candidate || closestCandidateNearTime(currentItem.ai_pick) || null;
+  const selectedTime = candidateTime(selected) || optionalMarkerTime(currentItem.ai_pick);
+  const selectedEdgeLocked = selectedVisualEdgeIsLocked(selected, selectedTime);
+  const primaryPhrase = visualPrimaryPhraseCandidate(selected, selectedTime);
+  if (primaryPhrase) return primaryPhrase;
+  const visualBoundary = visualStrongBoundaryCandidate(selected, selectedTime);
+  if (visualBoundary) return visualBoundary;
+  const selectedClock = selected ? candidateBpmClock(selected) : bpmOneClockForTime(selectedTime);
+  const selectedBar = Number(selectedClock?.nearest_one_bar || 0);
+  const selectedOffBeats = Number(selectedClock?.one_distance_beats);
+  const beatSeconds = Number(selectedClock?.beat_sec || (Number(currentItem.bpm || 0) > 0 ? 60 / Number(currentItem.bpm) : 0));
+  if (
+    selectedTime === null ||
+    !Number.isFinite(selectedBar) ||
+    selectedBar <= 0 ||
+    !Number.isFinite(selectedOffBeats) ||
+    selectedOffBeats <= 0.16 ||
+    !Number.isFinite(beatSeconds) ||
+    beatSeconds <= 0
+  ) {
+    return null;
+  }
+  const maxJump = Math.max(0.35, Math.min(0.72, 1.15 * beatSeconds));
+  const selectedScore = Number(selected?.confidence_score ?? selected?.score ?? 0);
+  const rescue = candidates
+    .map((candidate) => {
+      const time = candidateTime(candidate);
+      const clock = candidateBpmClock(candidate);
+      const bar = Number(clock?.nearest_one_bar || 0);
+      const offBeats = Number(clock?.one_distance_beats);
+      const distance = time === null ? Infinity : Math.abs(time - selectedTime);
+      const score = Number(candidate.confidence_score ?? candidate.score ?? 0);
+      const micro = candidateMicroNumber(candidate, "micro_confidence") || 0;
+      return { candidate, time, clock, bar, offBeats, distance, score, micro };
+    })
+    .filter((row) => {
+      if (row.time === null || row.distance <= 0.010 || row.distance > maxJump) return false;
+      if (selectedEdgeLocked && row.time > selectedTime && row.distance <= 0.080) return false;
+      if (!Number.isFinite(row.bar) || row.bar !== selectedBar) return false;
+      if (!Number.isFinite(row.offBeats) || row.offBeats > 0.16) return false;
+      if (row.score < selectedScore - 0.18 && row.micro < 0.8) return false;
+      return true;
+    })
+    .sort((a, b) => {
+      const scoreDelta = b.score - a.score;
+      if (Math.abs(scoreDelta) > 0.02) return scoreDelta;
+      const offDelta = a.offBeats - b.offBeats;
+      if (Math.abs(offDelta) > 0.01) return offDelta;
+      return (a.candidate.rank || 9999) - (b.candidate.rank || 9999);
+    })[0];
+  return rescue?.candidate || null;
+}
+
+function defaultBlueAnchorCandidate() {
+  const selectedVisual = selectedVisualAnchorCandidate();
+  if (selectedVisual) return selectedVisual;
+  const liveBlueAnchor = candidateStillCurrent(blueAnchorCandidate) ? blueAnchorCandidate : null;
+  const livePendingAutoPlace = candidateStillCurrent(pendingAutoPlaceCandidate) ? pendingAutoPlaceCandidate : null;
+  return liveBlueAnchor || livePendingAutoPlace || visualPreferredAnchorCandidate() || currentItem?.selected_candidate || null;
+}
+
+function closestCandidateNearTime(time, maxDistance = 0.18) {
+  const target = optionalMarkerTime(time);
+  const candidates = Array.isArray(currentItem?.top_10_candidates) ? currentItem.top_10_candidates : [];
+  if (target === null || !candidates.length) return null;
+  let best = null;
+  let bestDistance = Infinity;
+  candidates.forEach((candidate) => {
+    const marker = candidateTime(candidate);
+    if (marker === null) return;
+    const distance = Math.abs(marker - target);
+    if (distance < bestDistance) {
+      best = candidate;
+      bestDistance = distance;
+    }
+  });
+  return best && bestDistance <= maxDistance ? best : null;
+}
+
+function blueMarkerInfo() {
+  const manual = visualFirstMode() || pickedCandidate || userPick === null ? null : optionalMarkerTime(userPick);
+  if (manual !== null) {
+    return {
+      time: manual,
+      label: "placed",
+      barNumber: nearestBpmOne(manual)?.barNumber || null,
+      candidate: null,
+      source: "manual",
+    };
+  }
+  const candidate = pickedCandidate || defaultBlueAnchorCandidate();
+  const candidateAnchor = candidateTime(candidate);
+  const anchor = candidateAnchor || selectedMicroTime() || optionalMarkerTime(currentItem?.ai_pick);
+  const grid = nearestBpmOne(anchor);
+  const exact = visualFirstMode() ? optionalMarkerTime(anchor) : blueExactCandidateTime(candidate, grid);
+  const time = optionalMarkerTime(exact) || (visualFirstMode() ? null : grid?.time) || optionalMarkerTime(anchor);
+  if (!time) return { time: null, label: "", barNumber: null };
+  const closestCandidate = closestCandidateNearTime(time);
+  const rawRank = pickedCandidate?.picked_candidate_rank ?? closestCandidate?.rank;
+  const label = rawRank ? `#${rawRank}` : "AI";
+  return {
+    time,
+    label,
+    barNumber: grid?.barNumber || null,
+    candidate: closestCandidate || candidate || null,
+    source: exact ? "candidate" : grid?.time ? "grid" : "anchor",
+  };
+}
+
+function gridMarkerTime() {
+  return blueMarkerInfo().time;
+}
+
+function visualCandidateZoomRadius() {
+  const span = viewportDuration();
+  if (span > 90) return 8;
+  if (span > 24) return 4;
+  if (span > 8) return 1;
+  return Math.max(0.12, Math.min(1, span / 4));
+}
+
 function markerTimes() {
   return {
     ai: optionalMarkerTime(pendingAutoPlacePick) || optionalMarkerTime(currentItem?.ai_pick),
     knee: kneeMarkerTime(),
+    grid: gridMarkerTime(),
     manual: userPick === null ? null : optionalMarkerTime(userPick),
   };
 }
@@ -355,6 +836,18 @@ function updateAiPickDisplay() {
   target.textContent = time === null ? "--" : `${fmtTime(time)} (${time.toFixed(6)}s)`;
 }
 
+function updateGridMarkerUi() {
+  const info = blueMarkerInfo();
+  updateMarkerAcceptButton("acceptGridBtn", info.label ? `BLUE ${info.label}` : "BLUE", info.time);
+  const target = $("blueMarker");
+  if (target) {
+    const sourceLabel =
+      info.source === "candidate" ? "exact" : info.source === "grid" ? "grid" : info.source === "manual" ? "placed" : "";
+    const suffix = [info.label, sourceLabel, info.barNumber ? `b${info.barNumber}` : ""].filter(Boolean).join(" ");
+    target.textContent = info.time === null ? "none" : `${fmtTime(info.time)} (${info.time.toFixed(6)}s)${suffix ? ` ${suffix}` : ""}`;
+  }
+}
+
 function updateMetric(id, value, formatter) {
   const target = $(id);
   if (!target) return;
@@ -376,6 +869,7 @@ function updateSaveButton() {
   $("clearMarkerBtn").classList.toggle("disabled", !hasPick || saveInFlight);
   updateMarkerAcceptButton("approveBtn", "AI", times.ai);
   updateMarkerAcceptButton("acceptKneeBtn", "KNEE", times.knee);
+  updateGridMarkerUi();
   updateAiPickDisplay();
   $("userPick").textContent = times.manual === null ? "none" : `${fmtTime(times.manual)} (${times.manual.toFixed(6)}s)`;
   $("microMarker").textContent = times.knee === null ? "none" : `${fmtTime(times.knee)} (${times.knee.toFixed(6)}s)`;
@@ -400,6 +894,12 @@ function setUserPick(value, candidate = null) {
   userPick = clampOriginalTime(Number(value));
   pickedCandidate = candidate ? cloneCandidateForCorrection(candidate, userPick) : null;
   updateSaveButton();
+}
+
+function setBlueAnchorCandidate(candidate) {
+  blueAnchorCandidate = candidate ? { ...candidate } : null;
+  updateGridMarkerUi();
+  scheduleDrawWaveform();
 }
 
 function clearUserPick() {
@@ -565,6 +1065,7 @@ function drawBpmClock(ctx, width, height) {
 
   ctx.save();
   ctx.font = "10px -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif";
+  const subtleGuides = visualFirstMode();
   for (let beat = firstBeat; beat <= lastBeat; beat += 1) {
     const time = beat * beatSeconds;
     const x = timeToX(time);
@@ -573,20 +1074,30 @@ function drawBpmClock(ctx, width, height) {
     const isPhrase = beat % 64 === 0;
     const isEightBar = beat % 32 === 0;
     ctx.setLineDash([]);
-    ctx.strokeStyle = isPhrase
-      ? "rgba(15,111,191,0.62)"
-      : isEightBar
-        ? "rgba(15,111,191,0.45)"
-        : isOne
-          ? "rgba(15,111,191,0.32)"
-          : "rgba(15,111,191,0.12)";
-    ctx.lineWidth = isPhrase ? 2.2 : isEightBar ? 1.8 : isOne ? 1.35 : 0.75;
+    ctx.strokeStyle = subtleGuides
+      ? isPhrase
+        ? "rgba(15,111,191,0.30)"
+        : isEightBar
+          ? "rgba(15,111,191,0.22)"
+          : isOne
+            ? "rgba(15,111,191,0.16)"
+            : "rgba(15,111,191,0.05)"
+      : isPhrase
+        ? "rgba(15,111,191,0.62)"
+        : isEightBar
+          ? "rgba(15,111,191,0.45)"
+          : isOne
+            ? "rgba(15,111,191,0.32)"
+            : "rgba(15,111,191,0.12)";
+    ctx.lineWidth = subtleGuides
+      ? isPhrase ? 1.6 : isEightBar ? 1.35 : isOne ? 1 : 0.55
+      : isPhrase ? 2.2 : isEightBar ? 1.8 : isOne ? 1.35 : 0.75;
     ctx.beginPath();
     ctx.moveTo(Math.round(x) + 0.5, 0);
     ctx.lineTo(Math.round(x) + 0.5, height);
     ctx.stroke();
 
-    if (isOne && (beatPx >= 42 || isPhrase || isEightBar)) {
+    if (!subtleGuides && isOne && (beatPx >= 42 || isPhrase || isEightBar)) {
       const barNumber = Math.floor(beat / 4) + 1;
       const label = `${Math.round(bpm)} BPM ONE b${barNumber}`;
       const labelWidth = Math.ceil(ctx.measureText(label).width) + 8;
@@ -594,7 +1105,7 @@ function drawBpmClock(ctx, width, height) {
       ctx.fillRect(x + 4, 24, labelWidth, 15);
       ctx.fillStyle = "#0a4e88";
       ctx.fillText(label, x + 8, 35);
-    } else if (!isOne && beatPx >= 90) {
+    } else if (!subtleGuides && !isOne && beatPx >= 90) {
       const beatInBar = (beat % 4) + 1;
       ctx.fillStyle = "rgba(15,111,191,0.58)";
       ctx.fillText(String(beatInBar), x + 4, 35);
@@ -609,6 +1120,18 @@ function stemStroke(tile) {
 
 function stemFill(tile) {
   return STEM_FILLS[String(tile?.role || "drums")] || "rgba(38, 55, 70, 0.12)";
+}
+
+function rgbaFromHex(hex, alpha) {
+  const value = String(hex || "#263746").replace("#", "");
+  const normalized = value.length === 3
+    ? value.split("").map((char) => char + char).join("")
+    : value.padEnd(6, "0").slice(0, 6);
+  const intValue = Number.parseInt(normalized, 16);
+  const r = (intValue >> 16) & 255;
+  const g = (intValue >> 8) & 255;
+  const b = intValue & 255;
+  return `rgba(${r}, ${g}, ${b}, ${Math.max(0, Math.min(1, Number(alpha) || 0))})`;
 }
 
 function waveformGain(tile = waveTile) {
@@ -671,6 +1194,93 @@ function smoothRmsValues(values, binSpan) {
     const averaged = (prefix[i1] - prefix[i0]) / Math.max(1, i1 - i0);
     return Math.max(averaged, value * 0.18);
   });
+}
+
+function percentileValue(values, percentile) {
+  const finite = values.filter((value) => Number.isFinite(value)).sort((a, b) => a - b);
+  if (!finite.length) return 0;
+  const index = Math.max(0, Math.min(finite.length - 1, Math.round((finite.length - 1) * Number(percentile))));
+  return finite[index];
+}
+
+function movingAverage(values, radius) {
+  const safeRadius = Math.max(0, Math.round(Number(radius) || 0));
+  if (safeRadius <= 0 || values.length < 3) return values.slice();
+  const prefix = new Array(values.length + 1).fill(0);
+  for (let i = 0; i < values.length; i += 1) prefix[i + 1] = prefix[i] + Number(values[i] || 0);
+  return values.map((_value, index) => {
+    const start = Math.max(0, index - safeRadius);
+    const end = Math.min(values.length, index + safeRadius + 1);
+    return (prefix[end] - prefix[start]) / Math.max(1, end - start);
+  });
+}
+
+function drawEnergyChunks(ctx, width, laneTop, laneHeight, tile = waveTile, rmsValues = null, binSpanValue = null) {
+  if (!visualFirstMode() || viewportDuration() > VISUAL_CHUNK_MAX_VIEW_SECONDS) return;
+  const rawRms = Array.isArray(rmsValues) ? rmsValues : Array.isArray(tile?.rms) ? tile.rms : [];
+  if (rawRms.length < 4) return;
+  const start = tileStartSec(tile);
+  const span = Math.max(tileEndSec(tile) - start, 1 / Math.max(sampleRate(), 1));
+  const binSpan = Number(binSpanValue) > 0 ? Number(binSpanValue) : span / Math.max(1, rawRms.length);
+  const energy = rawRms.map((value) => hyperRmsAmplitude(value, tile));
+  const chunkSmoothSeconds = Math.max(0.08, Math.min(0.85, viewportDuration() / 260));
+  const radius = Math.max(1, Math.round((chunkSmoothSeconds / Math.max(binSpan, 1e-9)) / 2));
+  const smoothed = movingAverage(energy, radius);
+  const low = percentileValue(smoothed, 0.34);
+  const high = percentileValue(smoothed, 0.82);
+  const threshold = Math.max(0.10, low + (Math.max(0.02, high - low) * 0.42));
+  const minDuration = Math.max(0.06, Math.min(0.75, viewportDuration() / 310));
+  const mergeGap = Math.max(0.035, Math.min(0.28, viewportDuration() / 520));
+  const chunks = [];
+  let active = null;
+
+  smoothed.forEach((value, index) => {
+    if (value >= threshold) {
+      if (!active) active = { startIndex: index, endIndex: index, sum: 0, max: 0 };
+      active.endIndex = index;
+      active.sum += value;
+      active.max = Math.max(active.max, value);
+    } else if (active) {
+      chunks.push(active);
+      active = null;
+    }
+  });
+  if (active) chunks.push(active);
+
+  const merged = [];
+  chunks.forEach((chunk) => {
+    const chunkStart = start + chunk.startIndex * binSpan;
+    const chunkEnd = start + (chunk.endIndex + 1) * binSpan;
+    const prev = merged[merged.length - 1];
+    const count = Math.max(1, chunk.endIndex - chunk.startIndex + 1);
+    if (prev && chunkStart - prev.end <= mergeGap) {
+      prev.end = chunkEnd;
+      prev.sum += chunk.sum;
+      prev.count += count;
+      prev.max = Math.max(prev.max, chunk.max);
+      return;
+    }
+    merged.push({ start: chunkStart, end: chunkEnd, sum: chunk.sum, count, max: chunk.max });
+  });
+
+  const color = stemStroke(tile);
+  ctx.save();
+  merged.forEach((chunk) => {
+    const duration = chunk.end - chunk.start;
+    const x0 = Math.max(0, timeToX(chunk.start));
+    const x1 = Math.min(width, timeToX(chunk.end));
+    if (duration < minDuration || x1 - x0 < VISUAL_CHUNK_MIN_WIDTH_PX) return;
+    const average = chunk.sum / Math.max(1, chunk.count);
+    const alpha = VISUAL_CHUNK_MIN_ALPHA + (VISUAL_CHUNK_MAX_ALPHA - VISUAL_CHUNK_MIN_ALPHA) * Math.max(average, chunk.max * 0.72);
+    const y = laneTop + laneHeight * 0.08;
+    const h = laneHeight * 0.84;
+    ctx.fillStyle = rgbaFromHex(color, alpha);
+    ctx.fillRect(x0, y, x1 - x0, h);
+    ctx.strokeStyle = rgbaFromHex(color, Math.min(0.36, alpha + 0.08));
+    ctx.lineWidth = 1;
+    ctx.strokeRect(x0 + 0.5, y + 0.5, Math.max(0, x1 - x0 - 1), Math.max(0, h - 1));
+  });
+  ctx.restore();
 }
 
 function rmsY(value, laneTop, laneHeight, tile = waveTile, polarity = 1) {
@@ -835,6 +1445,7 @@ function drawPeaks(ctx, width, laneTop, laneHeight, tile = waveTile) {
   const binSpan = span / Math.max(1, mins.length);
   const strokeWidth = Math.max(0.55, Math.min(4, binSpan * pixelsPerSecond()));
   const detailRatio = mins.length / Math.max(width, 1);
+  drawEnergyChunks(ctx, width, laneTop, laneHeight, tile);
 
   ctx.beginPath();
   for (let i = 0; i < maxs.length; i += 1) {
@@ -991,6 +1602,7 @@ function drawRmsEnvelope(ctx, width, laneTop, laneHeight, tile = waveTile) {
   const span = Math.max(tileEndSec(tile) - start, 1 / Math.max(sampleRate(), 1));
   const binSpan = span / Math.max(1, rawRms.length);
   const rms = smoothRmsValues(rawRms, binSpan);
+  drawEnergyChunks(ctx, width, laneTop, laneHeight, tile, rawRms, binSpan);
 
   ctx.beginPath();
   for (let i = 0; i < rms.length; i += 1) {
@@ -1130,13 +1742,21 @@ function drawMarkers() {
   const overlay = $("waveOverlay");
   overlay.innerHTML = "";
   if (!currentItem || !waveDuration) return;
+  const blue = blueMarkerInfo();
   drawMarker(overlay, currentItem.ai_pick, "ai", "AI");
+  drawMarker(overlay, blue.time, "grid", blue.label ? `BLUE ${blue.label}` : "BLUE", { labelTop: 24 });
   drawMarker(overlay, kneeMarkerTime(), "knee", "KNEE");
-  (currentItem.top_10_candidates || []).forEach((cand, index) => {
-    const labelTop = isMobileLayout() ? 4 + Math.min(index, 9) * 19 : 4;
-    drawMarker(overlay, candidateTime(cand), "candidate", `#${cand.rank}`, { labelTop });
-  });
+  const showCandidateMarkers = !visualFirstMode() || viewportDuration() <= VISUAL_CHUNK_CANDIDATE_MARKER_VIEW_SECONDS;
+  if (showCandidateMarkers) {
+    (currentItem.top_10_candidates || []).forEach((cand, index) => {
+      const labelTop = isMobileLayout() ? 4 + Math.min(index, 9) * 19 : 4;
+      drawMarker(overlay, candidateTime(cand), "candidate", `#${cand.rank}`, { labelTop });
+    });
+  }
   if (userPick !== null) drawMarker(overlay, userPick, "user", "YOU");
+  if (userPick === null && correctionMode && hoverPlaceTime !== null) {
+    drawMarker(overlay, hoverPlaceTime, "placementPreview", "1.1.1");
+  }
   const playTime = playbackOriginalTime();
   if (playTime !== null) drawMarker(overlay, playTime, "playhead", "PLAY");
 }
@@ -1201,7 +1821,11 @@ function renderCandidates(item) {
     const barPriorText = formatBarPrior(barPriorForCandidate(cand));
     const clockText = formatBpmClock(bpmClockForCandidate(cand));
     const isPicked = pickedCandidate?.picked_candidate_rank === cand.rank;
-    li.className = cand.selected || isPicked ? "selected" : "";
+    const isBlueAnchor = visualFirstMode() && blueAnchorCandidate?.rank === cand.rank;
+    const isBlueNearest = visualFirstMode() && blueMarkerInfo().candidate?.rank === cand.rank;
+    li.className = visualFirstMode()
+      ? (isPicked || isBlueAnchor || isBlueNearest ? "selected" : "")
+      : (cand.selected || isPicked ? "selected" : "");
     li.innerHTML = `
       <button class="candidateButton" type="button" aria-label="Pick candidate ${cand.rank}">
         <span class="candidateTop">
@@ -1222,6 +1846,15 @@ function renderCandidates(item) {
     li.querySelector(".candidateButton").addEventListener("click", () => {
       if (t === null) {
         setStatus(`Candidate #${cand.rank} has no marker time.`);
+        return;
+      }
+      if (visualFirstMode()) {
+        setBlueAnchorCandidate(cand);
+        const focusTime = Number(t);
+        setViewportAround(focusTime, Math.min(visualCandidateZoomRadius(), VISUAL_DIRECT_PLACE_VIEW_SECONDS / 2), "custom");
+        setCorrectionMode(false);
+        renderCandidates(currentItem);
+        setStatus(`Candidate #${cand.rank} focused at ${fmtTime(focusTime)}. Click waveform to play/seek. Press PLACE 1.1.1 when you are ready to mark.`);
         return;
       }
       setUserPick(Number(t), cand);
@@ -1315,6 +1948,7 @@ function syncZoomControls() {
   }
   $("zoomLabel").textContent = `${duration < 1 ? (duration * 1000).toFixed(2) + " ms" : fmtTime(duration)} | ${msPerPixel.toFixed(4)} ms/px`;
   updateAudioStatus();
+  updateGridMarkerUi();
 }
 
 function updateAudioStatus() {
@@ -1374,6 +2008,8 @@ function setViewport(start, end, nextView = waveView) {
   waveView = nextView;
   syncViewButtons();
   syncZoomControls();
+  if (!visualDirectPlaceReady()) hoverPlaceTime = null;
+  $("waveWrapper")?.classList.toggle("directPlace", visualDirectPlaceReady() && correctionMode);
   scheduleDrawWaveform();
   scheduleWaveformTile();
 }
@@ -1517,8 +2153,26 @@ function timeFromClientX(clientX) {
 function placeAtClientX(clientX) {
   if (!correctionMode || !currentItem || !waveDuration) return;
   setUserPick(timeFromClientX(clientX));
+  hoverPlaceTime = null;
   setCorrectionMode(false);
-  setStatus(`Correction marker placed at ${fmtTime(userPick)} (${userPick.toFixed(6)}s). Waveform clicks now seek playback.`);
+  setStatus(`1.1.1 placed at ${fmtTime(userPick)} (${userPick.toFixed(6)}s). Tap SAVE PLACED when it looks right.`);
+}
+
+function visualZoomAtClientX(clientX) {
+  if (!visualFirstMode() || correctionMode || !currentItem || !waveDuration) return;
+  const center = timeFromClientX(clientX);
+  const span = viewportDuration();
+  let radius = 5;
+  if (span > 90) radius = 8;
+  else if (span > 24) radius = 4;
+  else if (span > 8) radius = 1;
+  else if (span > 2) radius = 0.25;
+  else if (span > 0.4) radius = 0.05;
+  else if (span > 0.08) radius = 0.008;
+  else radius = 0.002;
+  setViewportAround(center, radius, "custom");
+  const nextHint = visualDirectPlaceReady() ? "Click waveform to play/seek, or press PLACE 1.1.1 to mark." : "Click again to zoom closer.";
+  setPlaybackStatus(`Zoomed to ${fmtTime(center)}. ${nextHint}`);
 }
 
 function loadWaveform(item) {
@@ -1530,10 +2184,11 @@ function loadWaveform(item) {
   audioClipStartSec = previewStart;
   audioClipEndSec = previewEnd;
   updatePlaybackControls();
-  waveView = "window";
+  waveView = visualFirstMode() ? "full" : "window";
   syncViewButtons();
   setupCanvas();
-  focusAiWindow();
+  if (visualFirstMode()) resetZoom();
+  else focusAiWindow();
 }
 
 function activeCenterTime() {
@@ -2010,8 +2665,15 @@ function renderState(state) {
   refinedInfo = null;
   pendingAutoPlacePick = null;
   pendingAutoPlaceCandidate = null;
+  blueAnchorCandidate = null;
+  hoverPlaceTime = null;
   setCorrectionMode(false);
   waveView = "window";
+  document.body.classList.toggle("visualFirst", visualFirstMode());
+  $("approveBtn").textContent = visualFirstMode() ? "ACCEPT AI" : "ACCEPT AI MARKER";
+  $("placeBtn").textContent = visualFirstMode() ? "PLACE 1.1.1" : "PLACE MANUAL";
+  $("aiAutoPlaceBtn").textContent = visualFirstMode() ? "AI SCAN" : "AI AUTO PLACE";
+  $("candidateHelp").textContent = visualFirstMode() ? "Click waveform to play. Tap a number or double-click to zoom. Press PLACE 1.1.1, then click the true transient." : "Tap a number, then tap Save.";
   syncWaveformModeButtons();
   renderAutoAcceptGate(null);
   updateSaveButton();
@@ -2032,6 +2694,7 @@ function renderState(state) {
     $("fakeHitPenalty").textContent = "--";
     $("laterMatchScore").textContent = "--";
     $("microMarker").textContent = "none";
+    $("blueMarker").textContent = "none";
     $("microOffset").textContent = "--";
     $("microConfidence").textContent = "--";
     $("attackCleanliness").textContent = "--";
@@ -2102,7 +2765,10 @@ async function saveCorrection() {
   if (saveInFlight) return;
   saveInFlight = true;
   updateSaveButton();
-  const saveLabel = pickedCandidate?.picked_candidate_rank ? `candidate #${pickedCandidate.picked_candidate_rank}` : "placed marker";
+  const candidateForLearning = pickedCandidate || closestCandidateNearTime(userPick, 0.12);
+  const learningCandidate = candidateForLearning ? cloneCandidateForCorrection(candidateForLearning, userPick) : null;
+  const learningRank = learningCandidate?.picked_candidate_rank || learningCandidate?.rank || null;
+  const saveLabel = learningRank ? `candidate #${learningRank}` : "placed marker";
   setStatus(`Saving ${saveLabel} at ${fmtTime(userPick)}...`);
   try {
     const data = await fetchJson("/api/correct", {
@@ -2110,8 +2776,8 @@ async function saveCorrection() {
       body: JSON.stringify({
         id: currentItem.id,
         user_pick: userPick,
-        reviewed_from: pickedCandidate ? "web_candidate_pick" : "web_manual_marker",
-        picked_candidate: pickedCandidate,
+        reviewed_from: learningCandidate ? "web_candidate_pick" : "web_manual_marker",
+        picked_candidate: learningCandidate,
         top_10_candidates: currentItem.top_10_candidates || [],
       }),
     });
@@ -2147,10 +2813,15 @@ async function refineMarker() {
 
 async function autoPlace() {
   if (!currentItem) return;
-  setStatus("Running full-track AI drop scan, then MicroSnap...");
+  const mode = visualFirstMode() ? "visual_only" : "normal";
+  setStatus(
+    visualFirstMode()
+      ? "Running visual waveform scan, then zoomed marker placement..."
+      : "Running full-track AI drop scan, then MicroSnap...",
+  );
   const data = await fetchJson("/api/auto_place", {
     method: "POST",
-    body: JSON.stringify({ id: currentItem.id, mode: "normal" }),
+    body: JSON.stringify({ id: currentItem.id, mode }),
   });
   const suggestion = data.suggestion || {};
   if (data.structure_map) {
@@ -2173,6 +2844,7 @@ async function autoPlace() {
   const autoPlaceMarker = optionalMarkerTime(suggestion.suggested_time) || candidateTime(suggestion.candidate);
   pendingAutoPlacePick = autoPlaceMarker === null ? null : Number(autoPlaceMarker);
   pendingAutoPlaceCandidate = pendingAutoPlacePick === null ? null : suggestion.candidate || null;
+  blueAnchorCandidate = pendingAutoPlaceCandidate;
   if (suggestion.microalign) setRefinedPick(suggestion.microalign);
   else updateSaveButton();
   renderStructureSummary();
@@ -2184,7 +2856,9 @@ async function autoPlace() {
   const first = structureCandidate("first_drop");
   const second = structureCandidate("second_drop");
   const placementLabel =
-    suggestion.mode === "historical" || data.source === "historical_human_marker"
+    suggestion.mode === "visual_only" || data.source === "visual_gui_only"
+      ? "visual marker"
+      : suggestion.mode === "historical" || data.source === "historical_human_marker"
       ? "historical marker"
       : suggestion.suggested_time !== undefined && suggestion.suggested_time !== null
         ? "suggested for review"
@@ -2212,7 +2886,8 @@ async function acceptMarker(kind) {
   }
   const acceptedTime = markerTime(kind);
   if (acceptedTime === null) return;
-  const label = String(kind || "marker").toUpperCase();
+  const blue = kind === "grid" ? blueMarkerInfo() : null;
+  const label = kind === "grid" && blue?.label ? `BLUE ${blue.label}` : String(kind || "marker").toUpperCase();
   const payload = {
     id: currentItem.id,
     user_pick: acceptedTime,
@@ -2220,6 +2895,9 @@ async function acceptMarker(kind) {
   };
   if (hasPendingAutoPlace) {
     payload.picked_candidate = cloneCandidateForCorrection(pendingAutoPlaceCandidate || currentItem.selected_candidate, acceptedTime);
+    payload.top_10_candidates = currentItem.top_10_candidates || [];
+  } else if (kind === "grid") {
+    payload.picked_candidate = cloneCandidateForCorrection(pickedCandidate || blue?.candidate || defaultBlueAnchorCandidate(), acceptedTime);
     payload.top_10_candidates = currentItem.top_10_candidates || [];
   }
   const data = await fetchJson("/api/correct", {
@@ -2258,6 +2936,19 @@ async function retrain() {
 }
 
 function placeMode() {
+  if (visualFirstMode() && currentItem && waveDuration && !visualDirectPlaceReady()) {
+    const focus =
+      optionalMarkerTime(userPick) ??
+      candidateTime(blueAnchorCandidate) ??
+      blueMarkerInfo().time ??
+      candidateTime(currentItem.selected_candidate) ??
+      optionalMarkerTime(currentItem.ai_pick) ??
+      activeCenterTime();
+    setViewportAround(focus, VISUAL_DIRECT_PLACE_VIEW_SECONDS / 2, "custom");
+    setCorrectionMode(false);
+    setStatus(`Zoomed to ${fmtTime(focus)}. Click waveform to play/seek. Press PLACE 1.1.1 again when you are ready to mark.`);
+    return;
+  }
   setCorrectionMode(true);
   setStatus("Click the waveform once to place the true 1.1.1. After that, waveform clicks seek playback again.");
 }
@@ -2284,6 +2975,7 @@ function attachEvents() {
   });
   on("approveBtn", "click", () => acceptMarker("ai"));
   on("acceptKneeBtn", "click", () => acceptMarker("knee"));
+  on("acceptGridBtn", "click", () => acceptMarker("grid"));
   on("placeBtn", "click", placeMode);
   on("aiRefineBtn", "click", refineMarker);
   on("aiAutoPlaceBtn", "click", autoPlace);
@@ -2331,6 +3023,18 @@ function attachEvents() {
     { capture: true },
   );
 
+  $("waveWrapper").addEventListener(
+    "dblclick",
+    (event) => {
+      if (!visualFirstMode() || correctionMode || !currentItem || !waveDuration) return;
+      event.preventDefault();
+      event.stopPropagation();
+      suppressWaveClick = true;
+      visualZoomAtClientX(event.clientX);
+    },
+    { capture: true },
+  );
+
   $("waveWrapper").addEventListener("click", (event) => {
     if (correctionMode || !currentItem || !waveDuration) return;
     if (suppressWaveClick) {
@@ -2340,8 +3044,34 @@ function attachEvents() {
       return;
     }
     event.preventDefault();
+    if (visualFirstMode()) {
+      playPlaybackFromClientX(event.clientX);
+      return;
+    }
     if (isMobileLayout()) playPlaybackFromClientX(event.clientX);
     else seekPlaybackToClientX(event.clientX);
+  });
+
+  $("waveWrapper").addEventListener("mousemove", (event) => {
+    if (!visualDirectPlaceReady() || !correctionMode || userPick !== null) {
+      if (hoverPlaceTime !== null) {
+        hoverPlaceTime = null;
+        scheduleDrawWaveform();
+      }
+      return;
+    }
+    const next = timeFromClientX(event.clientX);
+    if (hoverPlaceTime === null || Math.abs(Number(next) - Number(hoverPlaceTime)) > minViewSeconds()) {
+      hoverPlaceTime = next;
+      scheduleDrawWaveform();
+    }
+  });
+
+  $("waveWrapper").addEventListener("mouseleave", () => {
+    if (hoverPlaceTime !== null) {
+      hoverPlaceTime = null;
+      scheduleDrawWaveform();
+    }
   });
 
   $("waveWrapper").addEventListener(
@@ -2466,6 +3196,7 @@ function attachEvents() {
     if (event.target && ["INPUT", "TEXTAREA"].includes(event.target.tagName)) return;
     const key = event.key.toLowerCase();
     if (key === "y") acceptMarker("ai");
+    if (key === "b") acceptMarker("grid");
     if (key === "n") placeMode();
     if (key === "s") skip();
     if (key === "r") retrain();

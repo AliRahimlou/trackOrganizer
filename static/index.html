@@ -7,7 +7,7 @@
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-title" content="Drop Review" />
     <title>Drop Aligner Review</title>
-  <link rel="stylesheet" href="/static/style.css?v=historical-regression-20260602b" />
+  <link rel="stylesheet" href="/static/style.css?v=visual-manual-flow-20260607j" />
   </head>
   <body>
     <main class="app">
@@ -31,7 +31,7 @@
         <section class="reviewFocus">
           <div class="panelHeader">
             <h2>Top candidates</h2>
-            <span class="muted">Tap a number, then tap Save.</span>
+            <span id="candidateHelp" class="muted">Tap a number, then tap Save.</span>
           </div>
           <ol id="candidateList" class="candidateList"></ol>
           <details id="debugDetails" class="debugDetails">
@@ -83,6 +83,7 @@
           <div class="acceptActions">
             <button id="approveBtn" class="primary markerAccept ai">ACCEPT AI MARKER</button>
             <button id="acceptKneeBtn" class="secondary markerAccept knee disabled">ACCEPT KNEE MARKER</button>
+            <button id="acceptGridBtn" class="secondary markerAccept grid disabled">ACCEPT BLUE LINE</button>
             <button id="saveCorrectionBtn" class="primary disabled">SAVE PLACED</button>
           </div>
           <div class="toolActions">
@@ -160,6 +161,10 @@
               <strong id="microMarker">none</strong>
             </div>
             <div class="metric">
+              <span>Blue line</span>
+              <strong id="blueMarker">none</strong>
+            </div>
+            <div class="metric">
               <span>Snap offset</span>
               <strong id="microOffset">--</strong>
             </div>
@@ -198,6 +203,6 @@
         </details>
       </aside>
     </main>
-  <script src="/static/app.js?v=historical-regression-20260602b"></script>
+    <script src="/static/app.js?v=visual-manual-flow-20260609d"></script>
   </body>
 </html>

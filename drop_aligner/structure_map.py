@@ -9,7 +9,7 @@ from .musical_clock import bpm_clock_for_time, phrase_strength_for_bar
 from .structure_features import compute_bar_feature_map
 
 
-STRUCTURE_MAP_VERSION = 6
+STRUCTURE_MAP_VERSION = 7
 
 
 def _clip01(value: Any) -> float:
@@ -73,6 +73,14 @@ def _bar_transition_score(
     )
     low_to_high = _clip01((0.62 * (post_8_energy - pre_8_energy + 0.18)) + (0.38 * (post_4_energy - pre_4_energy + 0.18)))
     sustained = _clip01((0.42 * post_groove) + (0.30 * post_density) + (0.28 * post_bass))
+    block_height = _clip01(
+        (0.30 * post_8_energy)
+        + (0.22 * post_4_energy)
+        + (0.18 * post_groove)
+        + (0.14 * post_density)
+        + (0.10 * post_bass)
+        + (0.06 * inst_reentry)
+    )
     pre_space = _clip01(1.0 - (0.68 * pre_4_energy) - (0.32 * _mean_bars(bars, "drum_density", idx - 4, idx)))
     phrase, phrase_name = phrase_strength_for_bar(phrase_bar)
     one_distance_value = (clock or {}).get("one_distance_ms", 999999.0)
@@ -99,6 +107,11 @@ def _bar_transition_score(
         "post_groove": float(post_groove),
         "post_density": float(post_density),
         "post_bass": float(post_bass),
+        "post_4_energy": float(post_4_energy),
+        "post_8_energy": float(post_8_energy),
+        "pre_4_energy": float(pre_4_energy),
+        "pre_8_energy": float(pre_8_energy),
+        "block_height": float(block_height),
         "pre_space": float(pre_space),
         "timbre_novelty": float(novelty),
         "build_slope": float(build_slope),
@@ -169,6 +182,112 @@ def _bar_lane(bar: Mapping[str, Any]) -> Dict[str, Any]:
 
 
 def _pick_first_second(candidates: List[Dict[str, Any]]) -> tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    def components(candidate: Mapping[str, Any]) -> Mapping[str, Any]:
+        value = candidate.get("structure_components")
+        return value if isinstance(value, Mapping) else {}
+
+    def clock_bar(candidate: Mapping[str, Any]) -> int:
+        return int(components(candidate).get("clock_bar", candidate.get("structure_clock_bar", candidate.get("structure_bar", 0))) or 0)
+
+    def score(candidate: Mapping[str, Any]) -> float:
+        return float(candidate.get("score", 0.0) or 0.0)
+
+    def sustained_groove(candidate: Mapping[str, Any]) -> float:
+        return float(components(candidate).get("sustained_groove", 0.0) or 0.0)
+
+    def block_height(candidate: Mapping[str, Any]) -> float:
+        comp = components(candidate)
+        if comp.get("block_height") is not None:
+            return float(comp.get("block_height", 0.0) or 0.0)
+        return float(
+            (0.45 * sustained_groove(candidate))
+            + (0.25 * float(comp.get("post_groove", 0.0) or 0.0))
+            + (0.18 * float(comp.get("post_density", 0.0) or 0.0))
+            + (0.12 * float(comp.get("post_bass", 0.0) or 0.0))
+        )
+
+    def phrase_prior(candidate: Mapping[str, Any]) -> float:
+        return float(components(candidate).get("phrase_prior", 0.0) or 0.0)
+
+    def visual_chunk_strength(candidate: Mapping[str, Any]) -> float:
+        comp = components(candidate)
+        return float(
+            (0.34 * block_height(candidate))
+            + (0.27 * sustained_groove(candidate))
+            + (0.18 * float(comp.get("low_to_high", 0.0) or 0.0))
+            + (0.10 * float(comp.get("timbre_novelty", 0.0) or 0.0))
+            + (0.06 * float(comp.get("pre_space", 0.0) or 0.0))
+            + (0.05 * score(candidate))
+        )
+
+    def stronger_later_phrase_candidate(rows: Sequence[Mapping[str, Any]], earliest: Mapping[str, Any]) -> Optional[Mapping[str, Any]]:
+        earliest_bar = clock_bar(earliest)
+        if earliest_bar <= 0:
+            return None
+        earliest_sustain = sustained_groove(earliest)
+        earliest_score = score(earliest)
+        earliest_strength = visual_chunk_strength(earliest)
+        earliest_height = block_height(earliest)
+        if earliest_bar <= 9:
+            allowed_bars = {17, 25, 33, 49}
+            min_bar_gap = 6
+            sustain_lift = 0.025
+            height_lift = 0.045
+            score_slack = 0.16
+            strength_lift = 0.030
+        elif earliest_bar <= 17:
+            allowed_bars = {25, 33, 49}
+            min_bar_gap = 8
+            sustain_lift = 0.035
+            height_lift = 0.055
+            score_slack = 0.20
+            strength_lift = 0.040
+        elif earliest_bar <= 25:
+            allowed_bars = {33, 41, 49}
+            min_bar_gap = 6
+            sustain_lift = 0.040
+            height_lift = 0.060
+            score_slack = 0.22
+            strength_lift = 0.045
+        elif earliest_bar <= 33:
+            allowed_bars = {41, 49}
+            min_bar_gap = 6
+            sustain_lift = 0.045
+            height_lift = 0.065
+            score_slack = 0.22
+            strength_lift = 0.050
+        else:
+            return None
+        primary_rows: List[Mapping[str, Any]] = []
+        for row in rows:
+            row_bar = clock_bar(row)
+            if row_bar not in allowed_bars or row_bar < earliest_bar + min_bar_gap:
+                continue
+            if phrase_prior(row) < 0.80:
+                continue
+            if score(row) < max(0.44, earliest_score - score_slack):
+                continue
+            row_height = block_height(row)
+            row_strength = visual_chunk_strength(row)
+            height_wins = row_height >= max(0.50, earliest_height + height_lift)
+            strength_wins = row_strength >= max(0.48, earliest_strength + strength_lift)
+            sustain_wins = sustained_groove(row) >= max(0.44, earliest_sustain + sustain_lift)
+            if not (height_wins or (strength_wins and sustain_wins)):
+                continue
+            primary_rows.append(row)
+        if not primary_rows:
+            return None
+        primary_rows.sort(
+            key=lambda row: (
+                clock_bar(row),
+                -block_height(row),
+                -visual_chunk_strength(row),
+                -sustained_groove(row),
+                -score(row),
+            )
+        )
+        return primary_rows[0]
+
     def one_distance(candidate: Mapping[str, Any]) -> float:
         value = (candidate.get("structure_components") or {}).get("one_distance_ms", 999999.0)
         return float(999999.0 if value is None else value)
@@ -191,32 +310,54 @@ def _pick_first_second(candidates: List[Dict[str, Any]]) -> tuple[Optional[Dict[
     if viable:
         strongest = max(viable, key=lambda row: float(row.get("score", 0.0) or 0.0))
         strongest_score = float(strongest.get("score", 0.0) or 0.0)
-        preferred_floor = max(0.44, strongest_score - 0.14)
-        preferred_phrase_starts = [
+        early_fat_blocks = [
             candidate
             for candidate in viable
-            if float(candidate.get("score", 0.0) or 0.0) >= preferred_floor
-            and float((candidate.get("structure_components") or {}).get("phrase_prior", 0.0) or 0.0) >= 0.86
-            and int((candidate.get("structure_components") or {}).get("clock_bar", 0) or 0) >= 9
+            if 9 <= clock_bar(candidate) <= 49
+            and block_height(candidate) >= 0.58
+            and sustained_groove(candidate) >= 0.54
+            and phrase_prior(candidate) >= 0.45
+            and score(candidate) >= 0.48
         ]
-        if preferred_phrase_starts:
-            preferred_phrase_starts.sort(
+        if early_fat_blocks:
+            early_fat_blocks.sort(
                 key=lambda row: (
-                    int((row.get("structure_components") or {}).get("clock_bar", row.get("structure_bar", 999999)) or 999999),
-                    -float(row.get("score", 0.0) or 0.0),
+                    clock_bar(row),
+                    -block_height(row),
+                    -visual_chunk_strength(row),
+                    -score(row),
                 )
             )
-            first = dict(preferred_phrase_starts[0])
+            first = dict(stronger_later_phrase_candidate(early_fat_blocks, early_fat_blocks[0]) or early_fat_blocks[0])
+            first["first_drop_selection_rule"] = "first_sufficient_visual_block"
         else:
-            floor = max(0.44, strongest_score - 0.12)
-            near_best = [
+            preferred_floor = max(0.44, strongest_score - 0.18)
+            preferred_phrase_starts = [
                 candidate
                 for candidate in viable
-                if float(candidate.get("score", 0.0) or 0.0) >= floor
-                and bool((candidate.get("structure_components") or {}).get("on_one"))
+                if float(candidate.get("score", 0.0) or 0.0) >= preferred_floor
+                and float((candidate.get("structure_components") or {}).get("phrase_prior", 0.0) or 0.0) >= 0.86
+                and int((candidate.get("structure_components") or {}).get("clock_bar", 0) or 0) >= 9
             ]
-            near_best.sort(key=lambda row: (int(row.get("structure_bar", 999999) or 999999), -float(row.get("score", 0.0) or 0.0)))
-            first = dict(near_best[0]) if near_best else None
+            if preferred_phrase_starts:
+                preferred_phrase_starts.sort(
+                    key=lambda row: (
+                        clock_bar(row) or 999999,
+                        -block_height(row),
+                        -score(row),
+                    )
+                )
+                first = dict(stronger_later_phrase_candidate(preferred_phrase_starts, preferred_phrase_starts[0]) or preferred_phrase_starts[0])
+            else:
+                floor = max(0.44, strongest_score - 0.12)
+                near_best = [
+                    candidate
+                    for candidate in viable
+                    if float(candidate.get("score", 0.0) or 0.0) >= floor
+                    and bool((candidate.get("structure_components") or {}).get("on_one"))
+                ]
+                near_best.sort(key=lambda row: (int(row.get("structure_bar", 999999) or 999999), -float(row.get("score", 0.0) or 0.0)))
+                first = dict(near_best[0]) if near_best else None
         if first is not None:
             first["structure_role"] = "first_drop"
             first["section_label"] = "first_drop"
