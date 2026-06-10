@@ -492,6 +492,56 @@ def select_first_visual_chunk(candidates: Sequence[Mapping[str, Any]]) -> Option
             and drum(row) >= 0.950
         )
 
+    def instrumental_bass_section_entry(row: Mapping[str, Any]) -> bool:
+        return bool(
+            clock_bar(row) >= 33
+            and phrase_prior(row) >= 0.80
+            and is_phrase_body_shift(row)
+            and inst(row) >= 0.500
+            and pre_inst(row) <= 0.380
+            and inst(row) >= pre_inst(row) + 0.220
+            and bass(row) >= 0.320
+            and drum(row) >= 0.900
+            and post4(row) >= 0.580
+            and post8(row) >= 0.580
+        )
+
+    def earlier_real_drop_before(row: Mapping[str, Any]) -> bool:
+        row_bar = clock_bar(row)
+        for earlier in rows:
+            if clock_bar(earlier) >= row_bar:
+                continue
+            local_reentry_drop = bool(
+                is_local_reentry(earlier)
+                and local_gap(earlier) >= 0.220
+                and bass(earlier) >= 0.480
+                and drum(earlier) >= 0.900
+                and post4(earlier) >= 0.580
+                and post8(earlier) >= 0.580
+            )
+            phrase_body_drop = bool(
+                is_phrase_body_shift(earlier)
+                and phrase_prior(earlier) >= 0.800
+                and bass(earlier) >= 0.500
+                and drum(earlier) >= 0.900
+                and post4(earlier) >= 0.600
+                and post8(earlier) >= 0.600
+            )
+            if local_reentry_drop or phrase_body_drop:
+                return True
+        return False
+
+    for row in rows:
+        if not instrumental_bass_section_entry(row) or earlier_real_drop_before(row):
+            continue
+        selected = dict(row)
+        selected["selected_by"] = "visual_gui_first_fat_block"
+        selected["reason"] = (
+            "visual-only selected first instrumental/bass section entry before later body peak; "
+            f"{row.get('reason') or 'instrumental/bass section entry'}"
+        )
+        return selected
+
     def same_opening_block_upgrade(selected: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
         selected_bar = clock_bar(selected)
         selected_score = float(selected.get("score", selected.get("confidence_score", 0.0)) or 0.0)

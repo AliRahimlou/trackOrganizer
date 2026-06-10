@@ -257,6 +257,50 @@ def test_zoomed_marker_prefers_late_bang_over_busy_visual_edge() -> None:
     assert marker == pytest.approx(99.13798760818882)
 
 
+def test_visual_first_prefers_instrumental_section_entry_over_later_body_peak() -> None:
+    drum_only_body = _candidate(
+        67.6056338028169,
+        41,
+        score=0.572,
+        phrase_prior=0.86,
+        post4=0.566,
+        post8=0.579,
+        bass=0.473,
+        phrase_body_shift=True,
+    )
+    drum_only_body["visual_components"].update({"pre_inst4": 0.044, "post_inst8": 0.069})
+    instrumental_entry = _candidate(
+        94.64788732394366,
+        57,
+        score=0.616,
+        phrase_prior=0.86,
+        post4=0.630,
+        post8=0.656,
+        bass=0.426,
+        drum=0.977,
+        pre_drum=0.778,
+        phrase_body_shift=True,
+    )
+    instrumental_entry["visual_components"].update({"pre_inst4": 0.226, "post_inst8": 0.684})
+    later_body_peak = _candidate(
+        98.02816901408451,
+        59,
+        score=0.625,
+        phrase_prior=0.48,
+        post4=0.668,
+        post8=0.679,
+        bass=0.460,
+        phrase_body_shift=False,
+    )
+    later_body_peak["visual_components"].update({"pre_inst4": 0.581, "post_inst8": 0.642})
+
+    selected = select_first_visual_chunk([drum_only_body, instrumental_entry, later_body_peak])
+
+    assert selected is not None
+    assert selected["timestamp"] == pytest.approx(94.64788732394366)
+    assert "instrumental/bass section entry" in selected["reason"]
+
+
 def test_visual_first_skips_early_jump_when_later_block_is_clearly_taller() -> None:
     heights = [0.34] * 16 + [0.56] * 8 + [0.61] * 8 + [0.70] * 24
     candidates = visual_chunk_candidates(_feature_map(heights))
