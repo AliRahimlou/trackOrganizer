@@ -3119,6 +3119,21 @@ class ReviewApp:
         )
         if not candidates:
             return False
+        closest_index = 0
+        closest_delta = float("inf")
+        for index, candidate in enumerate(candidates):
+            candidate_time = _candidate_marker_time(candidate)
+            if candidate_time is None:
+                continue
+            delta = abs(float(candidate_time) - float(marker))
+            if delta < closest_delta:
+                closest_delta = delta
+                closest_index = int(index)
+        if closest_index > 0 and closest_delta <= 1.500:
+            candidates = [candidates[closest_index]] + candidates[:closest_index] + candidates[closest_index + 1 :]
+            for rank, candidate in enumerate(candidates, start=1):
+                candidate["rank"] = int(rank)
+                candidate["handcrafted_rank"] = int(rank)
         item["top_10_candidates"] = candidates[:10]
         item["selected_candidate"] = dict(candidates[0])
         item["selected_by"] = str(candidates[0].get("selected_by") or "visual_gui_first_fat_block")
@@ -3176,7 +3191,12 @@ class ReviewApp:
             audio_path = str(item.get("audio_path") or "")
             if audio_path:
                 try:
-                    visual = visual_first_marker(audio_path, sample_rate=16000, use_cache=True)
+                    visual = visual_first_marker(
+                        audio_path,
+                        sample_rate=16000,
+                        use_cache=True,
+                        rejected_sections=self._visual_rejections_for_item(item),
+                    )
                 except Exception as exc:
                     item["visual_first_scan_error"] = str(exc) or exc.__class__.__name__
                 else:
@@ -3209,6 +3229,49 @@ class ReviewApp:
             str(item.get("confidence_tier", "UNKNOWN")),
         )
         item["initial_candidate_source"] = str(item["selected_by"])
+
+    def _visual_rejections_for_item(self, item: Mapping[str, Any]) -> List[Dict[str, Any]]:
+        review = item.get("review") if isinstance(item.get("review"), Mapping) else {}
+        rows = review.get("rejected_visual_sections") if isinstance(review.get("rejected_visual_sections"), list) else []
+        return [dict(row) for row in rows if isinstance(row, Mapping)]
+
+    def _remember_visual_rejection(self, item: Dict[str, Any]) -> None:
+        review = item.setdefault("review", {})
+        if not isinstance(review, dict):
+            return
+        selected = item.get("selected_candidate") if isinstance(item.get("selected_candidate"), Mapping) else {}
+        visual = selected.get("visual_components") if isinstance(selected.get("visual_components"), Mapping) else {}
+        marker = _candidate_marker_time(selected) or _float_or_none(item.get("ai_pick"))
+        raw_time = _float_or_none(selected.get("visual_raw_chunk_time")) or _float_or_none(selected.get("time_sec")) or marker
+        try:
+            clock_bar = int(visual.get("clock_bar", 0) or 0)
+        except (TypeError, ValueError):
+            clock_bar = 0
+        if marker is None and not clock_bar:
+            return
+        rejections = review.setdefault("rejected_visual_sections", [])
+        if not isinstance(rejections, list):
+            rejections = []
+            review["rejected_visual_sections"] = rejections
+        for existing in rejections:
+            if not isinstance(existing, Mapping):
+                continue
+            existing_bar = int(_float_or_none(existing.get("clock_bar")) or 0)
+            existing_time = _float_or_none(existing.get("timestamp"))
+            if clock_bar and existing_bar and abs(existing_bar - clock_bar) <= 2:
+                return
+            if marker is not None and existing_time is not None and abs(float(existing_time) - float(marker)) <= 6.0:
+                return
+        entry = {
+            "timestamp": None if marker is None else float(marker),
+            "raw_time": None if raw_time is None else float(raw_time),
+            "clock_bar": int(clock_bar),
+            "selected_by": str(selected.get("selected_by") or item.get("selected_by") or ""),
+            "reason": str(selected.get("reason") or ""),
+            "rejected_at": _now_iso(),
+        }
+        rejections.append(entry)
+        review["rejected_visual_sections"] = rejections[-12:]
 
     def _load_state(self) -> Dict[str, Any]:
         if self.state_path.exists():
@@ -4004,7 +4067,12 @@ class ReviewApp:
         if visual_only:
             audio_path = str(item_snapshot.get("audio_path", ""))
             try:
-                visual = visual_first_marker(audio_path, sample_rate=16000, use_cache=True)
+                visual = visual_first_marker(
+                    audio_path,
+                    sample_rate=16000,
+                    use_cache=True,
+                    rejected_sections=self._visual_rejections_for_item(item_snapshot),
+                )
             except Exception as exc:
                 return {"ok": False, "error": str(exc) or exc.__class__.__name__, "source": "visual_gui_only"}
             if not visual.get("ok"):
@@ -4413,6 +4481,7 @@ class ReviewApp:
             item = self.item_by_id.get(item_id)
             if not item:
                 return {"ok": False, "error": "unknown item"}
+            self._remember_visual_rejection(item)
             item["review"].update(
                 {
                     "reviewed": False,

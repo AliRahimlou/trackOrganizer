@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from drop_aligner.visual_first import (
+    _filter_rejected_sections,
     _use_visual_drop_v2_result,
     _zoomed_marker_time,
     select_first_visual_chunk,
@@ -172,6 +173,35 @@ def test_visual_first_shifts_off_phrase_edge_to_adjacent_phrase_edge() -> None:
     assert selected is not None
     assert selected["visual_components"]["clock_bar"] == 27
     assert selected["visual_edge_replaced_candidate"]["clock_bar"] == 26
+
+
+def test_visual_first_filters_rejected_visual_section_before_selection() -> None:
+    candidates = [
+        _candidate(55.0, 33, score=0.70, phrase_prior=1.0),
+        _candidate(82.0, 49, score=0.66, phrase_prior=0.96),
+    ]
+
+    filtered = _filter_rejected_sections(candidates, [{"timestamp": 55.0, "clock_bar": 33}])
+    selected = select_first_visual_chunk(filtered)
+
+    assert len(filtered) == 1
+    assert selected is not None
+    assert selected["visual_components"]["clock_bar"] == 49
+
+
+def test_visual_first_does_not_retreat_to_intro_after_later_rejection() -> None:
+    candidates = [
+        _candidate(15.0, 9, score=0.90, phrase_prior=1.0),
+        _candidate(55.0, 33, score=0.70, phrase_prior=1.0),
+        _candidate(82.0, 49, score=0.66, phrase_prior=0.96),
+    ]
+
+    filtered = _filter_rejected_sections(candidates, [{"timestamp": 55.0, "clock_bar": 33}])
+    selected = select_first_visual_chunk(filtered)
+
+    assert [row["visual_components"]["clock_bar"] for row in filtered] == [49]
+    assert selected is not None
+    assert selected["visual_components"]["clock_bar"] == 49
 
 
 def test_visual_first_skips_early_jump_when_later_block_is_clearly_taller() -> None:

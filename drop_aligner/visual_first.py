@@ -12,6 +12,8 @@ from .structure_features import compute_bar_feature_map
 
 
 VISUAL_FIRST_VERSION = 1
+REJECTED_SECTION_BAR_RADIUS = 2
+REJECTED_SECTION_TIME_RADIUS_SEC = 6.0
 
 
 def _clip01(value: Any) -> float:
@@ -89,6 +91,94 @@ def _use_visual_drop_v2_result(result: Mapping[str, Any]) -> bool:
         and honors_clock_intro
     )
     return bool(later_drop_gate or clear_song_start_gate)
+
+
+def _candidate_rejected_by_section(
+    candidate: Mapping[str, Any],
+    rejected_sections: Sequence[Mapping[str, Any]],
+    *,
+    bar_radius: int = REJECTED_SECTION_BAR_RADIUS,
+    time_radius_sec: float = REJECTED_SECTION_TIME_RADIUS_SEC,
+) -> bool:
+    if not rejected_sections:
+        return False
+    visual = candidate.get("visual_components") if isinstance(candidate.get("visual_components"), Mapping) else {}
+    try:
+        candidate_bar = int(visual.get("clock_bar", 0) or 0)
+    except (TypeError, ValueError):
+        candidate_bar = 0
+    candidate_time = (
+        _finite_float(candidate.get("visual_raw_chunk_time"))
+        or _finite_float(candidate.get("timestamp"))
+        or _finite_float(candidate.get("snapped_sec"))
+        or _finite_float(candidate.get("time_sec"))
+    )
+    for rejected in rejected_sections:
+        if not isinstance(rejected, Mapping):
+            continue
+        try:
+            rejected_bar = int(rejected.get("clock_bar", 0) or 0)
+        except (TypeError, ValueError):
+            rejected_bar = 0
+        if candidate_bar and rejected_bar and abs(candidate_bar - rejected_bar) <= int(bar_radius):
+            return True
+        rejected_time = _finite_float(rejected.get("raw_time")) or _finite_float(rejected.get("timestamp"))
+        if (
+            candidate_time is not None
+            and rejected_time is not None
+            and abs(float(candidate_time) - float(rejected_time)) <= float(time_radius_sec)
+        ):
+            return True
+    return False
+
+
+def _filter_rejected_sections(
+    candidates: Sequence[Mapping[str, Any]],
+    rejected_sections: Sequence[Mapping[str, Any]],
+) -> List[Dict[str, Any]]:
+    rows = [dict(row) for row in candidates if isinstance(row, Mapping)]
+    if not rejected_sections:
+        return rows
+    kept = [row for row in rows if not _candidate_rejected_by_section(row, rejected_sections)]
+    latest_rejected_bar = 0
+    latest_rejected_time: Optional[float] = None
+    for rejected in rejected_sections:
+        if not isinstance(rejected, Mapping):
+            continue
+        try:
+            rejected_bar = int(rejected.get("clock_bar", 0) or 0)
+        except (TypeError, ValueError):
+            rejected_bar = 0
+        latest_rejected_bar = max(latest_rejected_bar, rejected_bar)
+        rejected_time = _finite_float(rejected.get("raw_time")) or _finite_float(rejected.get("timestamp"))
+        if rejected_time is not None:
+            latest_rejected_time = max(latest_rejected_time or 0.0, float(rejected_time))
+
+    if latest_rejected_bar >= 17 or (latest_rejected_time is not None and latest_rejected_time >= 24.0):
+        later_rows: List[Dict[str, Any]] = []
+        for row in kept:
+            visual = row.get("visual_components") if isinstance(row.get("visual_components"), Mapping) else {}
+            try:
+                candidate_bar = int(visual.get("clock_bar", 0) or 0)
+            except (TypeError, ValueError):
+                candidate_bar = 0
+            candidate_time = (
+                _finite_float(row.get("visual_raw_chunk_time"))
+                or _finite_float(row.get("timestamp"))
+                or _finite_float(row.get("snapped_sec"))
+                or _finite_float(row.get("time_sec"))
+            )
+            later_by_bar = bool(candidate_bar and candidate_bar > latest_rejected_bar + REJECTED_SECTION_BAR_RADIUS)
+            later_by_time = bool(
+                candidate_time is not None
+                and latest_rejected_time is not None
+                and float(candidate_time) > latest_rejected_time + REJECTED_SECTION_TIME_RADIUS_SEC
+            )
+            if later_by_bar or later_by_time:
+                later_rows.append(row)
+        if later_rows:
+            return later_rows
+    return kept or rows
 
 
 def _mean(values: Sequence[float]) -> float:
@@ -1135,20 +1225,33 @@ def _structure_section_guard_candidate(audio_path: str, selected: Mapping[str, A
     return guarded
 
 
-def visual_first_marker(audio_path: str, *, sample_rate: int = 16000, use_cache: bool = True) -> Dict[str, Any]:
+def visual_first_marker(
+    audio_path: str,
+    *,
+    sample_rate: int = 16000,
+    use_cache: bool = True,
+    rejected_sections: Optional[Sequence[Mapping[str, Any]]] = None,
+) -> Dict[str, Any]:
+    rejected_sections = list(rejected_sections or [])
     visual_v2: Optional[Dict[str, Any]] = None
     try:
         from .visual_drop_v2 import visual_drop_v2_marker
 
         visual_v2 = dict(visual_drop_v2_marker(audio_path, sample_rate=int(sample_rate), use_cache=use_cache))
-        if _use_visual_drop_v2_result(visual_v2):
+        selected_v2 = (
+            visual_v2.get("selected_candidate")
+            if isinstance(visual_v2.get("selected_candidate"), Mapping)
+            else {}
+        )
+        if _use_visual_drop_v2_result(visual_v2) and not _candidate_rejected_by_section(selected_v2, rejected_sections):
             return dict(visual_v2)
     except Exception:
         visual_v2 = None
 
     feature_map = compute_bar_feature_map(audio_path, sample_rate=int(sample_rate), use_cache=use_cache)
     candidates = visual_chunk_candidates(feature_map)
-    selected = select_first_visual_chunk(candidates)
+    candidates_for_selection = _filter_rejected_sections(candidates, rejected_sections)
+    selected = select_first_visual_chunk(candidates_for_selection)
     if selected is None:
         return {
             "ok": False,
@@ -1165,7 +1268,7 @@ def visual_first_marker(audio_path: str, *, sample_rate: int = 16000, use_cache:
     guarded = _structure_section_guard_candidate(audio_path, selected)
     if guarded is not None:
         selected = guarded
-        candidates = [dict(guarded)] + [dict(row) for row in candidates]
+        candidates_for_selection = [dict(guarded)] + [dict(row) for row in candidates_for_selection]
 
     raw_time = float(selected.get("timestamp", 0.0) or 0.0)
     try:
@@ -1254,9 +1357,9 @@ def visual_first_marker(audio_path: str, *, sample_rate: int = 16000, use_cache:
         f"{selected.get('reason')}; zoomed from visual block edge "
         f"{raw_time:.6f}s to transient/body {marker:.6f}s"
     )
-    if candidates:
+    if candidates_for_selection:
         deduped: List[Dict[str, Any]] = [dict(selected)]
-        for candidate in candidates:
+        for candidate in candidates_for_selection:
             if abs(float(candidate.get("timestamp", 0.0) or 0.0) - marker) > 0.010:
                 deduped.append(dict(candidate))
         candidates = deduped[:10]

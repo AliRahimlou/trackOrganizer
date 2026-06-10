@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 
 from web_review import (
+    ReviewApp,
     _apply_even_bar_prior,
     _apply_post_structure_selection_guard,
     _boundary_variant_candidates,
@@ -101,6 +102,41 @@ def test_visual_primary_phrase_prior_keeps_zoomed_visual_first_primary_bar_marke
     )
 
     assert result is None
+
+
+def test_apply_visual_first_result_selects_candidate_matching_blue_marker() -> None:
+    app = ReviewApp.__new__(ReviewApp)
+    stale_phrase = _candidate(55.35327891156462, rank=1, score=0.70, micro=0.90)
+    stale_phrase.update({"selected_by": "visual_primary_phrase_prior"})
+    visual_marker = _candidate(82.60951537798219, rank=2, score=0.66, micro=0.92)
+    visual_marker.update(
+        {
+            "selected_by": "visual_gui_first_fat_block",
+            "visual_components": {"clock_bar": 49},
+            "reason": "visual-only selected first real fat waveform block",
+        }
+    )
+    item = {
+        "top_10_candidates": [stale_phrase],
+        "confidence_tier": "LOW",
+    }
+
+    ok = app._apply_visual_first_result(
+        item,
+        {
+            "ok": True,
+            "version": 1,
+            "marker": visual_marker["timestamp"],
+            "raw_visual_time": 82.40135211267607,
+            "selected_candidate": stale_phrase,
+            "candidates": [visual_marker],
+        },
+    )
+
+    assert ok is True
+    assert item["ai_pick"] == visual_marker["timestamp"]
+    assert item["selected_candidate"]["timestamp"] == visual_marker["timestamp"]
+    assert item["top_10_candidates"][0]["timestamp"] == visual_marker["timestamp"]
 
 
 def test_boundary_variants_do_not_promote_raw_clock_boundary_without_visual_support() -> None:
