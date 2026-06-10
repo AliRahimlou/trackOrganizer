@@ -4,7 +4,13 @@ from pathlib import Path
 
 import pytest
 
-from drop_aligner.visual_first import _zoomed_marker_time, select_first_visual_chunk, visual_chunk_candidates, visual_first_marker
+from drop_aligner.visual_first import (
+    _use_visual_drop_v2_result,
+    _zoomed_marker_time,
+    select_first_visual_chunk,
+    visual_chunk_candidates,
+    visual_first_marker,
+)
 from drop_aligner.visual_drop_v2 import select_visual_drop_v2, visual_drop_v2_candidates
 
 
@@ -70,6 +76,56 @@ def _component_feature_map(rows: list[dict], *, bpm: float = 60.0, with_roles: b
     }
 
 
+def _candidate(
+    timestamp: float,
+    clock_bar: int,
+    *,
+    score: float,
+    phrase_prior: float = 0.18,
+    post4: float = 0.60,
+    post8: float = 0.60,
+    bass: float = 0.40,
+    drum: float = 1.0,
+    pre_drum: float = 0.10,
+    local_gap: float = 0.20,
+    local_reentry: bool = True,
+    phrase_body_shift: bool = False,
+    bpm: float = 144.0,
+) -> dict:
+    return {
+        "timestamp": timestamp,
+        "score": score,
+        "confidence_score": score,
+        "reason": "test candidate",
+        "visual_components": {
+            "clock_bar": clock_bar,
+            "phrase_prior": phrase_prior,
+            "post4_height": post4,
+            "post8_height": post8,
+            "post_bass8": bass,
+            "post_drum8": drum,
+            "pre4_height": 0.25,
+            "pre8_height": 0.20,
+            "pre_inst4": 0.20,
+            "post_inst8": 0.20,
+            "pre_vocal4": 0.20,
+            "post_vocal8": 0.20,
+            "drum_continuity": drum,
+            "pre_drum_cont4": pre_drum,
+            "post_drum_cont4": drum,
+            "post_drum_cont8": drum,
+            "local_reentry": local_reentry,
+            "local_reentry_gap": local_gap,
+            "phrase_body_shift": phrase_body_shift,
+            "jump4": 0.15,
+            "jump8": 0.15,
+            "prev1_height": 0.20,
+            "prev2_height": 0.20,
+        },
+        "bpm_clock": {"bpm": bpm},
+    }
+
+
 def test_visual_first_skips_smaller_buildup_when_next_block_is_bigger() -> None:
     heights = [0.16] * 16 + [0.50] * 8 + [0.72] * 24
     candidates = visual_chunk_candidates(_feature_map(heights))
@@ -78,6 +134,44 @@ def test_visual_first_skips_smaller_buildup_when_next_block_is_bigger() -> None:
 
     assert selected is not None
     assert selected["visual_components"]["clock_bar"] == 25
+
+
+def test_visual_first_shifts_opening_edge_to_stronger_phrase_body() -> None:
+    candidates = [
+        _candidate(15.0, 10, score=0.685, phrase_prior=0.18, post4=0.763, post8=0.760, bass=0.566),
+        _candidate(
+            26.667,
+            17,
+            score=0.729,
+            phrase_prior=0.94,
+            post4=0.800,
+            post8=0.807,
+            bass=0.636,
+            pre_drum=1.0,
+            local_gap=0.072,
+            local_reentry=False,
+            phrase_body_shift=True,
+        ),
+    ]
+
+    selected = select_first_visual_chunk(candidates)
+
+    assert selected is not None
+    assert selected["visual_components"]["clock_bar"] == 17
+    assert selected["visual_edge_replaced_candidate"]["clock_bar"] == 10
+
+
+def test_visual_first_shifts_off_phrase_edge_to_adjacent_phrase_edge() -> None:
+    candidates = [
+        _candidate(42.488, 26, score=0.703, phrase_prior=0.18, post4=0.652, post8=0.679, bass=0.546, pre_drum=0.07),
+        _candidate(44.155, 27, score=0.714, phrase_prior=0.48, post4=0.685, post8=0.677, bass=0.544, pre_drum=0.20),
+    ]
+
+    selected = select_first_visual_chunk(candidates)
+
+    assert selected is not None
+    assert selected["visual_components"]["clock_bar"] == 27
+    assert selected["visual_edge_replaced_candidate"]["clock_bar"] == 26
 
 
 def test_visual_first_skips_early_jump_when_later_block_is_clearly_taller() -> None:
@@ -243,6 +337,43 @@ def test_visual_drop_v2_keeps_clear_song_start_drop_over_slightly_later_body() -
     assert selected is not None
     assert selected["visual_components"]["clock_bar"] == 9
     assert "protected first clear song-start drop section" in selected["reason"]
+
+
+def test_visual_first_only_uses_v2_clear_start_for_later_intro_phrase() -> None:
+    base_result = {
+        "ok": True,
+        "raw_visual_time": 14.8,
+        "feature_map": {
+            "beatgrid": {
+                "bpm": 142.0,
+                "first_low_downbeat_sec": 18.2,
+            }
+        },
+        "selected_candidate": {
+            "score": 0.62,
+            "reason": "visual-v2 protected first clear song-start drop section",
+            "visual_components": {
+                "clock_bar": 9,
+                "body_score": 0.64,
+                "post4_height": 0.70,
+                "post8_height": 0.66,
+                "post_bass8": 0.45,
+                "pre_drum_cont4": 0.10,
+                "transition": 0.24,
+            },
+        },
+    }
+
+    assert _use_visual_drop_v2_result(base_result) is False
+
+    later_phrase = dict(base_result)
+    later_phrase["raw_visual_time"] = 30.4
+    later_phrase["feature_map"] = {"beatgrid": {"bpm": 142.0, "first_low_downbeat_sec": 30.4}}
+    later_phrase["selected_candidate"] = dict(base_result["selected_candidate"])
+    later_phrase["selected_candidate"]["visual_components"] = dict(base_result["selected_candidate"]["visual_components"])
+    later_phrase["selected_candidate"]["visual_components"]["clock_bar"] = 19
+
+    assert _use_visual_drop_v2_result(later_phrase) is True
 
 
 def test_visual_first_uses_phrase_body_shift_when_waveform_is_dense_from_start() -> None:

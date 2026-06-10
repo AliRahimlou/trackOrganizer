@@ -24,6 +24,16 @@ def _clip01(value: Any) -> float:
     return float(np.clip(number, 0.0, 1.0))
 
 
+def _finite_float(value: Any) -> Optional[float]:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(number):
+        return None
+    return float(number)
+
+
 def _use_visual_drop_v2_result(result: Mapping[str, Any]) -> bool:
     if not result.get("ok"):
         return False
@@ -50,10 +60,25 @@ def _use_visual_drop_v2_result(result: Mapping[str, Any]) -> bool:
         and score >= 0.580
         and body >= 0.700
     )
+    raw_time = (
+        _finite_float(result.get("raw_visual_time"))
+        or _finite_float(selected.get("visual_raw_chunk_time"))
+        or _finite_float(selected.get("timestamp"))
+        or 0.0
+    )
+    first_low_downbeat = _finite_float(beatgrid.get("first_low_downbeat_sec"))
+    honors_clock_intro = bool(
+        first_low_downbeat is None
+        or first_low_downbeat <= 0.0
+        or raw_time >= first_low_downbeat - 0.250
+    )
+    # This branch is intentionally narrower than the v2 selector. It is only a
+    # shortcut for later intro phrase starts; very early b9/b10 hits still fall
+    # back to the older visual/candidate flow, which has better reviewed data.
     clear_song_start_gate = bool(
         "protected first clear song-start drop section" in reason
         and bpm >= 141.5
-        and 9 <= clock_bar <= 21
+        and 17 <= clock_bar <= 21
         and score >= 0.430
         and body >= 0.560
         and post4 >= 0.550
@@ -61,6 +86,7 @@ def _use_visual_drop_v2_result(result: Mapping[str, Any]) -> bool:
         and bass >= 0.300
         and pre_drum <= 0.250
         and transition >= 0.150
+        and honors_clock_intro
     )
     return bool(later_drop_gate or clear_song_start_gate)
 
@@ -324,6 +350,10 @@ def select_first_visual_chunk(candidates: Sequence[Mapping[str, Any]]) -> Option
     def phrase_prior(row: Mapping[str, Any]) -> float:
         return float(comp(row).get("phrase_prior", 0.0) or 0.0)
 
+    def bpm_for(row: Mapping[str, Any]) -> float:
+        clock = row.get("bpm_clock") if isinstance(row.get("bpm_clock"), Mapping) else {}
+        return float(clock.get("bpm", 0.0) or 0.0)
+
     def prev1(row: Mapping[str, Any]) -> float:
         return float(comp(row).get("prev1_height", 0.0) or 0.0)
 
@@ -371,6 +401,56 @@ def select_first_visual_chunk(candidates: Sequence[Mapping[str, Any]]) -> Option
             and post_drum_cont8(row) >= 0.900
             and drum(row) >= 0.950
         )
+
+    def same_opening_block_upgrade(selected: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+        selected_bar = clock_bar(selected)
+        selected_score = float(selected.get("score", selected.get("confidence_score", 0.0)) or 0.0)
+        selected_bpm = bpm_for(selected)
+        if selected_bpm < 141.5:
+            return None
+        for later in rows:
+            later_bar = clock_bar(later)
+            if later_bar <= selected_bar:
+                continue
+            later_score = float(later.get("score", later.get("confidence_score", 0.0)) or 0.0)
+            early_phrase_body_edge = bool(
+                selected_bar <= 12
+                and later_bar <= selected_bar + 8
+                and later_score >= selected_score + 0.035
+                and phrase_prior(later) >= 0.860
+                and (is_phrase_body_shift(later) or phrase_prior(later) >= phrase_prior(selected) + 0.300)
+                and post4(later) >= post4(selected) - 0.020
+                and post8(later) >= post8(selected) - 0.020
+                and bass(later) >= bass(selected) + 0.035
+                and drum(later) >= 0.950
+            )
+            adjacent_phrase_edge = bool(
+                21 <= selected_bar <= 33
+                and later_bar <= selected_bar + 1
+                and phrase_prior(selected) <= 0.250
+                and phrase_prior(later) >= phrase_prior(selected) + 0.250
+                and later_score >= selected_score + 0.005
+                and post4(later) >= post4(selected) + 0.015
+                and post8(later) >= post8(selected) - 0.015
+                and bass(later) >= bass(selected) - 0.015
+                and pre_drum_cont(later) <= 0.260
+            )
+            if early_phrase_body_edge or adjacent_phrase_edge:
+                upgraded = dict(later)
+                upgraded["selected_by"] = "visual_gui_first_fat_block"
+                upgraded["reason"] = (
+                    "visual-only shifted to stronger phrase/body edge inside same opening block; "
+                    f"{later.get('reason') or 'nearby phrase/body edge'}"
+                )
+                upgraded["visual_edge_replaced_candidate"] = {
+                    "timestamp": float(selected.get("timestamp", 0.0) or 0.0),
+                    "clock_bar": int(selected_bar),
+                    "score": float(selected_score),
+                    "phrase_prior": float(phrase_prior(selected)),
+                    "reason": str(selected.get("reason") or ""),
+                }
+                return upgraded
+        return None
 
     for row in rows:
         row_bar = clock_bar(row)
@@ -652,6 +732,9 @@ def select_first_visual_chunk(candidates: Sequence[Mapping[str, Any]]) -> Option
         selected = dict(row)
         selected["selected_by"] = "visual_gui_first_fat_block"
         selected["reason"] = "visual-only selected first real fat waveform block; smaller earlier buildup/fake block skipped"
+        upgraded = same_opening_block_upgrade(selected)
+        if upgraded is not None:
+            return upgraded
         return selected
     selected = dict(rows[0])
     selected["selected_by"] = "visual_gui_first_fat_block"
