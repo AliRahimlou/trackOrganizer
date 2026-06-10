@@ -858,23 +858,6 @@ def _zoomed_marker_time(
     visual = visual_components if isinstance(visual_components, Mapping) else {}
     pre4 = _clip01(visual.get("pre4_height", 0.0))
     jump4 = float(visual.get("jump4", 0.0) or 0.0) if visual else 0.0
-    if (
-        marker > float(raw_time) + 0.350
-        and micro_conf is not None
-        and micro_conf < 0.80
-        and pre4 >= 0.500
-        and jump4 <= 0.120
-    ):
-        return float(raw_time)
-    if marker < float(raw_time) - 0.050:
-        for key in ("impact_body_time", "visual_onset_knee_time", "centerline_boundary_time", "attack_start_time", "peak_time"):
-            value = _micro_time(micro, key)
-            if value is not None and float(raw_time) - 0.050 <= value <= float(raw_time) + 1.250:
-                return float(value)
-        return float(raw_time)
-    if marker > float(raw_time) + 1.250:
-        return float(raw_time)
-    visual = visual_components if isinstance(visual_components, Mapping) else {}
     post_drum = _clip01(visual.get("post_drum8", 0.0))
     post_bass = _clip01(visual.get("post_bass8", 0.0))
     pre_drum = _clip01(visual.get("pre_drum_cont4", 0.0))
@@ -905,6 +888,50 @@ def _zoomed_marker_time(
         zero_quality = float(micro.get("zero_crossing_quality", 0.0) or 0.0)
     except (TypeError, ValueError):
         zero_quality = 0.0
+    try:
+        rms_rise = float(micro.get("rms_rise_score", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        rms_rise = 0.0
+    try:
+        peak_rise = float(micro.get("peak_rise_score", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        peak_rise = 0.0
+    if (
+        marker > float(raw_time) + 0.350
+        and micro_conf is not None
+        and micro_conf < 0.80
+        and pre4 >= 0.500
+        and jump4 <= 0.120
+    ):
+        busy_buildup_late_bang = bool(
+            attack_time is not None
+            and float(raw_time) + 0.550 <= float(attack_time) <= float(raw_time) + 1.350
+            and post_drum >= 0.78
+            and post_bass >= 0.30
+            and attack_strength >= 0.65
+            and denoised_impact >= 0.75
+            and (
+                (attack_clean >= 0.54 and impact_conf >= 0.40)
+                or (rms_rise >= 0.75 and peak_rise >= 0.75)
+            )
+        )
+        if busy_buildup_late_bang:
+            if (
+                zero_time is not None
+                and zero_quality >= 0.45
+                and float(attack_time) - 0.035 <= float(zero_time) <= float(attack_time) + 0.015
+            ):
+                return float(zero_time)
+            return float(attack_time)
+        return float(raw_time)
+    if marker < float(raw_time) - 0.050:
+        for key in ("impact_body_time", "visual_onset_knee_time", "centerline_boundary_time", "attack_start_time", "peak_time"):
+            value = _micro_time(micro, key)
+            if value is not None and float(raw_time) - 0.050 <= value <= float(raw_time) + 1.250:
+                return float(value)
+        return float(raw_time)
+    if marker > float(raw_time) + 1.250:
+        return float(raw_time)
     early_knee_before_bang = bool(
         knee_used
         and knee_time is not None

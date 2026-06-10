@@ -229,6 +229,34 @@ def test_zoomed_marker_prefers_clean_impact_when_visual_knee_is_early() -> None:
     assert marker == pytest.approx(83.22078521925202)
 
 
+def test_zoomed_marker_prefers_late_bang_over_busy_visual_edge() -> None:
+    marker = _zoomed_marker_time(
+        98.02816901408451,
+        {
+            "microaligned_time": 98.93215994378973,
+            "attack_start_time": 99.14079939957203,
+            "zero_crossing_time": 99.13798760818882,
+            "zero_crossing_quality": 0.926,
+            "attack_cleanliness": 0.566,
+            "attack_peak_strength": 1.0,
+            "impact_boundary_confidence": 0.468,
+            "denoised_impact_strength": 1.0,
+            "rms_rise_score": 0.972,
+            "peak_rise_score": 1.0,
+            "micro_confidence": 0.419,
+        },
+        {
+            "pre4_height": 0.611,
+            "jump4": 0.057,
+            "post_drum8": 1.0,
+            "post_bass8": 0.460,
+            "pre_drum_cont4": 0.532,
+        },
+    )
+
+    assert marker == pytest.approx(99.13798760818882)
+
+
 def test_visual_first_skips_early_jump_when_later_block_is_clearly_taller() -> None:
     heights = [0.34] * 16 + [0.56] * 8 + [0.61] * 8 + [0.70] * 24
     candidates = visual_chunk_candidates(_feature_map(heights))
