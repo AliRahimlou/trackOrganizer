@@ -874,6 +874,60 @@ def _zoomed_marker_time(
         return float(raw_time)
     if marker > float(raw_time) + 1.250:
         return float(raw_time)
+    visual = visual_components if isinstance(visual_components, Mapping) else {}
+    post_drum = _clip01(visual.get("post_drum8", 0.0))
+    post_bass = _clip01(visual.get("post_bass8", 0.0))
+    pre_drum = _clip01(visual.get("pre_drum_cont4", 0.0))
+    attack_time = _micro_time(micro, "attack_start_time")
+    zero_time = _micro_time(micro, "zero_crossing_time")
+    knee_time = _micro_time(micro, "visual_onset_knee_time")
+    try:
+        knee_used = bool(float(micro.get("visual_onset_knee_used", 0.0) or 0.0) > 0.0)
+    except (TypeError, ValueError):
+        knee_used = False
+    try:
+        attack_clean = float(micro.get("attack_cleanliness", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        attack_clean = 0.0
+    try:
+        attack_strength = float(micro.get("attack_peak_strength", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        attack_strength = 0.0
+    try:
+        impact_conf = float(micro.get("impact_boundary_confidence", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        impact_conf = 0.0
+    try:
+        denoised_impact = float(micro.get("denoised_impact_strength", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        denoised_impact = 0.0
+    try:
+        zero_quality = float(micro.get("zero_crossing_quality", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        zero_quality = 0.0
+    early_knee_before_bang = bool(
+        knee_used
+        and knee_time is not None
+        and attack_time is not None
+        and abs(float(marker) - float(knee_time)) <= 0.035
+        and float(attack_time) >= float(marker) + 0.300
+        and float(attack_time) <= float(raw_time) + 1.150
+        and post_drum >= 0.78
+        and post_bass >= 0.24
+        and pre_drum <= 0.20
+        and attack_clean >= 0.78
+        and attack_strength >= 0.52
+        and impact_conf >= 0.70
+        and denoised_impact >= 0.66
+    )
+    if early_knee_before_bang:
+        if (
+            zero_time is not None
+            and zero_quality >= 0.45
+            and float(attack_time) - 0.030 <= float(zero_time) <= float(attack_time) + 0.010
+        ):
+            return float(zero_time)
+        return float(attack_time)
     return float(marker)
 
 
