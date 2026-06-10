@@ -3181,6 +3181,8 @@ class ReviewApp:
         if _is_historical_candidate(selected):
             item["selected_candidate"] = {}
             item["selected_by"] = ""
+        if scan and item.get("visual_first_scanned") and item.get("visual_first_scan") and not item.get("visual_first_scan_error"):
+            return
         if scan and not item.get("visual_first_scanned"):
             item["visual_first_scanned"] = True
             memory = self._review_memory_for_item(item)

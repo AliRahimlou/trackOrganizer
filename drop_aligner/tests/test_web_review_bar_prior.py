@@ -139,6 +139,32 @@ def test_apply_visual_first_result_selects_candidate_matching_blue_marker() -> N
     assert item["top_10_candidates"][0]["timestamp"] == visual_marker["timestamp"]
 
 
+def test_visual_first_refresh_preserves_successful_visual_scan() -> None:
+    app = ReviewApp.__new__(ReviewApp)
+    visual_marker = _candidate(82.60951537798219, rank=1, score=0.66, micro=0.92)
+    visual_marker.update(
+        {
+            "selected_by": "visual_gui_first_fat_block",
+            "visual_components": {"clock_bar": 49},
+        }
+    )
+    stale_phrase = _candidate(55.35327891156462, rank=2, score=0.70, micro=0.90)
+    stale_phrase.update({"selected_by": "visual_primary_phrase_prior"})
+    item = {
+        "top_10_candidates": [visual_marker, stale_phrase],
+        "selected_candidate": dict(visual_marker),
+        "selected_by": "visual_gui_first_fat_block",
+        "visual_first_scanned": True,
+        "visual_first_scan": {"marker": visual_marker["timestamp"], "source": "visual_gui_first_fat_block"},
+        "confidence_tier": "LOW",
+    }
+
+    app._prime_item_with_visual_candidate(item, scan=True)
+
+    assert item["selected_candidate"]["timestamp"] == visual_marker["timestamp"]
+    assert item["top_10_candidates"][0]["timestamp"] == visual_marker["timestamp"]
+
+
 def test_boundary_variants_do_not_promote_raw_clock_boundary_without_visual_support() -> None:
     candidate = _candidate(27.428571, rank=1, score=0.80, micro=0.91)
     candidate["microalign"].update(
