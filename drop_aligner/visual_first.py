@@ -82,7 +82,7 @@ def _role_feature(bar: Mapping[str, Any], role: str, key: str) -> float:
     return _clip01(data.get(key, 0.0))
 
 
-def visual_chunk_candidates(feature_map: Mapping[str, Any], *, min_clock_bar: int = 9, max_clock_bar: int = 81) -> List[Dict[str, Any]]:
+def visual_chunk_candidates(feature_map: Mapping[str, Any], *, min_clock_bar: int = 5, max_clock_bar: int = 81) -> List[Dict[str, Any]]:
     bars = [dict(row) for row in feature_map.get("bars") or [] if isinstance(row, Mapping)]
     beatgrid = feature_map.get("beatgrid") if isinstance(feature_map.get("beatgrid"), Mapping) else {}
     if len(bars) < 8:
@@ -103,6 +103,9 @@ def visual_chunk_candidates(feature_map: Mapping[str, Any], *, min_clock_bar: in
         one_distance_ms = 999999.0 if one_distance_value is None else float(one_distance_value)
         if clock_bar < int(min_clock_bar) or clock_bar > int(max_clock_bar):
             continue
+        bpm_value = float(beatgrid.get("bpm", 0.0) or 0.0)
+        if clock_bar < 9 and bpm_value < 141.5:
+            continue
 
         post4 = _window_mean(heights, idx, idx + 4)
         post8 = _window_mean(heights, idx, idx + 8)
@@ -115,9 +118,12 @@ def visual_chunk_candidates(feature_map: Mapping[str, Any], *, min_clock_bar: in
         local_bar = float(heights[idx])
         phrase_prior, phrase_name = phrase_strength_for_bar(clock_bar)
         post_bass8 = _window_mean(bass_heights, idx, idx + 8)
+        pre_bass4 = _window_mean(bass_heights, idx - 4, idx)
         post_drum8 = _window_mean(drum_heights, idx, idx + 8)
         post_inst8 = _window_mean(inst_heights, idx, idx + 8)
+        pre_inst4 = _window_mean(inst_heights, idx - 4, idx)
         post_vocal8 = _window_mean(vocal_heights, idx, idx + 8)
+        pre_vocal4 = _window_mean(vocal_heights, idx - 4, idx)
         local_drum_continuity = float(drum_continuity[idx]) if idx < len(drum_continuity) else 0.0
         pre_drum_cont4 = _window_mean(drum_continuity, idx - 4, idx)
         post_drum_cont4 = _window_mean(drum_continuity, idx, idx + 4)
@@ -137,7 +143,21 @@ def visual_chunk_candidates(feature_map: Mapping[str, Any], *, min_clock_bar: in
             and post4 >= max(0.50, 0.78 * max_post8)
             and post8 >= max(0.50, 0.78 * max_post8)
         )
-        if not on_phrase_one and not local_reentry and not continuity_transition:
+        phrase_body_shift = bool(
+            on_phrase_one
+            and phrase_prior >= 0.86
+            and post4 >= max(0.50, 0.74 * max_post8)
+            and post8 >= max(0.50, 0.74 * max_post8)
+            and post_drum_cont4 >= 0.62
+            and post_bass8 >= 0.36
+            and (
+                post_bass8 >= pre_bass4 + 0.055
+                or pre_inst4 >= post_inst8 + 0.180
+                or pre_vocal4 >= post_vocal8 + 0.150
+                or pre4 <= post4 - 0.085
+            )
+        )
+        if not on_phrase_one and not local_reentry and not continuity_transition and not phrase_body_shift:
             continue
         sustained_bars = sum(1 for value in heights[idx : min(len(heights), idx + 8)] if value >= max(0.42, post8 - 0.08))
         sustained = _clip01(sustained_bars / 6.0)
@@ -149,6 +169,7 @@ def visual_chunk_candidates(feature_map: Mapping[str, Any], *, min_clock_bar: in
             or (local_bar >= pre4 + 0.105 and post4 >= max(0.42, pre4 + 0.035))
             or local_reentry
             or continuity_transition
+            or phrase_body_shift
         )
         visually_large = bool(post8 >= max(0.44, 0.72 * max_post8) or post4 >= max(0.48, 0.74 * max_post8))
         if not starts_block or not visually_large:
@@ -185,6 +206,8 @@ def visual_chunk_candidates(feature_map: Mapping[str, Any], *, min_clock_bar: in
                 "reason": (
                     "visual-only local waveform re-entry candidate"
                     if local_reentry
+                    else "visual-only phrase body-shift drop candidate"
+                    if phrase_body_shift
                     else "visual-only first sustained waveform block candidate"
                 ),
                 "structure_role": "first_drop",
@@ -211,13 +234,17 @@ def visual_chunk_candidates(feature_map: Mapping[str, Any], *, min_clock_bar: in
                     "local_reentry": bool(local_reentry),
                     "local_reentry_gap": float(local_reentry_gap),
                     "post_bass8": float(post_bass8),
+                    "pre_bass4": float(pre_bass4),
                     "post_drum8": float(post_drum8),
                     "post_inst8": float(post_inst8),
+                    "pre_inst4": float(pre_inst4),
                     "post_vocal8": float(post_vocal8),
+                    "pre_vocal4": float(pre_vocal4),
                     "drum_continuity": float(local_drum_continuity),
                     "pre_drum_cont4": float(pre_drum_cont4),
                     "post_drum_cont4": float(post_drum_cont4),
                     "post_drum_cont8": float(post_drum_cont8),
+                    "phrase_body_shift": bool(phrase_body_shift),
                     "one_distance_ms": float(one_distance_ms),
                 },
                 "bpm_clock": dict(clock),
@@ -264,6 +291,12 @@ def select_first_visual_chunk(candidates: Sequence[Mapping[str, Any]]) -> Option
     def vocal(row: Mapping[str, Any]) -> float:
         return float(comp(row).get("post_vocal8", 0.0) or 0.0)
 
+    def pre_inst(row: Mapping[str, Any]) -> float:
+        return float(comp(row).get("pre_inst4", 0.0) or 0.0)
+
+    def pre_vocal(row: Mapping[str, Any]) -> float:
+        return float(comp(row).get("pre_vocal4", 0.0) or 0.0)
+
     def drum(row: Mapping[str, Any]) -> float:
         return float(comp(row).get("post_drum8", 0.0) or 0.0)
 
@@ -302,6 +335,9 @@ def select_first_visual_chunk(candidates: Sequence[Mapping[str, Any]]) -> Option
 
     def is_local_reentry(row: Mapping[str, Any]) -> bool:
         return bool(comp(row).get("local_reentry"))
+
+    def is_phrase_body_shift(row: Mapping[str, Any]) -> bool:
+        return bool(comp(row).get("phrase_body_shift"))
 
     def first_clean_dense_reentry(row: Mapping[str, Any]) -> bool:
         return bool(
@@ -423,6 +459,42 @@ def select_first_visual_chunk(candidates: Sequence[Mapping[str, Any]]) -> Option
                     )
                 )
             )
+            early_dense_intro_to_later_body = bool(
+                row_bar <= 17
+                and 31 <= later_bar <= 37
+                and (is_phrase_body_shift(later) or is_local_reentry(later) or phrase_prior(later) >= 0.86)
+                and post_drum_cont(later) >= 0.780
+                and drum(later) >= 0.950
+                and post4(later) >= post4(row) - 0.120
+                and post8(later) >= post8(row) - 0.130
+                and bass(later) >= bass(row) - 0.020
+                and (
+                    bass(later) >= bass(row) + 0.050
+                    or inst(later) <= inst(row) - 0.300
+                    or pre_inst(later) >= inst(later) + 0.180
+                    or pre_vocal(later) >= vocal(later) + 0.150
+                    or (
+                        pre4(later) <= post4(later) - 0.075
+                        and post_drum_cont(later) >= 0.780
+                    )
+                )
+            )
+            mid_intro_to_phrase_body = bool(
+                21 <= row_bar <= 25
+                and 31 <= later_bar <= 37
+                and later_bar <= row_bar + 12
+                and (is_phrase_body_shift(later) or is_local_reentry(later) or phrase_prior(later) >= 0.86)
+                and post_drum_cont(later) >= 0.780
+                and drum(later) >= 0.950
+                and post4(later) >= post4(row) - 0.055
+                and post8(later) >= post8(row) - 0.050
+                and bass(later) >= bass(row) + 0.035
+                and (
+                    pre4(later) <= post4(later) - 0.070
+                    or post_drum_cont(later) >= post_drum_cont(row) + 0.120
+                    or phrase_prior(later) >= phrase_prior(row) + 0.120
+                )
+            )
             nearby_bass_body_upgrade = bool(
                 21 <= row_bar <= 33
                 and later_bar <= row_bar + 8
@@ -461,6 +533,8 @@ def select_first_visual_chunk(candidates: Sequence[Mapping[str, Any]]) -> Option
                 or phrase_intro_to_drop
                 or post_intro_breakdown_reentry
                 or intro_break_to_later_drum_drop
+                or early_dense_intro_to_later_body
+                or mid_intro_to_phrase_body
             ):
                 continue
             height_wins = post8(later) >= post8(row) + max(0.050, 0.075 * max(0.1, post8(row)))
@@ -483,6 +557,9 @@ def select_first_visual_chunk(candidates: Sequence[Mapping[str, Any]]) -> Option
                 and post4(later) >= post4(row) + 0.115
                 and bass(later) >= bass(row) + 0.070
             )
+            texture_heavy_intro = bool(inst(row) >= 0.650 and vocal(row) >= 0.500)
+            if first_clean_dense_reentry(row) and not texture_heavy_intro and not overwhelming_later_drop:
+                continue
             protected_first_dense_transition = bool(
                 row_bar <= 33
                 and first_dense_transition(row)
@@ -490,6 +567,8 @@ def select_first_visual_chunk(candidates: Sequence[Mapping[str, Any]]) -> Option
                 and not phrase_intro_to_drop
                 and not post_intro_breakdown_reentry
                 and not nearby_phrase_body_after_predrop
+                and not early_dense_intro_to_later_body
+                and not mid_intro_to_phrase_body
                 and not overwhelming_later_drop
             )
             if protected_first_dense_transition:
@@ -513,6 +592,8 @@ def select_first_visual_chunk(candidates: Sequence[Mapping[str, Any]]) -> Option
                 and not buildup_to_bass_drop
                 and not post_gap_drum_slam
                 and not intro_break_to_later_drum_drop
+                and not early_dense_intro_to_later_body
+                and not mid_intro_to_phrase_body
                 and not nearby_bass_body_upgrade
                 and not drum_stem_body_takeover
                 and not sparse_to_dense_drum_drop
@@ -533,6 +614,8 @@ def select_first_visual_chunk(candidates: Sequence[Mapping[str, Any]]) -> Option
                 or buildup_to_bass_drop
                 or post_gap_drum_slam
                 or intro_break_to_later_drum_drop
+                or early_dense_intro_to_later_body
+                or mid_intro_to_phrase_body
                 or nearby_bass_body_upgrade
                 or drum_stem_body_takeover
                 or sparse_to_dense_drum_drop

@@ -179,6 +179,50 @@ def test_visual_first_keeps_first_clean_dense_reentry_over_nearby_body() -> None
     assert selected["visual_components"]["clock_bar"] == 9
 
 
+def test_visual_first_allows_guarded_early_body_before_bar_nine() -> None:
+    rows = [{"height": 0.14, "drum_cont": 0.0} for _ in range(20)]
+    rows[4] = {"aggregate": 0.46, "groove": 0.52, "bass": 0.42, "drum": 0.80, "inst": 0.54, "vocal": 0.15, "drum_cont": 0.50}
+    rows[5] = {"height": 0.20, "drum": 0.75, "drum_cont": 0.30}
+    for idx in range(6, 14):
+        rows[idx] = {"aggregate": 0.82, "groove": 0.86, "bass": 0.84, "drum": 1.0, "inst": 0.62, "vocal": 0.30, "drum_cont": 1.0}
+    candidates = visual_chunk_candidates(_component_feature_map(rows, bpm=142.0, with_roles=True))
+
+    selected = select_first_visual_chunk(candidates)
+
+    assert selected is not None
+    assert selected["visual_components"]["clock_bar"] == 7
+
+
+def test_visual_first_skips_early_dense_intro_when_cleaner_32_bar_body_appears() -> None:
+    rows = [{"height": 0.12, "drum_cont": 0.0} for _ in range(44)]
+    for idx in range(4, 16):
+        rows[idx] = {"aggregate": 0.62, "groove": 0.66, "bass": 0.38, "drum": 1.0, "inst": 0.72, "vocal": 0.10, "drum_cont": 0.98}
+    for idx in range(16, 24):
+        rows[idx] = {"aggregate": 0.62, "groove": 0.66, "bass": 0.39, "drum": 1.0, "inst": 0.30, "vocal": 0.10, "drum_cont": 0.98}
+    for idx in range(28, 32):
+        rows[idx] = {"aggregate": 0.30, "groove": 0.34, "bass": 0.18, "drum": 0.65, "inst": 0.48, "vocal": 0.38, "drum_cont": 0.30}
+    for idx in range(32, 40):
+        rows[idx] = {"aggregate": 0.58, "groove": 0.66, "bass": 0.46, "drum": 1.0, "inst": 0.10, "vocal": 0.26, "drum_cont": 1.0}
+    candidates = visual_chunk_candidates(_component_feature_map(rows, bpm=140.0, with_roles=True))
+
+    selected = select_first_visual_chunk(candidates)
+
+    assert selected is not None
+    assert selected["visual_components"]["clock_bar"] == 33
+
+
+def test_visual_first_uses_phrase_body_shift_when_waveform_is_dense_from_start() -> None:
+    rows = [{"aggregate": 0.60, "groove": 0.65, "bass": 0.42, "drum": 1.0, "inst": 0.55, "vocal": 0.68, "drum_cont": 0.72} for _ in range(72)]
+    for idx in range(48, 56):
+        rows[idx] = {"aggregate": 0.60, "groove": 0.70, "bass": 0.58, "drum": 1.0, "inst": 0.30, "vocal": 0.22, "drum_cont": 0.86}
+    candidates = visual_chunk_candidates(_component_feature_map(rows, bpm=142.0, with_roles=True))
+
+    selected = select_first_visual_chunk(candidates)
+
+    assert selected is not None
+    assert selected["visual_components"]["clock_bar"] == 49
+
+
 def test_zoomed_marker_allows_forward_move_to_drop_body() -> None:
     marker = _zoomed_marker_time(
         27.428571,
