@@ -222,12 +222,36 @@ def _metric(candidate: Mapping[str, Any], key: str) -> float:
     return float(_components(candidate).get(key, 0.0) or 0.0)
 
 
+def _clear_song_start_drop(candidate: Mapping[str, Any]) -> bool:
+    return bool(
+        _clock_bar(candidate) <= 21
+        and float(candidate.get("score", 0.0) or 0.0) >= 0.430
+        and _metric(candidate, "body_score") >= 0.560
+        and _metric(candidate, "post4_height") >= 0.550
+        and _metric(candidate, "post8_height") >= 0.560
+        and _metric(candidate, "post_bass8") >= 0.300
+        and _metric(candidate, "pre_drum_cont4") <= 0.250
+        and _metric(candidate, "transition") >= 0.150
+    )
+
+
+def _overwhelming_later_upgrade(current: Mapping[str, Any], later: Mapping[str, Any]) -> bool:
+    return bool(
+        _metric(later, "post4_height") >= _metric(current, "post4_height") + 0.110
+        and _metric(later, "post8_height") >= _metric(current, "post8_height") + 0.080
+        and _metric(later, "post_bass8") >= _metric(current, "post_bass8") + 0.080
+        and float(later.get("score", 0.0) or 0.0) >= float(current.get("score", 0.0) or 0.0) - 0.020
+    )
+
+
 def _later_beats_intro_candidate(current: Mapping[str, Any], later: Mapping[str, Any]) -> bool:
     row_bar = _clock_bar(current)
     later_bar = _clock_bar(later)
     if row_bar > 21 or later_bar <= row_bar + 8 or later_bar > 57:
         return False
     if float(later.get("score", 0.0) or 0.0) < max(0.420, float(current.get("score", 0.0) or 0.0) - 0.120):
+        return False
+    if _clear_song_start_drop(current) and not _overwhelming_later_upgrade(current, later):
         return False
     comparable_body = bool(
         _metric(later, "body_score") >= max(0.54, _metric(current, "body_score") - 0.025)
@@ -265,6 +289,22 @@ def select_visual_drop_v2(candidates: Sequence[Mapping[str, Any]]) -> Optional[D
     scan_rows = [row for row in rows if _clock_bar(row) <= 81]
     early_intro_rows = [row for row in scan_rows if _clock_bar(row) <= 21]
     if early_intro_rows:
+        protected_starts = [row for row in early_intro_rows if _clear_song_start_drop(row)]
+        if protected_starts:
+            first_start = protected_starts[0]
+            has_overwhelming_upgrade = any(
+                _clock_bar(later) > _clock_bar(first_start) + 8
+                and _clock_bar(later) <= 57
+                and _overwhelming_later_upgrade(first_start, later)
+                for later in scan_rows
+            )
+            if not has_overwhelming_upgrade:
+                selected = dict(first_start)
+                selected["selected_by"] = "visual_drop_v2"
+                selected["reason"] = (
+                    "visual-v2 protected first clear song-start drop section; later sections were not stronger enough"
+                )
+                return selected
         intro_beating_later = [
             later
             for later in scan_rows
@@ -287,6 +327,10 @@ def select_visual_drop_v2(candidates: Sequence[Mapping[str, Any]]) -> Optional[D
         selected["reason"] = (
             "visual-v2 selected first full-song drop section; intro/build/fake block skipped"
         )
+        if _clear_song_start_drop(selected):
+            selected["reason"] = (
+                "visual-v2 protected first clear song-start drop section; later sections were not stronger enough"
+            )
         return selected
 
     selected = dict(scan_rows[0] if scan_rows else rows[0])

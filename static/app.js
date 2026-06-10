@@ -13,6 +13,7 @@ let correctionMode = false;
 let userPick = null;
 let pickedCandidate = null;
 let saveInFlight = false;
+let reviewActionInFlight = false;
 let refinedPick = null;
 let refinedInfo = null;
 let pendingAutoPlacePick = null;
@@ -824,9 +825,25 @@ function markerTime(kind) {
 function updateMarkerAcceptButton(id, label, time) {
   const button = $(id);
   if (!button) return;
-  const enabled = time !== null;
+  const enabled = time !== null && !reviewActionInFlight && !saveInFlight;
+  button.disabled = !enabled;
   button.classList.toggle("disabled", !enabled);
-  button.textContent = enabled ? `ACCEPT ${label} ${fmtTime(time)}` : `NO ${label} MARKER`;
+  button.textContent = reviewActionInFlight
+    ? "WORKING..."
+    : enabled
+      ? `ACCEPT ${label} ${fmtTime(time)}`
+      : `NO ${label} MARKER`;
+}
+
+function setReviewActionInFlight(value) {
+  reviewActionInFlight = Boolean(value);
+  const skipButton = $("skipBtn");
+  if (skipButton) {
+    skipButton.disabled = reviewActionInFlight;
+    skipButton.classList.toggle("disabled", reviewActionInFlight);
+    skipButton.textContent = reviewActionInFlight ? "WORKING..." : "SKIP";
+  }
+  updateSaveButton();
 }
 
 function updateAiPickDisplay() {
@@ -860,13 +877,16 @@ function updateSaveButton() {
   const times = markerTimes();
   const saveButton = $("saveCorrectionBtn");
   const hasPick = userPick !== null;
-  saveButton.classList.toggle("disabled", !hasPick || saveInFlight);
+  const busy = saveInFlight || reviewActionInFlight;
+  saveButton.disabled = !hasPick || busy;
+  saveButton.classList.toggle("disabled", !hasPick || busy);
   saveButton.textContent = saveInFlight
     ? "SAVING..."
     : times.manual === null
       ? "SAVE PLACED"
       : `SAVE ${fmtTime(times.manual)}`;
-  $("clearMarkerBtn").classList.toggle("disabled", !hasPick || saveInFlight);
+  $("clearMarkerBtn").disabled = !hasPick || busy;
+  $("clearMarkerBtn").classList.toggle("disabled", !hasPick || busy);
   updateMarkerAcceptButton("approveBtn", "AI", times.ai);
   updateMarkerAcceptButton("acceptKneeBtn", "KNEE", times.knee);
   updateGridMarkerUi();
@@ -2338,6 +2358,7 @@ function seekStemPlayersTo(originalTime) {
 
 function startStemPlayer(role, shouldPlay = true) {
   if (!currentItem || !audioPlayer || isStemMuted(role) || !stemSourceForRole(role)) return;
+  if (!shouldPlay) return;
   const range = stemAudioRangeUrl(role, audioClipStartSec, playbackClipEnd());
   let player = stemAudioPlayers[role];
   if (!player || player.src !== new URL(range.url, window.location.href).href) {
@@ -2421,7 +2442,7 @@ function prepareAudioPlayer(url, clipStartSec = 0, label = "preview", showReady 
     return null;
   }
   audioPlayer = new Audio();
-  audioPlayer.preload = showReady ? "auto" : "metadata";
+  audioPlayer.preload = "metadata";
   audioPlayer.addEventListener("loadedmetadata", () => {
     if (!(audioClipEndSec > audioClipStartSec) && Number.isFinite(audioPlayer.duration)) {
       audioClipEndSec = audioClipStartSec + Number(audioPlayer.duration || 0);
@@ -2454,7 +2475,6 @@ function prepareAudioPlayer(url, clipStartSec = 0, label = "preview", showReady 
   audioPlayer.src = url;
   audioPlayer.load();
   updatePlaybackControls();
-  startStemPlayers(false);
   return audioPlayer;
 }
 
@@ -2748,12 +2768,21 @@ async function refresh() {
 
 async function approve() {
   if (!currentItem) return;
-  const data = await fetchJson("/api/approve", {
-    method: "POST",
-    body: JSON.stringify({ id: currentItem.id }),
-  });
-  setStatus("AI marker accepted and logged.");
-  renderState(data.state);
+  if (reviewActionInFlight || saveInFlight) return;
+  setReviewActionInFlight(true);
+  setStatus(`Accepting AI marker at ${fmtTime(markerTimes().ai)}...`);
+  try {
+    const data = await fetchJson("/api/approve", {
+      method: "POST",
+      body: JSON.stringify({ id: currentItem.id }),
+    });
+    setStatus("AI marker accepted and logged.");
+    renderState(data.state);
+  } catch (err) {
+    setStatus(`Accept failed: ${err.message}`);
+  } finally {
+    setReviewActionInFlight(false);
+  }
 }
 
 async function saveCorrection() {
@@ -2762,7 +2791,7 @@ async function saveCorrection() {
     setStatus("Pick a candidate number or place a marker first.");
     return;
   }
-  if (saveInFlight) return;
+  if (saveInFlight || reviewActionInFlight) return;
   saveInFlight = true;
   updateSaveButton();
   const candidateForLearning = pickedCandidate || closestCandidateNearTime(userPick, 0.12);
@@ -2879,6 +2908,7 @@ async function autoPlace() {
 
 async function acceptMarker(kind) {
   if (!currentItem) return;
+  if (reviewActionInFlight || saveInFlight) return;
   const hasPendingAutoPlace = kind === "ai" && optionalMarkerTime(pendingAutoPlacePick) !== null;
   if (kind === "ai" && !hasPendingAutoPlace) {
     await approve();
@@ -2900,23 +2930,40 @@ async function acceptMarker(kind) {
     payload.picked_candidate = cloneCandidateForCorrection(pickedCandidate || blue?.candidate || defaultBlueAnchorCandidate(), acceptedTime);
     payload.top_10_candidates = currentItem.top_10_candidates || [];
   }
-  const data = await fetchJson("/api/correct", {
-    method: "POST",
-    body: JSON.stringify(payload),
-  });
-  setStatus(data.regeneration || `${label} marker accepted at ${fmtTime(acceptedTime)}.`);
-  clearRefinedPick();
-  renderState(data.state);
+  setReviewActionInFlight(true);
+  setStatus(`Accepting ${label} marker at ${fmtTime(acceptedTime)}...`);
+  try {
+    const data = await fetchJson("/api/correct", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    setStatus(data.regeneration || `${label} marker accepted at ${fmtTime(acceptedTime)}.`);
+    clearRefinedPick();
+    renderState(data.state);
+  } catch (err) {
+    setStatus(`${label} accept failed: ${err.message}`);
+  } finally {
+    setReviewActionInFlight(false);
+  }
 }
 
 async function skip() {
   if (!currentItem) return;
-  const data = await fetchJson("/api/skip", {
-    method: "POST",
-    body: JSON.stringify({ id: currentItem.id }),
-  });
-  setStatus("Skipped.");
-  renderState(data.state);
+  if (reviewActionInFlight || saveInFlight) return;
+  setReviewActionInFlight(true);
+  setStatus(`Skipping ${currentItem.track_name || "track"}...`);
+  try {
+    const data = await fetchJson("/api/skip", {
+      method: "POST",
+      body: JSON.stringify({ id: currentItem.id }),
+    });
+    setStatus("Skipped.");
+    renderState(data.state);
+  } catch (err) {
+    setStatus(`Skip failed: ${err.message}`);
+  } finally {
+    setReviewActionInFlight(false);
+  }
 }
 
 async function navigate(direction) {

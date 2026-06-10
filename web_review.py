@@ -3351,7 +3351,7 @@ class ReviewApp:
                     idx = self._first_active_index(idx)
             self.state["current_index"] = idx
             self._save_state()
-            return self.state_payload()
+        return self.state_payload()
 
     def _advance(self) -> None:
         if not self.items:
@@ -4206,7 +4206,7 @@ class ReviewApp:
                 }
             )
             self._after_logged_review()
-            return {"ok": True, "state": self.state_payload()}
+        return {"ok": True, "state": self.state_payload()}
 
     def correct(
         self,
@@ -4273,7 +4273,7 @@ class ReviewApp:
                 }
             )
             self._after_logged_review()
-            return {"ok": True, "regeneration": regen_report, "state": self.state_payload()}
+        return {"ok": True, "regeneration": regen_report, "state": self.state_payload()}
 
     def label_section(
         self,
@@ -4424,15 +4424,15 @@ class ReviewApp:
             )
             self._advance()
             self._save_state()
-            return {"ok": True, "state": self.state_payload()}
+        return {"ok": True, "state": self.state_payload()}
 
     def _after_logged_review(self) -> None:
         self.state["new_reviews_since_retrain"] = int(self.state.get("new_reviews_since_retrain", 0)) + 1
         self._advance()
         self._save_state()
         if self.auto_retrain_every and int(self.state.get("new_reviews_since_retrain", 0)) >= self.auto_retrain_every:
-            self.run_retrain()
-            self.state["new_reviews_since_retrain"] = 0
+            self.state["retrain_due"] = True
+            self.state["retrain_due_since"] = _now_iso()
             self._save_state()
 
     def run_retrain(self) -> Dict[str, Any]:
@@ -4452,6 +4452,8 @@ class ReviewApp:
         if rerank_report:
             self.state["last_retrain"]["rerank_report"] = rerank_report
         self.state["new_reviews_since_retrain"] = 0
+        self.state["retrain_due"] = False
+        self.state.pop("retrain_due_since", None)
         self._save_state()
         return {"ok": code == 0, "return_code": int(code), "promotion_report": report, "rerank_report": rerank_report}
 

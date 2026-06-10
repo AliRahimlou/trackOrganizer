@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from drop_aligner.visual_first import _zoomed_marker_time, select_first_visual_chunk, visual_chunk_candidates, visual_first_marker
+from drop_aligner.visual_drop_v2 import select_visual_drop_v2, visual_drop_v2_candidates
 
 
 def _feature_map(heights: list[float], *, bpm: float = 60.0) -> dict:
@@ -209,6 +210,39 @@ def test_visual_first_skips_early_dense_intro_when_cleaner_32_bar_body_appears()
 
     assert selected is not None
     assert selected["visual_components"]["clock_bar"] == 33
+
+
+def test_visual_drop_v2_keeps_clear_song_start_drop_over_slightly_later_body() -> None:
+    rows = [{"height": 0.05, "drum_cont": 0.0} for _ in range(44)]
+    for idx in range(8, 16):
+        rows[idx] = {
+            "aggregate": 0.64,
+            "groove": 0.68,
+            "bass": 0.54,
+            "drum": 1.0,
+            "inst": 0.42,
+            "vocal": 0.28,
+            "drum_cont": 0.90,
+        }
+    for idx in range(28, 32):
+        rows[idx] = {"height": 0.26, "bass": 0.18, "drum": 0.55, "drum_cont": 0.20}
+    for idx in range(32, 40):
+        rows[idx] = {
+            "aggregate": 0.68,
+            "groove": 0.70,
+            "bass": 0.56,
+            "drum": 1.0,
+            "inst": 0.44,
+            "vocal": 0.26,
+            "drum_cont": 1.0,
+        }
+    candidates = visual_drop_v2_candidates(_component_feature_map(rows, bpm=144.0, with_roles=True))
+
+    selected = select_visual_drop_v2(candidates)
+
+    assert selected is not None
+    assert selected["visual_components"]["clock_bar"] == 9
+    assert "protected first clear song-start drop section" in selected["reason"]
 
 
 def test_visual_first_uses_phrase_body_shift_when_waveform_is_dense_from_start() -> None:

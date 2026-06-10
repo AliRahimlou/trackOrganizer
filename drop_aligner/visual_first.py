@@ -29,19 +29,40 @@ def _use_visual_drop_v2_result(result: Mapping[str, Any]) -> bool:
         return False
     selected = result.get("selected_candidate") if isinstance(result.get("selected_candidate"), Mapping) else {}
     visual = selected.get("visual_components") if isinstance(selected.get("visual_components"), Mapping) else {}
+    feature_map = result.get("feature_map") if isinstance(result.get("feature_map"), Mapping) else {}
+    beatgrid = feature_map.get("beatgrid") if isinstance(feature_map.get("beatgrid"), Mapping) else {}
     reason = str(selected.get("reason") or "")
     try:
+        bpm = float(beatgrid.get("bpm", 0.0) or 0.0)
         clock_bar = int(visual.get("clock_bar", 0) or 0)
         score = float(selected.get("score", selected.get("confidence_score", 0.0)) or 0.0)
         body = float(visual.get("body_score", 0.0) or 0.0)
+        post4 = float(visual.get("post4_height", 0.0) or 0.0)
+        post8 = float(visual.get("post8_height", 0.0) or 0.0)
+        bass = float(visual.get("post_bass8", 0.0) or 0.0)
+        pre_drum = float(visual.get("pre_drum_cont4", 0.0) or 0.0)
+        transition = float(visual.get("transition", 0.0) or 0.0)
     except (TypeError, ValueError):
         return False
-    return bool(
+    later_drop_gate = bool(
         "skipped full intro/build section" in reason
         and 33 <= clock_bar <= 37
         and score >= 0.580
         and body >= 0.700
     )
+    clear_song_start_gate = bool(
+        "protected first clear song-start drop section" in reason
+        and bpm >= 141.5
+        and 9 <= clock_bar <= 21
+        and score >= 0.430
+        and body >= 0.560
+        and post4 >= 0.550
+        and post8 >= 0.560
+        and bass >= 0.300
+        and pre_drum <= 0.250
+        and transition >= 0.150
+    )
+    return bool(later_drop_gate or clear_song_start_gate)
 
 
 def _mean(values: Sequence[float]) -> float:
