@@ -14,6 +14,7 @@ from .structure_features import compute_bar_feature_map
 VISUAL_FIRST_VERSION = 1
 REJECTED_SECTION_BAR_RADIUS = 2
 REJECTED_SECTION_TIME_RADIUS_SEC = 6.0
+EXTENDED_VISUAL_MAX_CLOCK_BAR = 129
 
 
 def _clip01(value: Any) -> float:
@@ -139,10 +140,13 @@ def _filter_rejected_sections(
     rows = [dict(row) for row in candidates if isinstance(row, Mapping)]
     if not rejected_sections:
         return rows
-    kept = [row for row in rows if not _candidate_rejected_by_section(row, rejected_sections)]
+    hard_rejected_sections = _hard_rejected_sections(rejected_sections)
+    if not hard_rejected_sections:
+        return rows
+    kept = [row for row in rows if not _candidate_rejected_by_section(row, hard_rejected_sections)]
     latest_rejected_bar = 0
     latest_rejected_time: Optional[float] = None
-    for rejected in rejected_sections:
+    for rejected in hard_rejected_sections:
         if not isinstance(rejected, Mapping):
             continue
         try:
@@ -179,6 +183,14 @@ def _filter_rejected_sections(
         if later_rows:
             return later_rows
     return kept or rows
+
+
+def _hard_rejected_sections(rejected_sections: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+    return [
+        dict(row)
+        for row in rejected_sections
+        if isinstance(row, Mapping) and not bool(row.get("backfilled_from_latest_skip"))
+    ]
 
 
 def _visual_components(candidate: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -259,6 +271,133 @@ def _visual_real_drop_like(candidate: Mapping[str, Any]) -> bool:
             and post8 >= 0.560
         )
     )
+
+
+def _late_reset_body_drop_like(
+    candidate: Mapping[str, Any],
+    selected: Mapping[str, Any],
+    *,
+    duration_sec: Optional[float] = None,
+) -> bool:
+    visual = _visual_components(candidate)
+    selected_visual = _visual_components(selected)
+    candidate_bar = _visual_clock_bar(candidate)
+    selected_bar = _visual_clock_bar(selected)
+    candidate_time = _visual_candidate_raw_time(candidate)
+    selected_time = _visual_candidate_raw_time(selected)
+    if candidate_bar <= 0 or selected_bar <= 0 or candidate_time is None or selected_time is None:
+        return False
+    if not (selected_bar <= 17 and candidate_bar >= selected_bar + 32):
+        return False
+    if float(candidate_time) <= float(selected_time) + 42.0:
+        return False
+    if duration_sec is not None and duration_sec > 0.0 and float(candidate_time) > float(duration_sec) * 0.76:
+        return False
+
+    post4 = float(visual.get("post4_height", 0.0) or 0.0)
+    post8 = float(visual.get("post8_height", 0.0) or 0.0)
+    bass = float(visual.get("post_bass8", 0.0) or 0.0)
+    drum = float(visual.get("post_drum8", 0.0) or 0.0)
+    pre4 = float(visual.get("pre4_height", 0.0) or 0.0)
+    pre_drum = float(visual.get("pre_drum_cont4", 0.0) or 0.0)
+    post_drum_cont = float(visual.get("post_drum_cont4", 0.0) or 0.0)
+    post_drum_cont8 = float(visual.get("post_drum_cont8", 0.0) or 0.0)
+    local_gap = float(visual.get("local_reentry_gap", 0.0) or 0.0)
+    local_reentry = bool(visual.get("local_reentry"))
+    phrase_body_shift = bool(visual.get("phrase_body_shift"))
+
+    selected_post4 = float(selected_visual.get("post4_height", 0.0) or 0.0)
+    selected_post8 = float(selected_visual.get("post8_height", 0.0) or 0.0)
+    selected_bass = float(selected_visual.get("post_bass8", 0.0) or 0.0)
+    selected_inst = float(selected_visual.get("post_inst8", 0.0) or 0.0)
+    selected_pre_drum = float(selected_visual.get("pre_drum_cont4", 0.0) or 0.0)
+
+    later_is_real_body = bool(
+        (local_reentry or phrase_body_shift)
+        and local_gap >= 0.220
+        and post4 >= 0.660
+        and post8 >= 0.650
+        and bass >= 0.450
+        and drum >= 0.900
+        and post_drum_cont >= 0.820
+        and post_drum_cont8 >= 0.820
+    )
+    later_has_reset = bool(pre4 <= post4 - 0.075 or pre_drum <= 0.450)
+    later_clearly_outweighs_intro = bool(
+        post4 >= selected_post4 + 0.040
+        and post8 >= selected_post8 + 0.035
+        and bass >= selected_bass + 0.060
+    )
+    selected_looks_like_intro = bool(
+        selected_bass <= 0.430
+        or selected_inst >= 0.620
+        or selected_pre_drum <= 0.100
+    )
+    return bool(later_is_real_body and later_has_reset and later_clearly_outweighs_intro and selected_looks_like_intro)
+
+
+def _late_reset_body_guard_candidate(
+    selected: Mapping[str, Any],
+    candidates: Sequence[Mapping[str, Any]],
+    feature_map: Mapping[str, Any],
+) -> Optional[Dict[str, Any]]:
+    selected_bar = _visual_clock_bar(selected)
+    selected_time = _visual_candidate_raw_time(selected)
+    if selected_bar <= 0 or selected_bar > 17 or selected_time is None:
+        return None
+    beatgrid = feature_map.get("beatgrid") if isinstance(feature_map.get("beatgrid"), Mapping) else {}
+    first_low_downbeat = _finite_float(beatgrid.get("first_low_downbeat_sec"))
+    selected_visual = _visual_components(selected)
+    selected_bass = float(selected_visual.get("post_bass8", 0.0) or 0.0)
+    selected_inst = float(selected_visual.get("post_inst8", 0.0) or 0.0)
+    selected_micro_snap = abs(float(selected.get("snap_offset_ms", 0.0) or 0.0))
+    early_marker_is_suspect = bool(
+        selected_bass <= 0.430
+        or selected_inst >= 0.620
+        or selected_micro_snap >= 300.0
+        or (
+            first_low_downbeat is not None
+            and first_low_downbeat > 0.0
+            and float(selected_time) + 8.0 < float(first_low_downbeat)
+        )
+    )
+    if not early_marker_is_suspect:
+        return None
+
+    duration_sec = _finite_float(feature_map.get("duration_sec"))
+    viable = [
+        dict(row)
+        for row in candidates
+        if isinstance(row, Mapping)
+        and _late_reset_body_drop_like(row, selected, duration_sec=duration_sec)
+        and _visual_candidate_score(row) >= 0.560
+    ]
+    if not viable:
+        return None
+
+    viable.sort(
+        key=lambda row: (
+            _visual_candidate_raw_time(row) or 1e18,
+            -float(_visual_components(row).get("post_bass8", 0.0) or 0.0),
+            -float(_visual_components(row).get("post8_height", 0.0) or 0.0),
+        )
+    )
+    guarded = dict(viable[0])
+    guarded["selected_by"] = "visual_late_reset_body_guard"
+    guarded["reason"] = (
+        "visual late reset/body guard replaced early low-bass intro with later sustained drum/bass body; "
+        f"{guarded.get('reason') or 'late reset body candidate'}"
+    )
+    guarded["visual_guard_replaced_candidate"] = {
+        "timestamp": float(selected_time),
+        "clock_bar": int(selected_bar),
+        "score": float(selected.get("score", selected.get("confidence_score", 0.0)) or 0.0),
+        "post_bass8": float(selected_bass),
+        "post_inst8": float(selected_inst),
+        "first_low_downbeat_sec": float(first_low_downbeat) if first_low_downbeat is not None else None,
+        "reason": str(selected.get("reason") or ""),
+    }
+    return guarded
 
 
 def _visual_instrumental_bass_section_entry(candidate: Mapping[str, Any]) -> bool:
@@ -363,12 +502,13 @@ def audit_visual_selection(
     selected_strength = _visual_drop_strength(selected)
     preferred: Optional[Dict[str, Any]] = None
     recommended_action = "accept"
+    hard_rejected_sections = _hard_rejected_sections(list(rejected_sections or []))
 
-    if _candidate_rejected_by_section(selected, list(rejected_sections or [])):
+    if _candidate_rejected_by_section(selected, hard_rejected_sections):
         later = [
             row
             for row in rows
-            if not _candidate_rejected_by_section(row, list(rejected_sections or []))
+            if not _candidate_rejected_by_section(row, hard_rejected_sections)
             and _visual_candidate_time(row) is not None
             and (selected_time is None or float(_visual_candidate_time(row)) > float(selected_time) + 0.750)
         ]
@@ -685,6 +825,7 @@ def visual_chunk_candidates(feature_map: Mapping[str, Any], *, min_clock_bar: in
         pre_vocal4 = _window_mean(vocal_heights, idx - 4, idx)
         local_drum_continuity = float(drum_continuity[idx]) if idx < len(drum_continuity) else 0.0
         pre_drum_cont4 = _window_mean(drum_continuity, idx - 4, idx)
+        prev_drum_continuity = float(drum_continuity[idx - 1]) if idx > 0 and idx - 1 < len(drum_continuity) else pre_drum_cont4
         post_drum_cont4 = _window_mean(drum_continuity, idx, idx + 4)
         post_drum_cont8 = _window_mean(drum_continuity, idx, idx + 8)
         local_reentry_gap = max(local_bar - prev1, local_bar - prev2, post4 - prev1)
@@ -716,7 +857,21 @@ def visual_chunk_candidates(feature_map: Mapping[str, Any], *, min_clock_bar: in
                 or pre4 <= post4 - 0.085
             )
         )
-        if not on_phrase_one and not local_reentry and not continuity_transition and not phrase_body_shift:
+        previous_phrase_prior = phrase_strength_for_bar(max(1, clock_bar - 1))[0]
+        opening_body_start = bool(
+            15 <= clock_bar <= 21
+            and phrase_prior <= 0.30
+            and previous_phrase_prior >= 0.86
+            and prev_drum_continuity <= 0.45
+            and local_drum_continuity >= 0.85
+            and post_drum_cont4 >= 0.85
+            and post_drum_cont8 >= 0.82
+            and local_bar >= max(0.58, pre4 + 0.105)
+            and post4 >= max(0.58, 0.76 * max_post8)
+            and post8 >= max(0.58, 0.76 * max_post8)
+            and post_bass8 >= max(0.42, pre_bass4 + 0.085)
+        )
+        if not on_phrase_one and not local_reentry and not continuity_transition and not phrase_body_shift and not opening_body_start:
             continue
         sustained_bars = sum(1 for value in heights[idx : min(len(heights), idx + 8)] if value >= max(0.42, post8 - 0.08))
         sustained = _clip01(sustained_bars / 6.0)
@@ -729,6 +884,7 @@ def visual_chunk_candidates(feature_map: Mapping[str, Any], *, min_clock_bar: in
             or local_reentry
             or continuity_transition
             or phrase_body_shift
+            or opening_body_start
         )
         visually_large = bool(post8 >= max(0.44, 0.72 * max_post8) or post4 >= max(0.48, 0.74 * max_post8))
         if not starts_block or not visually_large:
@@ -765,6 +921,8 @@ def visual_chunk_candidates(feature_map: Mapping[str, Any], *, min_clock_bar: in
                 "reason": (
                     "visual-only local waveform re-entry candidate"
                     if local_reentry
+                    else "visual-only opening drop body-start candidate"
+                    if opening_body_start
                     else "visual-only phrase body-shift drop candidate"
                     if phrase_body_shift
                     else "visual-only first sustained waveform block candidate"
@@ -800,10 +958,12 @@ def visual_chunk_candidates(feature_map: Mapping[str, Any], *, min_clock_bar: in
                     "post_vocal8": float(post_vocal8),
                     "pre_vocal4": float(pre_vocal4),
                     "drum_continuity": float(local_drum_continuity),
+                    "prev_drum_continuity": float(prev_drum_continuity),
                     "pre_drum_cont4": float(pre_drum_cont4),
                     "post_drum_cont4": float(post_drum_cont4),
                     "post_drum_cont8": float(post_drum_cont8),
                     "phrase_body_shift": bool(phrase_body_shift),
+                    "opening_body_start": bool(opening_body_start),
                     "one_distance_ms": float(one_distance_ms),
                 },
                 "bpm_clock": dict(clock),
@@ -878,6 +1038,9 @@ def select_first_visual_chunk(candidates: Sequence[Mapping[str, Any]]) -> Option
     def pre_drum_cont(row: Mapping[str, Any]) -> float:
         return float(comp(row).get("pre_drum_cont4", 0.0) or 0.0)
 
+    def prev_drum_cont(row: Mapping[str, Any]) -> float:
+        return float(comp(row).get("prev_drum_continuity", 0.0) or 0.0)
+
     def post_drum_cont(row: Mapping[str, Any]) -> float:
         return float(comp(row).get("post_drum_cont4", 0.0) or 0.0)
 
@@ -901,6 +1064,9 @@ def select_first_visual_chunk(candidates: Sequence[Mapping[str, Any]]) -> Option
 
     def is_phrase_body_shift(row: Mapping[str, Any]) -> bool:
         return bool(comp(row).get("phrase_body_shift"))
+
+    def is_opening_body_start(row: Mapping[str, Any]) -> bool:
+        return bool(comp(row).get("opening_body_start"))
 
     def first_clean_dense_reentry(row: Mapping[str, Any]) -> bool:
         return bool(
@@ -1072,6 +1238,18 @@ def select_first_visual_chunk(candidates: Sequence[Mapping[str, Any]]) -> Option
                     or jump(row) <= 0.120
                 )
             )
+            phrase_edge_to_opening_body_start = bool(
+                row_bar <= 17
+                and later_bar <= row_bar + 2
+                and is_phrase_body_shift(row)
+                and is_opening_body_start(later)
+                and prev_drum_cont(later) <= 0.45
+                and post_drum_cont(later) >= post_drum_cont(row) + 0.150
+                and bass(later) >= bass(row) + 0.020
+                and post4(later) >= post4(row) + 0.015
+                and post8(later) >= post8(row) - 0.005
+                and drum(later) >= 0.950
+            )
             buildup_to_bass_drop = bool(
                 later_bar <= row_bar + 8
                 and local_gap(later) >= 0.210
@@ -1198,6 +1376,7 @@ def select_first_visual_chunk(candidates: Sequence[Mapping[str, Any]]) -> Option
                 or intro_break_to_later_drum_drop
                 or early_dense_intro_to_later_body
                 or mid_intro_to_phrase_body
+                or phrase_edge_to_opening_body_start
             ):
                 continue
             height_wins = post8(later) >= post8(row) + max(0.050, 0.075 * max(0.1, post8(row)))
@@ -1230,6 +1409,7 @@ def select_first_visual_chunk(candidates: Sequence[Mapping[str, Any]]) -> Option
                 and not phrase_intro_to_drop
                 and not post_intro_breakdown_reentry
                 and not nearby_phrase_body_after_predrop
+                and not phrase_edge_to_opening_body_start
                 and not early_dense_intro_to_later_body
                 and not mid_intro_to_phrase_body
                 and not overwhelming_later_drop
@@ -1252,6 +1432,7 @@ def select_first_visual_chunk(candidates: Sequence[Mapping[str, Any]]) -> Option
                 and not phrase_intro_to_drop
                 and not post_intro_breakdown_reentry
                 and not nearby_phrase_body_after_predrop
+                and not phrase_edge_to_opening_body_start
                 and not buildup_to_bass_drop
                 and not post_gap_drum_slam
                 and not intro_break_to_later_drum_drop
@@ -1274,6 +1455,7 @@ def select_first_visual_chunk(candidates: Sequence[Mapping[str, Any]]) -> Option
                 or phrase_intro_to_drop
                 or post_intro_breakdown_reentry
                 or nearby_phrase_body_after_predrop
+                or phrase_edge_to_opening_body_start
                 or buildup_to_bass_drop
                 or post_gap_drum_slam
                 or intro_break_to_later_drum_drop
@@ -1353,6 +1535,10 @@ def _zoomed_marker_time(
     except (TypeError, ValueError):
         impact_conf = 0.0
     try:
+        impact_body_quality = float(micro.get("impact_body_quality", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        impact_body_quality = 0.0
+    try:
         denoised_impact = float(micro.get("denoised_impact_strength", 0.0) or 0.0)
     except (TypeError, ValueError):
         denoised_impact = 0.0
@@ -1427,6 +1613,24 @@ def _zoomed_marker_time(
         ):
             return float(zero_time)
         return float(attack_time)
+    impact_body_time = _micro_time(micro, "impact_body_time")
+    short_hit_before_sustained_body = bool(
+        impact_body_time is not None
+        and 0.006 <= float(impact_body_time) - float(marker) <= 0.045
+        and -0.020 <= float(marker) - float(raw_time) <= 0.065
+        and bool(visual.get("local_reentry"))
+        and post_drum >= 0.88
+        and post_bass >= 0.40
+        and pre_drum <= 0.12
+        and (micro_conf is not None and micro_conf >= 0.88)
+        and attack_clean >= 0.88
+        and impact_conf >= 0.70
+        and impact_body_quality >= 0.58
+    )
+    if short_hit_before_sustained_body:
+        body_shift = float(impact_body_time) - float(marker)
+        transition_lead = min(0.0025, max(0.0007, body_shift * 0.09))
+        return max(float(marker), float(impact_body_time) - transition_lead)
     return float(marker)
 
 
@@ -1490,6 +1694,91 @@ def _visual_body_onset_time(audio_path: str, raw_time: float, visual_components:
     except Exception:
         pass
     return float(coarse)
+
+
+def _visual_body_entry_before_time(
+    audio_path: str,
+    raw_time: float,
+    visual_components: Mapping[str, Any],
+) -> Optional[float]:
+    clock_bar = int(visual_components.get("clock_bar", 0) or 0)
+    pre4 = _clip01(visual_components.get("pre4_height", 0.0))
+    jump4 = float(visual_components.get("jump4", 0.0) or 0.0)
+    post_bass = _clip01(visual_components.get("post_bass8", 0.0))
+    post_drum = _clip01(visual_components.get("post_drum8", 0.0))
+    post_inst = _clip01(visual_components.get("post_inst8", 0.0))
+    pre_drum = _clip01(visual_components.get("pre_drum_cont4", 0.0))
+    local_gap = float(visual_components.get("local_reentry_gap", 0.0) or 0.0)
+    phrase_prior = float(visual_components.get("phrase_prior", 0.0) or 0.0)
+    local_reentry = bool(visual_components.get("local_reentry"))
+    if not (
+        21 <= clock_bar <= 49
+        and local_reentry
+        and local_gap >= 0.140
+        and phrase_prior <= 0.700
+        and pre4 <= 0.480
+        and pre_drum <= 0.400
+        and post_bass >= 0.450
+        and post_drum >= 0.900
+        and post_inst >= 0.360
+        and (pre4 >= 0.320 or jump4 >= 0.160 or pre_drum >= 0.150)
+    ):
+        return None
+    try:
+        import librosa
+
+        group = find_stem_group(audio_path)
+        drums_path = group.roles.get("drums") or audio_path
+        sr = 44100
+        start = max(0.0, float(raw_time) - 1.350)
+        end = float(raw_time) + 0.180
+        audio, sr = librosa.load(drums_path, sr=sr, mono=True, offset=float(start), duration=max(0.200, end - start))
+    except Exception:
+        return None
+    window = max(1, int(0.010 * sr))
+    hop = max(1, int(0.005 * sr))
+    if audio.size <= window * 3:
+        return None
+    times: List[float] = []
+    combined: List[float] = []
+    for index in range(0, int(audio.size) - window, hop):
+        chunk = audio[index : index + window]
+        rms = float(np.sqrt(np.mean(chunk * chunk)))
+        peak = float(np.max(np.abs(chunk)))
+        times.append(float(start) + ((index + (window / 2.0)) / float(sr)))
+        combined.append((0.65 * rms) + (0.35 * peak))
+    if len(times) < 24:
+        return None
+    values = np.asarray(combined, dtype=np.float64)
+    if float(np.max(values)) <= 0.0:
+        return None
+    values = values / float(np.max(values))
+    smooth_frames = max(3, int(round(0.080 / 0.005)))
+    smooth = np.convolve(values, np.ones(smooth_frames, dtype=np.float64) / float(smooth_frames), mode="same")
+    threshold = max(0.40, min(0.55, float(np.quantile(smooth, 0.72))))
+    post_frames = max(8, int(round(0.280 / 0.005)))
+    pre_frames = max(6, int(round(0.180 / 0.005)))
+    for index, time_value in enumerate(times):
+        if not (float(raw_time) - 1.150 <= time_value <= float(raw_time) - 0.150):
+            continue
+        post = smooth[index : min(len(smooth), index + post_frames)]
+        pre = smooth[max(0, index - pre_frames) : index]
+        if post.size < 10:
+            continue
+        post_ok = bool(float(np.median(post)) >= threshold and float(np.quantile(post, 0.25)) >= threshold * 0.72)
+        pre_ok = bool(pre.size == 0 or float(np.median(pre)) <= threshold * 0.65)
+        if not (smooth[index] >= threshold and post_ok and pre_ok):
+            continue
+        coarse = float(time_value)
+        try:
+            refined = microalign_marker(audio_path, coarse, search_before_ms=90, search_after_ms=140)
+            refined_time = _micro_time(refined, "microaligned_time")
+            if refined_time is not None and abs(float(refined_time) - coarse) <= 0.090:
+                return float(refined_time)
+        except Exception:
+            pass
+        return float(coarse)
+    return None
 
 
 def _buildup_release_body_entry_marker(
@@ -1700,6 +1989,223 @@ def _buildup_release_body_entry_marker(
     }
 
 
+def _opening_texture_release_marker(
+    audio_path: str,
+    raw_time: float,
+    visual_components: Mapping[str, Any],
+) -> Optional[Dict[str, Any]]:
+    clock_bar = int(visual_components.get("clock_bar", 0) or 0)
+    pre_drum = _clip01(visual_components.get("pre_drum_cont4", 0.0))
+    post_drum = _clip01(visual_components.get("post_drum8", 0.0))
+    post_bass = _clip01(visual_components.get("post_bass8", 0.0))
+    post4 = _clip01(visual_components.get("post4_height", 0.0))
+    post8 = _clip01(visual_components.get("post8_height", 0.0))
+    if not (
+        17 <= clock_bar <= 29
+        and pre_drum <= 0.260
+        and post_drum >= 0.850
+        and post_bass >= 0.350
+        and post4 >= 0.540
+        and post8 >= 0.530
+    ):
+        return None
+
+    try:
+        group = find_stem_group(audio_path)
+        bpm = infer_bpm_from_path(audio_path)
+        cfg = DropDetectorConfig(sample_rate=16000, use_drumprint=False)
+        features_by_role = {
+            role: extract_features(path, cfg, bpm=bpm)
+            for role, path in group.roles.items()
+            if role in {"drums", "instrumental", "vocals"}
+        }
+    except Exception:
+        return None
+    if not all(role in features_by_role for role in ("drums", "instrumental", "vocals")):
+        return None
+
+    def feature_mean(role: str, key: str, start: float, end: float) -> float:
+        features = features_by_role.get(role)
+        if features is None:
+            return 0.0
+        times = np.asarray(features.frame_times, dtype=np.float64)
+        values = np.asarray(getattr(features, key), dtype=np.float64)
+        if times.size == 0 or values.size == 0:
+            return 0.0
+        mask = (times >= float(start)) & (times < float(end))
+        if not bool(np.any(mask)):
+            return 0.0
+        return float(np.mean(values[mask]))
+
+    def feature_max(role: str, key: str, start: float, end: float) -> float:
+        features = features_by_role.get(role)
+        if features is None:
+            return 0.0
+        times = np.asarray(features.frame_times, dtype=np.float64)
+        values = np.asarray(getattr(features, key), dtype=np.float64)
+        if times.size == 0 or values.size == 0:
+            return 0.0
+        mask = (times >= float(start)) & (times < float(end))
+        if not bool(np.any(mask)):
+            return 0.0
+        return float(np.max(values[mask]))
+
+    rows: List[Dict[str, float]] = []
+    scan_start = float(raw_time) + 0.300
+    scan_end = float(raw_time) + 2.250
+    for time in np.arange(scan_start, scan_end, 0.016):
+        t = float(time)
+        drum_pre = feature_mean("drums", "rms", t - 0.800, t)
+        drum_post = feature_mean("drums", "rms", t, t + 0.550)
+        low_pre = feature_mean("drums", "low_energy", t - 0.800, t)
+        low_post = feature_mean("drums", "low_energy", t, t + 0.550)
+        inst_pre = feature_mean("instrumental", "rms", t - 0.800, t)
+        inst_post = feature_mean("instrumental", "rms", t, t + 0.550)
+        vocal_pre = feature_mean("vocals", "rms", t - 0.800, t)
+        vocal_post = feature_mean("vocals", "rms", t, t + 0.550)
+        attack = max(
+            feature_max("drums", "combined_attack", t - 0.040, t + 0.080),
+            0.70 * feature_max("instrumental", "combined_attack", t - 0.040, t + 0.080),
+            0.70 * feature_max("vocals", "combined_attack", t - 0.040, t + 0.080),
+        )
+        drum_gain = max(0.0, drum_post - drum_pre) + (0.50 * max(0.0, low_post - low_pre))
+        texture_drop = max(0.0, inst_pre - inst_post) + max(0.0, vocal_pre - vocal_post)
+        score = _clip01(
+            (0.35 * _clip01(drum_post / 0.70))
+            + (0.25 * _clip01(drum_gain / 0.45))
+            + (0.25 * _clip01(texture_drop / 0.90))
+            + (0.15 * _clip01(attack))
+        )
+        if score < 0.820 or drum_post < 0.450 or drum_gain < 0.250 or texture_drop < 0.350:
+            continue
+        rows.append(
+            {
+                "time": t,
+                "score": float(score),
+                "drum_post": float(drum_post),
+                "drum_gain": float(drum_gain),
+                "texture_drop": float(texture_drop),
+                "attack": float(attack),
+            }
+        )
+    if not rows:
+        return None
+
+    max_score = max(float(row["score"]) for row in rows)
+    plateau = [row for row in rows if float(row["score"]) >= max(0.920, max_score - 0.025)]
+    if not plateau:
+        return None
+    scan_choice = plateau[0]
+    scan_time = float(scan_choice["time"])
+    try:
+        refined = microalign_marker(audio_path, scan_time, search_before_ms=100, search_after_ms=160)
+    except Exception:
+        return None
+    marker = _micro_time(refined, "microaligned_time")
+    if marker is None:
+        return None
+    try:
+        micro_conf = float(refined.get("micro_confidence", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        micro_conf = 0.0
+    try:
+        impact_conf = float(refined.get("impact_boundary_confidence", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        impact_conf = 0.0
+    if not (float(raw_time) + 0.450 <= float(marker) <= float(raw_time) + 1.650):
+        return None
+    if abs(float(marker) - scan_time) > 0.140:
+        return None
+    if micro_conf < 0.880 and impact_conf < 0.880:
+        return None
+    return {
+        "marker": float(marker),
+        "scan_time": float(scan_time),
+        "scan_score": float(scan_choice["score"]),
+        "max_scan_score": float(max_score),
+        "drum_post": float(scan_choice["drum_post"]),
+        "drum_gain": float(scan_choice["drum_gain"]),
+        "texture_drop": float(scan_choice["texture_drop"]),
+        "attack": float(scan_choice["attack"]),
+        "microalign": dict(refined),
+    }
+
+
+def _opening_texture_release_guard_candidate(
+    audio_path: str,
+    selected: Mapping[str, Any],
+    candidates: Sequence[Mapping[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    selected_visual = selected.get("visual_components") if isinstance(selected.get("visual_components"), Mapping) else {}
+    selected_time = _micro_time(selected, "timestamp")
+    selected_bar = int(selected_visual.get("clock_bar", 0) or 0)
+    if selected_time is None or selected_bar < 33:
+        return None
+
+    earlier: List[Dict[str, Any]] = []
+    for candidate in candidates:
+        if not isinstance(candidate, Mapping):
+            continue
+        visual = candidate.get("visual_components") if isinstance(candidate.get("visual_components"), Mapping) else {}
+        candidate_time = _micro_time(candidate, "timestamp")
+        candidate_bar = int(visual.get("clock_bar", 0) or 0)
+        score = float(candidate.get("score", candidate.get("confidence_score", 0.0)) or 0.0)
+        if candidate_time is None or candidate_time >= float(selected_time) - 12.0:
+            continue
+        if not (
+            17 <= candidate_bar <= 29
+            and score >= 0.540
+            and _clip01(visual.get("post4_height", 0.0)) >= 0.540
+            and _clip01(visual.get("post8_height", 0.0)) >= 0.530
+            and _clip01(visual.get("post_bass8", 0.0)) >= 0.350
+            and _clip01(visual.get("post_drum8", 0.0)) >= 0.850
+            and _clip01(visual.get("pre_drum_cont4", 0.0)) <= 0.260
+        ):
+            continue
+        earlier.append(dict(candidate))
+    if not earlier:
+        return None
+
+    max_early_score = max(float(row.get("score", row.get("confidence_score", 0.0)) or 0.0) for row in earlier)
+    viable = [
+        row
+        for row in earlier
+        if float(row.get("score", row.get("confidence_score", 0.0)) or 0.0) >= max(max_early_score - 0.040, 0.560)
+    ]
+    if not viable:
+        return None
+    candidate = min(viable, key=lambda row: float(row.get("timestamp", 0.0) or 0.0))
+    visual = candidate.get("visual_components") if isinstance(candidate.get("visual_components"), Mapping) else {}
+    raw_time = _micro_time(candidate, "timestamp")
+    if raw_time is None:
+        return None
+    release = _opening_texture_release_marker(audio_path, float(raw_time), visual)
+    if release is None:
+        return None
+
+    guarded = dict(candidate)
+    guarded["timestamp"] = float(release["marker"])
+    guarded["snapped_sec"] = float(release["marker"])
+    guarded["time_sec"] = float(release["marker"])
+    guarded["microaligned_time"] = float(release["marker"])
+    guarded["selected_by"] = "visual_opening_texture_release_guard"
+    guarded["reason"] = (
+        "visual opening texture-release guard selected first large section before later body; "
+        f"{candidate.get('reason') or 'opening section candidate'}"
+    )
+    guarded["opening_texture_release"] = {
+        key: value for key, value in release.items() if key != "microalign"
+    }
+    guarded["microalign"] = dict(release.get("microalign") if isinstance(release.get("microalign"), Mapping) else {})
+    guarded["visual_guard_replaced_candidate"] = {
+        "timestamp": float(selected_time),
+        "clock_bar": int(selected_bar),
+        "score": float(selected.get("score", selected.get("confidence_score", 0.0)) or 0.0),
+        "reason": str(selected.get("reason") or ""),
+    }
+    return guarded
+
+
 def _structure_section_guard_candidate(audio_path: str, selected: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
     visual = selected.get("visual_components") if isinstance(selected.get("visual_components"), Mapping) else {}
     if not visual:
@@ -1830,6 +2336,34 @@ def visual_first_marker(
             "candidates": [],
         }
 
+    selected_bar = _visual_clock_bar(selected)
+    if selected_bar and selected_bar <= 17:
+        try:
+            extended_candidates = visual_chunk_candidates(
+                feature_map,
+                max_clock_bar=max(
+                    81,
+                    min(EXTENDED_VISUAL_MAX_CLOCK_BAR, int(feature_map.get("bar_count", 0) or EXTENDED_VISUAL_MAX_CLOCK_BAR)),
+                ),
+            )
+        except Exception:
+            extended_candidates = []
+        if extended_candidates:
+            extended_candidates = _filter_rejected_sections(extended_candidates, rejected_sections)
+            guarded = _late_reset_body_guard_candidate(selected, extended_candidates, feature_map)
+            if guarded is not None and not _candidate_rejected_by_section(guarded, rejected_sections):
+                selected = guarded
+                candidates_for_selection = [dict(guarded)] + [
+                    dict(row)
+                    for row in extended_candidates
+                    if abs(float(row.get("timestamp", 0.0) or 0.0) - float(guarded.get("timestamp", 0.0) or 0.0)) > 0.010
+                ]
+
+    guarded = _opening_texture_release_guard_candidate(audio_path, selected, candidates_for_selection)
+    if guarded is not None:
+        selected = guarded
+        candidates_for_selection = [dict(guarded)] + [dict(row) for row in candidates_for_selection]
+
     guarded = _structure_section_guard_candidate(audio_path, selected)
     if guarded is not None:
         selected = guarded
@@ -1852,6 +2386,20 @@ def visual_first_marker(
         micro if isinstance(micro, Mapping) else {},
         selected.get("visual_components") if isinstance(selected.get("visual_components"), Mapping) else {},
     )
+    body_entry_before = _visual_body_entry_before_time(
+        audio_path,
+        raw_time,
+        selected.get("visual_components") if isinstance(selected.get("visual_components"), Mapping) else {},
+    )
+    if body_entry_before is not None and float(marker) > float(body_entry_before) + 0.120:
+        marker = float(body_entry_before)
+        if isinstance(micro, Mapping):
+            micro = dict(micro)
+        else:
+            micro = {}
+        micro["visual_body_entry_before_time"] = float(body_entry_before)
+        micro["visual_body_entry_before_used"] = True
+        micro["reason"] = f"{micro.get('reason') or 'MicroSnap reviewed'}; visual body entry-before verifier used"
     body_onset = _visual_body_onset_time(
         audio_path,
         raw_time,

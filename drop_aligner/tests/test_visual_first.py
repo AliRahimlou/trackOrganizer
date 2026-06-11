@@ -6,6 +6,7 @@ import pytest
 
 from drop_aligner.visual_first import (
     _filter_rejected_sections,
+    _late_reset_body_guard_candidate,
     _opening_drop_profile,
     _use_visual_drop_v2_result,
     _zoomed_marker_time,
@@ -93,6 +94,8 @@ def _candidate(
     local_gap: float = 0.20,
     local_reentry: bool = True,
     phrase_body_shift: bool = False,
+    opening_body_start: bool = False,
+    prev_drum: float = 1.0,
     bpm: float = 144.0,
 ) -> dict:
     return {
@@ -114,12 +117,14 @@ def _candidate(
             "pre_vocal4": 0.20,
             "post_vocal8": 0.20,
             "drum_continuity": drum,
+            "prev_drum_continuity": prev_drum,
             "pre_drum_cont4": pre_drum,
             "post_drum_cont4": drum,
             "post_drum_cont8": drum,
             "local_reentry": local_reentry,
             "local_reentry_gap": local_gap,
             "phrase_body_shift": phrase_body_shift,
+            "opening_body_start": opening_body_start,
             "jump4": 0.15,
             "jump8": 0.15,
             "prev1_height": 0.20,
@@ -164,6 +169,53 @@ def test_visual_first_shifts_opening_edge_to_stronger_phrase_body() -> None:
     assert selected["visual_edge_replaced_candidate"]["clock_bar"] == 10
 
 
+def test_visual_first_uses_opening_body_start_after_low_drum_phrase_edge() -> None:
+    candidates = [
+        _candidate(
+            26.667,
+            17,
+            score=0.637,
+            phrase_prior=0.94,
+            post4=0.647,
+            post8=0.659,
+            bass=0.442,
+            drum=0.731,
+            local_reentry=False,
+            phrase_body_shift=True,
+        ),
+        _candidate(
+            28.333,
+            18,
+            score=0.614,
+            phrase_prior=0.18,
+            post4=0.675,
+            post8=0.671,
+            bass=0.475,
+            drum=1.0,
+            local_reentry=False,
+            opening_body_start=True,
+            prev_drum=0.173,
+        ),
+        _candidate(
+            31.667,
+            20,
+            score=0.613,
+            phrase_prior=0.18,
+            post4=0.689,
+            post8=0.677,
+            bass=0.483,
+            drum=1.0,
+            local_gap=0.169,
+            local_reentry=True,
+        ),
+    ]
+
+    selected = select_first_visual_chunk(candidates)
+
+    assert selected is not None
+    assert selected["visual_components"]["clock_bar"] == 18
+
+
 def test_visual_first_shifts_off_phrase_edge_to_adjacent_phrase_edge() -> None:
     candidates = [
         _candidate(42.488, 26, score=0.703, phrase_prior=0.18, post4=0.652, post8=0.679, bass=0.546, pre_drum=0.07),
@@ -189,6 +241,29 @@ def test_visual_first_filters_rejected_visual_section_before_selection() -> None
     assert len(filtered) == 1
     assert selected is not None
     assert selected["visual_components"]["clock_bar"] == 49
+
+
+def test_visual_first_does_not_hide_drop_from_backfilled_skip_rejection() -> None:
+    candidates = [
+        _candidate(44.113, 27, score=0.714, phrase_prior=0.48, post4=0.66, post8=0.68, bass=0.54),
+        _candidate(70.834, 43, score=0.659, phrase_prior=0.48, post4=0.72, post8=0.74, bass=0.51),
+    ]
+
+    filtered = _filter_rejected_sections(
+        candidates,
+        [{"timestamp": 44.113, "raw_time": 44.155, "clock_bar": 27, "backfilled_from_latest_skip": True}],
+    )
+    selected = select_first_visual_chunk(filtered)
+    audit = audit_visual_selection(
+        candidates[0],
+        filtered,
+        rejected_sections=[{"timestamp": 44.113, "raw_time": 44.155, "clock_bar": 27, "backfilled_from_latest_skip": True}],
+    )
+
+    assert [row["visual_components"]["clock_bar"] for row in filtered] == [27, 43]
+    assert selected is not None
+    assert selected["visual_components"]["clock_bar"] == 27
+    assert audit["status"] == "pass"
 
 
 def test_visual_first_does_not_retreat_to_intro_after_later_rejection() -> None:
@@ -524,6 +599,40 @@ def test_visual_first_skips_early_dense_intro_when_cleaner_32_bar_body_appears()
     assert selected["visual_components"]["clock_bar"] == 33
 
 
+def test_visual_late_reset_guard_replaces_low_bass_intro_with_real_body_drop() -> None:
+    intro = _candidate(
+        20.307,
+        13,
+        score=0.789,
+        post4=0.666,
+        post8=0.658,
+        bass=0.388,
+        drum=1.0,
+        pre_drum=0.072,
+        local_gap=0.423,
+    )
+    intro["visual_components"].update({"post_inst8": 0.680})
+    later_body = _candidate(
+        149.410,
+        91,
+        score=0.680,
+        post4=0.730,
+        post8=0.719,
+        bass=0.491,
+        drum=1.0,
+        pre_drum=0.328,
+        local_gap=0.322,
+    )
+    later_body["visual_components"].update({"post_inst8": 0.718, "pre4_height": 0.572})
+    feature_map = {"duration_sec": 223.54, "beatgrid": {"first_low_downbeat_sec": 41.824}}
+
+    guarded = _late_reset_body_guard_candidate(intro, [intro, later_body], feature_map)
+
+    assert guarded is not None
+    assert guarded["visual_components"]["clock_bar"] == 91
+    assert guarded["selected_by"] == "visual_late_reset_body_guard"
+
+
 def test_visual_drop_v2_keeps_clear_song_start_drop_over_slightly_later_body() -> None:
     rows = [{"height": 0.05, "drum_cont": 0.0} for _ in range(44)]
     for idx in range(8, 16):
@@ -650,6 +759,39 @@ def test_zoomed_marker_rejects_large_forward_low_confidence_snap() -> None:
     assert marker == 54.006857
 
 
+def test_zoomed_marker_uses_transition_edge_after_short_prehit() -> None:
+    marker = _zoomed_marker_time(
+        26.666666666666668,
+        {
+            "microaligned_time": 26.67698412698413,
+            "impact_body_time": 26.69185941043084,
+            "impact_body_quality": 0.622128910283896,
+            "micro_confidence": 0.9418233714580599,
+            "attack_cleanliness": 0.9955085737125926,
+            "attack_peak_strength": 1.0,
+            "impact_boundary_confidence": 0.7985634703079503,
+            "denoised_impact_strength": 0.617832536572747,
+            "rms_rise_score": 1.0,
+            "peak_rise_score": 1.0,
+            "zero_crossing_quality": 0.6578543361900151,
+        },
+        {
+            "clock_bar": 17,
+            "pre4_height": 0.40207146339017075,
+            "jump4": 0.25092718557370797,
+            "post_bass8": 0.574879342238052,
+            "post_drum8": 1.0,
+            "post_inst8": 0.13779078708566878,
+            "pre_drum_cont4": 0.004807692307692308,
+            "local_reentry": True,
+            "local_reentry_gap": 0.3189355146915343,
+            "phrase_prior": 0.94,
+        },
+    )
+
+    assert marker == pytest.approx(26.690520634020638)
+
+
 @pytest.mark.parametrize(
     ("audio_path", "target", "tolerance"),
     [
@@ -737,6 +879,31 @@ def test_zoomed_marker_rejects_large_forward_low_confidence_snap() -> None:
             "/Users/alirahimlou/Desktop/MUSIC/STEMS/142/9A/When I Look at You - Emalkay/drums_142_9A_8-When I Look at You - Emalkay.flac",
             1.231360544217687,
             0.05,
+        ),
+        (
+            "/Users/alirahimlou/Desktop/MUSIC/STEMS/144/12A/Covex, Lexi Shanley, SVDKO - I Miss U - SVDKO Remix/drums_144_12A_6-Covex, Lexi Shanley, SVDKO - I Miss U - SVDKO Remix.flac",
+            43.334535,
+            0.05,
+        ),
+        (
+            "/Users/alirahimlou/Desktop/MUSIC/STEMS/144/4A/Saint Mary’s Lake - Mfinity/drums_144_4A_7-Saint Mary’s Lake - Mfinity.flac",
+            26.690431,
+            0.05,
+        ),
+        (
+            "/Users/alirahimlou/Desktop/MUSIC/STEMS/144/7A/Move Your Body - Nyrus Dub - Morillo, Scott Nice, Nyrus/drums_144_7A_6-Move Your Body - Nyrus Dub - Morillo, Scott Nice, Nyrus.wav",
+            28.33298866213152,
+            0.05,
+        ),
+        (
+            "/Users/alirahimlou/Desktop/MUSIC/STEMS/144/9A/Jkyl & Hyde - Sensory Session/drums_144_9A_3-Jkyl & Hyde - Sensory Session.flac",
+            39.999979,
+            0.05,
+        ),
+        (
+            "/Users/alirahimlou/Desktop/MUSIC/STEMS/145/11A/Lapalux - Don't Mean A Thing/drums_145_11A_5-Lapalux - Don't Mean A Thing.flac",
+            149.477101,
+            0.08,
         ),
         (
             "/Users/alirahimlou/Desktop/MUSIC/STEMS/140/9A/Tomb (feat. Rasha Kamal) - Fady Haroun, Adrinaline, Rasha Kamal/drums_140_9A_8-Tomb (feat. Rasha Kamal) - Fady Haroun, Adrinaline, Rasha Kamal.wav",
