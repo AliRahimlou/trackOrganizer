@@ -8,6 +8,7 @@ from drop_aligner.visual_first import (
     _filter_rejected_sections,
     _use_visual_drop_v2_result,
     _zoomed_marker_time,
+    audit_visual_selection,
     select_first_visual_chunk,
     visual_chunk_candidates,
     visual_first_marker,
@@ -299,6 +300,70 @@ def test_visual_first_prefers_instrumental_section_entry_over_later_body_peak() 
     assert selected is not None
     assert selected["timestamp"] == pytest.approx(94.64788732394366)
     assert "instrumental/bass section entry" in selected["reason"]
+
+
+def test_visual_audit_flags_late_body_peak_after_section_entry() -> None:
+    instrumental_entry = _candidate(
+        94.64788732394366,
+        57,
+        score=0.616,
+        phrase_prior=0.86,
+        post4=0.630,
+        post8=0.656,
+        bass=0.426,
+        drum=0.977,
+        pre_drum=0.778,
+        phrase_body_shift=True,
+    )
+    instrumental_entry["visual_components"].update({"pre_inst4": 0.226, "post_inst8": 0.684})
+    later_body_peak = _candidate(
+        98.02816901408451,
+        59,
+        score=0.625,
+        phrase_prior=0.48,
+        post4=0.668,
+        post8=0.679,
+        bass=0.460,
+        phrase_body_shift=False,
+    )
+    later_body_peak["visual_components"].update({"pre_inst4": 0.581, "post_inst8": 0.642})
+
+    audit = audit_visual_selection(later_body_peak, [instrumental_entry, later_body_peak])
+
+    assert audit["status"] == "replace"
+    assert "late_body_after_section_entry" in audit["flag_codes"]
+    assert audit["preferred_candidate"]["clock_bar"] == 57
+
+
+def test_visual_audit_flags_rejected_blue_section() -> None:
+    rejected = _candidate(55.0, 33, score=0.70, phrase_prior=1.0)
+    later = _candidate(82.0, 49, score=0.66, phrase_prior=0.96)
+
+    audit = audit_visual_selection(rejected, [rejected, later], rejected_sections=[{"timestamp": 55.0, "clock_bar": 33}])
+
+    assert audit["status"] == "replace"
+    assert "selected_matches_rejected_section" in audit["flag_codes"]
+    assert audit["preferred_candidate"]["clock_bar"] == 49
+
+
+def test_visual_audit_marks_early_intro_when_later_drop_is_stronger() -> None:
+    intro = _candidate(13.714, 9, score=0.68, phrase_prior=0.18, post4=0.54, post8=0.52, bass=0.20)
+    later = _candidate(
+        55.714,
+        33,
+        score=0.77,
+        phrase_prior=0.92,
+        post4=0.72,
+        post8=0.74,
+        bass=0.58,
+        drum=1.0,
+        phrase_body_shift=True,
+    )
+
+    audit = audit_visual_selection(intro, [intro, later])
+
+    assert audit["status"] == "review"
+    assert "intro_before_stronger_drop" in audit["flag_codes"]
 
 
 def test_visual_first_skips_early_jump_when_later_block_is_clearly_taller() -> None:

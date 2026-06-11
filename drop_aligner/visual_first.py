@@ -181,6 +181,300 @@ def _filter_rejected_sections(
     return kept or rows
 
 
+def _visual_components(candidate: Mapping[str, Any]) -> Mapping[str, Any]:
+    value = candidate.get("visual_components")
+    return value if isinstance(value, Mapping) else {}
+
+
+def _visual_clock_bar(candidate: Mapping[str, Any]) -> int:
+    try:
+        return int(_visual_components(candidate).get("clock_bar", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _visual_candidate_time(candidate: Mapping[str, Any]) -> Optional[float]:
+    for key in ("timestamp", "snapped_sec", "time_sec", "visual_raw_chunk_time", "microaligned_time"):
+        value = _finite_float(candidate.get(key))
+        if value is not None:
+            return float(value)
+    return None
+
+
+def _visual_candidate_raw_time(candidate: Mapping[str, Any]) -> Optional[float]:
+    return _finite_float(candidate.get("visual_raw_chunk_time")) or _visual_candidate_time(candidate)
+
+
+def _visual_candidate_score(candidate: Mapping[str, Any]) -> float:
+    return _finite_float(candidate.get("score")) or _finite_float(candidate.get("confidence_score")) or 0.0
+
+
+def _visual_drop_strength(candidate: Mapping[str, Any]) -> float:
+    visual = _visual_components(candidate)
+    phrase_bonus = 0.5 * _clip01((float(visual.get("phrase_prior", 0.0) or 0.0) - 0.48) / 0.44)
+    section_shift = 0.16 if bool(visual.get("phrase_body_shift")) else 0.0
+    local_reentry = 0.10 if bool(visual.get("local_reentry")) else 0.0
+    return _clip01(
+        (0.24 * float(visual.get("post8_height", 0.0) or 0.0))
+        + (0.20 * float(visual.get("post_bass8", 0.0) or 0.0))
+        + (0.18 * float(visual.get("post_drum8", 0.0) or 0.0))
+        + (0.14 * float(visual.get("post_inst8", 0.0) or 0.0))
+        + (0.09 * float(visual.get("jump8", 0.0) or 0.0))
+        + (0.07 * float(visual.get("post_drum_cont8", 0.0) or 0.0))
+        + phrase_bonus
+        + section_shift
+        + local_reentry
+        - (0.08 * float(visual.get("pre_drum_cont4", 0.0) or 0.0))
+    )
+
+
+def _visual_real_drop_like(candidate: Mapping[str, Any]) -> bool:
+    visual = _visual_components(candidate)
+    clock_bar = _visual_clock_bar(candidate)
+    post4 = float(visual.get("post4_height", 0.0) or 0.0)
+    post8 = float(visual.get("post8_height", 0.0) or 0.0)
+    bass = float(visual.get("post_bass8", 0.0) or 0.0)
+    drum = float(visual.get("post_drum8", 0.0) or 0.0)
+    phrase = float(visual.get("phrase_prior", 0.0) or 0.0)
+    local_gap = float(visual.get("local_reentry_gap", 0.0) or 0.0)
+    local_reentry = bool(visual.get("local_reentry"))
+    phrase_shift = bool(visual.get("phrase_body_shift"))
+    if clock_bar <= 0:
+        return False
+    return bool(
+        (
+            local_reentry
+            and local_gap >= 0.220
+            and bass >= 0.420
+            and drum >= 0.880
+            and post4 >= 0.560
+            and post8 >= 0.560
+        )
+        or (
+            phrase_shift
+            and phrase >= 0.780
+            and bass >= 0.320
+            and drum >= 0.880
+            and post4 >= 0.560
+            and post8 >= 0.560
+        )
+    )
+
+
+def _visual_instrumental_bass_section_entry(candidate: Mapping[str, Any]) -> bool:
+    visual = _visual_components(candidate)
+    inst = float(visual.get("post_inst8", 0.0) or 0.0)
+    pre_inst = float(visual.get("pre_inst4", 0.0) or 0.0)
+    return bool(
+        _visual_clock_bar(candidate) >= 33
+        and float(visual.get("phrase_prior", 0.0) or 0.0) >= 0.80
+        and bool(visual.get("phrase_body_shift"))
+        and inst >= 0.500
+        and pre_inst <= 0.380
+        and inst >= pre_inst + 0.220
+        and float(visual.get("post_bass8", 0.0) or 0.0) >= 0.320
+        and float(visual.get("post_drum8", 0.0) or 0.0) >= 0.900
+        and float(visual.get("post4_height", 0.0) or 0.0) >= 0.580
+        and float(visual.get("post8_height", 0.0) or 0.0) >= 0.580
+    )
+
+
+def _visual_has_earlier_real_drop_before(
+    candidates: Sequence[Mapping[str, Any]],
+    candidate: Mapping[str, Any],
+) -> bool:
+    candidate_bar = _visual_clock_bar(candidate)
+    candidate_time = _visual_candidate_raw_time(candidate)
+    for earlier in candidates:
+        if earlier is candidate:
+            continue
+        earlier_bar = _visual_clock_bar(earlier)
+        earlier_time = _visual_candidate_raw_time(earlier)
+        if candidate_bar and earlier_bar:
+            if earlier_bar >= candidate_bar:
+                continue
+        elif candidate_time is not None and earlier_time is not None:
+            if earlier_time >= candidate_time:
+                continue
+        else:
+            continue
+        if _visual_real_drop_like(earlier):
+            return True
+    return False
+
+
+def summarize_visual_candidate(candidate: Mapping[str, Any]) -> Dict[str, Any]:
+    visual = _visual_components(candidate)
+    keys = (
+        "clock_bar",
+        "phrase_prior",
+        "post4_height",
+        "post8_height",
+        "pre4_height",
+        "jump4",
+        "jump8",
+        "post_bass8",
+        "post_drum8",
+        "post_inst8",
+        "pre_inst4",
+        "pre_drum_cont4",
+        "post_drum_cont4",
+        "post_drum_cont8",
+        "local_reentry",
+        "local_reentry_gap",
+        "phrase_body_shift",
+    )
+    components = {key: visual.get(key) for key in keys if key in visual}
+    return {
+        "rank": candidate.get("rank"),
+        "time": _visual_candidate_time(candidate),
+        "raw_time": _visual_candidate_raw_time(candidate),
+        "clock_bar": _visual_clock_bar(candidate),
+        "score": _visual_candidate_score(candidate),
+        "drop_strength": _visual_drop_strength(candidate),
+        "selected_by": str(candidate.get("selected_by") or ""),
+        "reason": str(candidate.get("reason") or ""),
+        "real_drop_like": _visual_real_drop_like(candidate),
+        "instrumental_bass_section_entry": _visual_instrumental_bass_section_entry(candidate),
+        "visual_components": components,
+    }
+
+
+def audit_visual_selection(
+    selected: Mapping[str, Any],
+    candidates: Sequence[Mapping[str, Any]],
+    *,
+    rejected_sections: Optional[Sequence[Mapping[str, Any]]] = None,
+) -> Dict[str, Any]:
+    rows = [dict(row) for row in candidates if isinstance(row, Mapping)]
+    if selected:
+        selected_time = _visual_candidate_time(selected)
+        if not any(
+            selected_time is not None
+            and _visual_candidate_time(row) is not None
+            and abs(float(_visual_candidate_time(row)) - float(selected_time)) <= 0.010
+            for row in rows
+        ):
+            rows.insert(0, dict(selected))
+
+    flags: List[Dict[str, Any]] = []
+    selected_bar = _visual_clock_bar(selected)
+    selected_time = _visual_candidate_time(selected)
+    selected_strength = _visual_drop_strength(selected)
+    preferred: Optional[Dict[str, Any]] = None
+    recommended_action = "accept"
+
+    if _candidate_rejected_by_section(selected, list(rejected_sections or [])):
+        later = [
+            row
+            for row in rows
+            if not _candidate_rejected_by_section(row, list(rejected_sections or []))
+            and _visual_candidate_time(row) is not None
+            and (selected_time is None or float(_visual_candidate_time(row)) > float(selected_time) + 0.750)
+        ]
+        later.sort(key=lambda row: (-_visual_drop_strength(row), _visual_candidate_time(row) or 1e18))
+        if later:
+            preferred = dict(later[0])
+            recommended_action = "replace"
+        flags.append(
+            {
+                "code": "selected_matches_rejected_section",
+                "severity": "high",
+                "message": "Selected blue marker lands in a section the user already skipped/rejected.",
+            }
+        )
+
+    earlier_entries = [
+        row
+        for row in rows
+        if _visual_instrumental_bass_section_entry(row)
+        and not _visual_has_earlier_real_drop_before(rows, row)
+        and _visual_candidate_time(row) is not None
+        and selected_time is not None
+        and float(_visual_candidate_time(row)) + 1.200 < float(selected_time)
+        and (_visual_clock_bar(row) == 0 or selected_bar == 0 or _visual_clock_bar(row) + 1 < selected_bar)
+    ]
+    if earlier_entries:
+        earlier_entries.sort(key=lambda row: (_visual_candidate_time(row) or 1e18, -_visual_drop_strength(row)))
+        entry = dict(earlier_entries[0])
+        if preferred is None or _visual_drop_strength(entry) >= _visual_drop_strength(preferred) - 0.050:
+            preferred = entry
+            recommended_action = "replace"
+        flags.append(
+            {
+                "code": "late_body_after_section_entry",
+                "severity": "high",
+                "message": "Selected blue marker appears to be inside the drop body after an earlier first drop section entry.",
+            }
+        )
+
+    if selected_bar and selected_bar <= 17:
+        later_stronger = [
+            row
+            for row in rows
+            if _visual_candidate_time(row) is not None
+            and selected_time is not None
+            and float(_visual_candidate_time(row)) > float(selected_time) + 6.0
+            and _visual_clock_bar(row) >= selected_bar + 4
+            and _visual_real_drop_like(row)
+            and _visual_drop_strength(row) >= selected_strength + 0.140
+        ]
+        later_stronger.sort(key=lambda row: (-_visual_drop_strength(row), _visual_candidate_time(row) or 1e18))
+        if later_stronger:
+            if recommended_action != "replace":
+                recommended_action = "review"
+            flags.append(
+                {
+                    "code": "intro_before_stronger_drop",
+                    "severity": "medium",
+                    "message": "Selected blue marker is early while a later candidate has a stronger full drop profile.",
+                    "preferred_candidate": summarize_visual_candidate(later_stronger[0]),
+                }
+            )
+
+    body_shift_candidates = []
+    if not _visual_instrumental_bass_section_entry(selected):
+        body_shift_candidates = [
+            row
+            for row in rows
+            if _visual_candidate_time(row) is not None
+            and selected_time is not None
+            and float(_visual_candidate_time(row)) < float(selected_time) - 0.500
+            and bool(_visual_components(row).get("phrase_body_shift"))
+            and _visual_drop_strength(row) >= selected_strength - 0.080
+        ]
+    if body_shift_candidates and selected_bar and _visual_clock_bar(body_shift_candidates[0]) < selected_bar:
+        if recommended_action == "accept":
+            recommended_action = "review"
+        body_shift_candidates.sort(key=lambda row: (_visual_candidate_time(row) or 1e18))
+        flags.append(
+            {
+                "code": "earlier_phrase_body_edge_available",
+                "severity": "medium",
+                "message": "An earlier phrase/body edge is close in strength; verify the blue marker is not late.",
+                "preferred_candidate": summarize_visual_candidate(body_shift_candidates[0]),
+            }
+        )
+
+    status = "pass"
+    if recommended_action == "replace":
+        status = "replace"
+    elif flags:
+        status = "review"
+
+    return {
+        "ok": bool(selected),
+        "status": status,
+        "recommended_action": recommended_action,
+        "flags": flags,
+        "flag_codes": [str(flag.get("code")) for flag in flags],
+        "selected": summarize_visual_candidate(selected) if selected else {},
+        "preferred_candidate": summarize_visual_candidate(preferred) if preferred else None,
+        "candidate_count": len(rows),
+        "candidates": [summarize_visual_candidate(row) for row in rows[:10]],
+    }
+
+
 def _mean(values: Sequence[float]) -> float:
     if not values:
         return 0.0
@@ -1375,7 +1669,13 @@ def visual_first_marker(
             else {}
         )
         if _use_visual_drop_v2_result(visual_v2) and not _candidate_rejected_by_section(selected_v2, rejected_sections):
-            return dict(visual_v2)
+            visual_v2 = dict(visual_v2)
+            visual_v2["visual_audit"] = audit_visual_selection(
+                selected_v2,
+                [row for row in visual_v2.get("candidates") or [] if isinstance(row, Mapping)],
+                rejected_sections=rejected_sections,
+            )
+            return visual_v2
     except Exception:
         visual_v2 = None
 
@@ -1494,6 +1794,7 @@ def visual_first_marker(
             if abs(float(candidate.get("timestamp", 0.0) or 0.0) - marker) > 0.010:
                 deduped.append(dict(candidate))
         candidates = deduped[:10]
+    audit = audit_visual_selection(selected, candidates, rejected_sections=rejected_sections)
     return {
         "ok": True,
         "version": VISUAL_FIRST_VERSION,
@@ -1502,6 +1803,7 @@ def visual_first_marker(
         "raw_visual_time": float(raw_time),
         "selected_candidate": selected,
         "candidates": [dict(row) for row in candidates[:10]],
+        "visual_audit": audit,
         "feature_map": {
             "ok": bool(feature_map.get("ok")),
             "bar_count": int(feature_map.get("bar_count", 0) or 0),

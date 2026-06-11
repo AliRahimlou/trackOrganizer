@@ -3146,6 +3146,7 @@ class ReviewApp:
             "raw_visual_time": visual.get("raw_visual_time"),
             "marker": float(marker),
             "source": item["selected_by"],
+            "audit": visual.get("visual_audit") if isinstance(visual.get("visual_audit"), Mapping) else {},
         }
         item["auto_accept"] = _review_required_auto_accept(
             "visual-first waveform marker requires review",
@@ -4097,6 +4098,7 @@ class ReviewApp:
                         "version": visual.get("version"),
                         "raw_visual_time": visual.get("raw_visual_time"),
                         "feature_map": visual.get("feature_map") or {},
+                        "audit": visual.get("visual_audit") if isinstance(visual.get("visual_audit"), Mapping) else {},
                     }
                 },
                 "candidates": candidates,
