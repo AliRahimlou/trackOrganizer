@@ -6,6 +6,7 @@ import pytest
 
 from drop_aligner.visual_first import (
     _filter_rejected_sections,
+    _opening_drop_profile,
     _use_visual_drop_v2_result,
     _zoomed_marker_time,
     audit_visual_selection,
@@ -466,6 +467,31 @@ def test_visual_first_keeps_first_clean_dense_reentry_over_nearby_body() -> None
     assert selected["visual_components"]["clock_bar"] == 9
 
 
+def test_opening_drop_profile_detects_tracks_that_start_in_the_drop() -> None:
+    rows = []
+    rows.append({"aggregate": 0.46, "groove": 0.54, "bass": 0.22, "drum": 1.0, "inst": 0.58, "vocal": 0.20})
+    for _ in range(1, 12):
+        rows.append({"aggregate": 0.68, "groove": 0.72, "bass": 0.50, "drum": 1.0, "inst": 0.62, "vocal": 0.10})
+    for _ in range(12, 16):
+        rows.append({"aggregate": 0.60, "groove": 0.64, "bass": 0.42, "drum": 1.0, "inst": 0.52, "vocal": 0.10})
+    feature_map = _component_feature_map(rows, bpm=142.0)
+
+    profile = _opening_drop_profile(feature_map)
+
+    assert profile is not None
+    assert profile["avg2_9_height"] >= 0.62
+    assert profile["dense_opening_bars"] >= 10
+
+
+def test_opening_drop_profile_ignores_sparse_intro_tracks() -> None:
+    rows = [{"height": 0.08, "bass": 0.02, "drum": 0.0, "inst": 0.30} for _ in range(16)]
+    for idx in range(8, 16):
+        rows[idx] = {"aggregate": 0.52, "groove": 0.54, "bass": 0.28, "drum": 0.70, "inst": 0.45}
+    feature_map = _component_feature_map(rows, bpm=140.0)
+
+    assert _opening_drop_profile(feature_map) is None
+
+
 def test_visual_first_allows_guarded_early_body_before_bar_nine() -> None:
     rows = [{"height": 0.14, "drum_cont": 0.0} for _ in range(20)]
     rows[4] = {"aggregate": 0.46, "groove": 0.52, "bass": 0.42, "drum": 0.80, "inst": 0.54, "vocal": 0.15, "drum_cont": 0.50}
@@ -705,6 +731,11 @@ def test_zoomed_marker_rejects_large_forward_low_confidence_snap() -> None:
         (
             "/Users/alirahimlou/Desktop/MUSIC/STEMS/140/9A/Ravenscoon - Free Your Mind/drums_140_9A_8-Ravenscoon - Free Your Mind.flac",
             58.239864,
+            0.05,
+        ),
+        (
+            "/Users/alirahimlou/Desktop/MUSIC/STEMS/142/9A/When I Look at You - Emalkay/drums_142_9A_8-When I Look at You - Emalkay.flac",
+            1.231360544217687,
             0.05,
         ),
         (

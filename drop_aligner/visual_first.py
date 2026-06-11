@@ -495,6 +495,134 @@ def _window_mean(heights: Sequence[float], start: int, end: int) -> float:
     return _mean(list(heights[max(0, int(start)) : min(len(heights), int(end))]))
 
 
+def _opening_drop_profile(feature_map: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    bars = [bar for bar in feature_map.get("bars") or [] if isinstance(bar, Mapping)]
+    if len(bars) < 9:
+        return None
+    beatgrid = feature_map.get("beatgrid") if isinstance(feature_map.get("beatgrid"), Mapping) else {}
+    beat_sec = _finite_float(beatgrid.get("beat_sec"))
+    bar_sec = _finite_float(beatgrid.get("bar_sec"))
+    if beat_sec is None or beat_sec <= 0.0 or bar_sec is None or bar_sec <= 0.0:
+        return None
+
+    heights = [_bar_height(bar) for bar in bars[:16]]
+    opening = bars[1:9]
+    avg1_4 = _mean(heights[:4])
+    avg2_9 = _mean(heights[1:9])
+    avg_bass = _mean([float(bar.get("bass_low_energy", 0.0) or 0.0) for bar in opening])
+    avg_drum = _mean([float(bar.get("drum_density", 0.0) or 0.0) for bar in opening])
+    avg_inst = _mean([float(bar.get("instrumental_energy", 0.0) or 0.0) for bar in opening])
+    dense_bars = sum(1 for value in heights[:16] if value >= 0.580)
+
+    # "Starts in the drop" tracks have no real intro: the opening bars are
+    # already sustained drums plus bass/full-spectrum energy. This guard keeps
+    # normal intros and small buildups on the standard visual-section flow.
+    if not (
+        avg1_4 >= 0.540
+        and avg2_9 >= 0.620
+        and avg_bass >= 0.340
+        and avg_drum >= 0.880
+        and avg_inst >= 0.420
+        and dense_bars >= 10
+    ):
+        return None
+
+    probe_time = max(0.850, float(beat_sec) * 3.0)
+    probe_time = min(probe_time, max(0.500, float(bar_sec) + 0.250))
+    return {
+        "probe_time": float(probe_time),
+        "beat_sec": float(beat_sec),
+        "bar_sec": float(bar_sec),
+        "avg1_4_height": float(avg1_4),
+        "avg2_9_height": float(avg2_9),
+        "avg_bass2_9": float(avg_bass),
+        "avg_drum2_9": float(avg_drum),
+        "avg_inst2_9": float(avg_inst),
+        "dense_opening_bars": int(dense_bars),
+    }
+
+
+def _opening_drop_start_candidate(audio_path: str, feature_map: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    profile = _opening_drop_profile(feature_map)
+    if profile is None:
+        return None
+    probe_time = float(profile["probe_time"])
+    try:
+        micro = microalign_marker(audio_path, probe_time, search_before_ms=350, search_after_ms=650)
+    except Exception:
+        return None
+    marker = _micro_time(micro if isinstance(micro, Mapping) else {}, "microaligned_time") or probe_time
+    if not (0.250 <= float(marker) <= min(4.0, float(profile["bar_sec"]) * 2.5)):
+        return None
+    try:
+        micro_conf = float(micro.get("micro_confidence", 0.0) or 0.0) if isinstance(micro, Mapping) else 0.0
+    except (TypeError, ValueError):
+        micro_conf = 0.0
+    try:
+        impact_conf = float(micro.get("impact_boundary_confidence", 0.0) or 0.0) if isinstance(micro, Mapping) else 0.0
+    except (TypeError, ValueError):
+        impact_conf = 0.0
+    if max(micro_conf, impact_conf) < 0.720:
+        return None
+
+    selected_score = _clip01(
+        0.48
+        + (0.18 * _clip01((profile["avg2_9_height"] - 0.62) / 0.16))
+        + (0.15 * _clip01((profile["avg_bass2_9"] - 0.34) / 0.20))
+        + (0.10 * _clip01((profile["avg_drum2_9"] - 0.88) / 0.12))
+        + (0.09 * max(micro_conf, impact_conf))
+    )
+    candidate = {
+        "timestamp": float(marker),
+        "snapped_sec": float(marker),
+        "time_sec": float(marker),
+        "microaligned_time": float(marker),
+        "visual_raw_chunk_time": float(probe_time),
+        "score": float(selected_score),
+        "confidence_score": float(selected_score),
+        "selected_by": "visual_gui_opening_drop",
+        "rank": 1,
+        "handcrafted_rank": 1,
+        "microalign": dict(micro) if isinstance(micro, Mapping) else {},
+        "reason": (
+            "visual-only selected opening drop because the first bars are already "
+            "sustained drums/bass/full-spectrum energy"
+        ),
+        "visual_components": {
+            "clock_bar": 1,
+            "phrase_prior": 1.0,
+            "post4_height": float(profile["avg1_4_height"]),
+            "post8_height": float(profile["avg2_9_height"]),
+            "pre4_height": 0.0,
+            "pre8_height": 0.0,
+            "jump4": float(profile["avg1_4_height"]),
+            "jump8": float(profile["avg2_9_height"]),
+            "post_bass8": float(profile["avg_bass2_9"]),
+            "post_drum8": float(profile["avg_drum2_9"]),
+            "post_inst8": float(profile["avg_inst2_9"]),
+            "pre_inst4": 0.0,
+            "pre_drum_cont4": 0.0,
+            "post_drum_cont4": float(profile["avg_drum2_9"]),
+            "post_drum_cont8": float(profile["avg_drum2_9"]),
+            "local_reentry": True,
+            "local_reentry_gap": 0.0,
+            "phrase_body_shift": True,
+            "opening_drop_profile": dict(profile),
+        },
+        "bpm_clock": dict(
+            bpm_clock_for_time(
+                float(marker),
+                (feature_map.get("beatgrid") or {}).get("bpm") if isinstance(feature_map.get("beatgrid"), Mapping) else None,
+                clock_zero_sec=float((feature_map.get("beatgrid") or {}).get("bar_zero_sec", 0.0) or 0.0)
+                if isinstance(feature_map.get("beatgrid"), Mapping)
+                else 0.0,
+            )
+            or {}
+        ),
+    }
+    return candidate
+
+
 def _bar_clock(bar: Mapping[str, Any], beatgrid: Mapping[str, Any]) -> Dict[str, Any]:
     return bpm_clock_for_time(
         float(bar.get("start_sec", 0.0) or 0.0),
@@ -1682,7 +1810,13 @@ def visual_first_marker(
     feature_map = compute_bar_feature_map(audio_path, sample_rate=int(sample_rate), use_cache=use_cache)
     candidates = visual_chunk_candidates(feature_map)
     candidates_for_selection = _filter_rejected_sections(candidates, rejected_sections)
-    selected = select_first_visual_chunk(candidates_for_selection)
+    opening_drop = _opening_drop_start_candidate(audio_path, feature_map)
+    selected = None
+    if opening_drop is not None and not _candidate_rejected_by_section(opening_drop, rejected_sections):
+        selected = dict(opening_drop)
+        candidates_for_selection = [dict(opening_drop)] + [dict(row) for row in candidates_for_selection]
+    if selected is None:
+        selected = select_first_visual_chunk(candidates_for_selection)
     if selected is None:
         return {
             "ok": False,
