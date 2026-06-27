@@ -30,6 +30,34 @@ def _dark_pixel_count(payload: bytes) -> int:
     return int(np.count_nonzero(dark))
 
 
+def test_rms_bins_match_reference_loop_for_uneven_edges() -> None:
+    mono = np.asarray([0.0, 0.25, -0.50, 1.0, -0.75, 0.125, 0.5], dtype=np.float32)
+    bins = 4
+    edges = np.floor(np.linspace(0, int(mono.size), bins + 1)).astype(np.int64)
+    expected = []
+    for idx in range(bins):
+        seg = mono[int(edges[idx]) : int(edges[idx + 1])]
+        expected.append(float(np.sqrt(np.mean(np.square(seg, dtype=np.float32), dtype=np.float64))) if seg.size else 0.0)
+
+    actual = waveform_module._rms_bins_from_mono(mono, bins)
+
+    assert np.allclose(actual, np.asarray(expected, dtype=np.float32))
+
+
+def test_moving_average_matches_prefix_loop_at_boundaries() -> None:
+    values = [0.0, 1.0, 3.0, 9.0, 27.0]
+    radius = 2
+    expected = []
+    for index in range(len(values)):
+        start = max(0, index - radius)
+        end = min(len(values), index + radius + 1)
+        expected.append(sum(values[start:end]) / max(1, end - start))
+
+    actual = waveform_module._moving_average(values, radius)
+
+    assert np.allclose(actual, expected)
+
+
 def test_gzip_json_memory_cache_reuses_payload_without_reparse(tmp_path: Path, monkeypatch) -> None:
     cache_path = tmp_path / "tile.json.gz"
     with gzip.open(cache_path, "wt", encoding="utf-8") as fh:

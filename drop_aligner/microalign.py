@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 import librosa
 import numpy as np
+import soundfile as sf
 from scipy import signal
 
 from .auto_verifier import (
@@ -129,7 +130,20 @@ def _looks_like_drums(path: str) -> bool:
 def _load_window(audio_path: str, candidate_time: float, before_sec: float, after_sec: float) -> tuple[np.ndarray, int, float]:
     start = max(0.0, float(candidate_time) - float(before_sec))
     duration = float(before_sec) + float(after_sec)
-    y, sr = librosa.load(audio_path, sr=None, mono=True, offset=start, duration=duration)
+    try:
+        with sf.SoundFile(str(audio_path)) as fh:
+            sr = int(fh.samplerate)
+            frame_start = max(0, min(int(round(start * sr)), int(fh.frames)))
+            frames = max(0, min(int(round(duration * sr)), int(fh.frames) - frame_start))
+            fh.seek(frame_start)
+            data = fh.read(frames, dtype="float32", always_2d=True)
+        arr = np.asarray(data, dtype=np.float32)
+        if arr.ndim == 2 and arr.shape[1] > 1:
+            y = np.mean(arr, axis=1, dtype=np.float32)
+        else:
+            y = arr.reshape(-1).astype(np.float32, copy=False)
+    except Exception:
+        y, sr = librosa.load(audio_path, sr=None, mono=True, offset=start, duration=duration)
     y = np.asarray(y, dtype=np.float32)
     if y.size == 0:
         raise ValueError(f"Could not load microalignment window: {audio_path}")

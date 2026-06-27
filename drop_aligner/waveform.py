@@ -146,9 +146,14 @@ def _rms_bins_from_mono(data: np.ndarray, bins: int) -> np.ndarray:
     if mono.size == 0:
         return rms
     edges = np.floor(np.linspace(0, int(mono.size), safe_bins + 1)).astype(np.int64)
-    for idx in range(safe_bins):
-        seg = mono[int(edges[idx]) : int(edges[idx + 1])]
-        rms[idx] = _frame_rms(seg)
+    counts = np.diff(edges)
+    non_empty = counts > 0
+    if not bool(np.any(non_empty)):
+        return rms
+    squared = np.square(mono, dtype=np.float32)
+    prefix = np.concatenate([np.asarray([0.0], dtype=np.float64), np.cumsum(squared, dtype=np.float64)])
+    sums = prefix[edges[1:]] - prefix[edges[:-1]]
+    rms[non_empty] = np.sqrt(sums[non_empty] / counts[non_empty]).astype(np.float32, copy=False)
     return rms
 
 
@@ -240,12 +245,11 @@ def _moving_average(values: Sequence[float], radius: int) -> List[float]:
     if safe_radius <= 0 or source.size < 3:
         return [float(v) for v in source]
     prefix = np.concatenate([np.asarray([0.0]), np.cumsum(source)])
-    out: List[float] = []
-    for index in range(int(source.size)):
-        start = max(0, index - safe_radius)
-        end = min(int(source.size), index + safe_radius + 1)
-        out.append(float((prefix[end] - prefix[start]) / max(1, end - start)))
-    return out
+    indices = np.arange(int(source.size), dtype=np.int64)
+    starts = np.maximum(0, indices - safe_radius)
+    ends = np.minimum(int(source.size), indices + safe_radius + 1)
+    counts = np.maximum(1, ends - starts)
+    return ((prefix[ends] - prefix[starts]) / counts).astype(np.float64, copy=False).tolist()
 
 
 def _bool_runs(values: Sequence[bool]) -> List[tuple[int, int]]:
@@ -852,10 +856,18 @@ class WaveformCache:
         if total <= PEAK_FULL_READ_LIMIT:
             data = self._read_frames(path, start_sample, end_sample)
             data = _mono_preserve_peak(data)
-            for idx in range(bins):
-                seg = data[int(edges[idx]) : int(edges[idx + 1])]
-                mins[idx], maxs[idx] = _frame_min_max(seg)
-                rms[idx] = _frame_rms(seg)
+            counts = np.diff(edges)
+            if data.size and bool(np.all(counts > 0)):
+                starts = edges[:-1]
+                mins = np.minimum.reduceat(data, starts).astype(np.float32, copy=False)
+                maxs = np.maximum.reduceat(data, starts).astype(np.float32, copy=False)
+                sums = np.add.reduceat(np.square(data, dtype=np.float32), starts).astype(np.float64, copy=False)
+                rms = np.sqrt(sums / counts).astype(np.float32, copy=False)
+            else:
+                for idx in range(bins):
+                    seg = data[int(edges[idx]) : int(edges[idx + 1])]
+                    mins[idx], maxs[idx] = _frame_min_max(seg)
+                    rms[idx] = _frame_rms(seg)
         else:
             mins.fill(np.inf)
             maxs.fill(-np.inf)
@@ -899,7 +911,7 @@ class WaveformCache:
             "rms": _json_safe(np.clip(rms, 0.0, 1.0), digits=7),
         }
 
-    def _global_rms_profile(self, path: Path, total_samples: int) -> Dict[str, Any]:
+    def _global_rms_profile(self, path: Path, total_samples: int, sample_rate: int) -> Dict[str, Any]:
         cache_path = self._profile_cache_path(path)
         if cache_path.exists():
             try:
@@ -951,7 +963,7 @@ class WaveformCache:
             "global_rms_profile_samples_per_bin": float(total_samples / max(1, bins)),
         }
         profile.update({f"global_{key}": value for key, value in stats.items()})
-        profile_sample_rate = max(1, int(sf.info(str(path)).samplerate))
+        profile_sample_rate = max(1, int(sample_rate))
         body_bin_span = float((total_samples / max(1, bins)) / profile_sample_rate) if total_samples > 0 else 0.0
         body_radius = max(1, int(round((BOOM_BODY_SMOOTH_SECONDS / max(body_bin_span, 1e-9)) / 2.0)))
         energy = [_boom_rms_amplitude(float(value), stats, {}) for value in rms]
@@ -1010,7 +1022,7 @@ class WaveformCache:
             amplitude_values = list(payload.get("mins", [])) + list(payload.get("maxs", []))
         peak = max((abs(float(v)) for v in amplitude_values), default=1.0)
         rms_stats = _rms_stats(payload.get("rms", []))
-        global_profile = self._global_rms_profile(path, total_samples)
+        global_profile = self._global_rms_profile(path, total_samples, sr)
         boom_masks = _boom_masks(
             payload.get("rms", []),
             start_sec=float(start / sr),
