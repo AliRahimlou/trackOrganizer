@@ -1,0 +1,5 @@
+-r requirements.txt
+
+# Optional CuPy backend for CUDA 12.x systems.
+# Use requirements.txt on CPU-only machines.
+cupy-cuda12x>=13.0
