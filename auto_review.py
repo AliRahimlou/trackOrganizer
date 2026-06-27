@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from drop_aligner.als import modify_als
 from drop_aligner.exclusions import row_has_excluded_path
+from drop_aligner.legacy_write_guard import add_legacy_detector_write_arg, require_legacy_detector_write_opt_in
 from drop_aligner.microalign import choose_microaligned_candidate, microalign_candidate_dicts, should_auto_accept
 from verify_als import verify_als
 
@@ -197,11 +198,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--review-low-only", action="store_true")
     parser.add_argument("--review-medium-and-low", action="store_true")
     parser.add_argument("--max-tracks", type=int)
+    add_legacy_detector_write_arg(parser)
     return parser
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
+    require_legacy_detector_write_opt_in(
+        "auto_review.py",
+        action="writing legacy auto-review logs or regenerated ALS files",
+        explicit=bool(args.allow_legacy_detector_write),
+    )
     rows = _filter_rows(
         _read_summary(args.summary_csv),
         low_only=bool(args.review_low_only),

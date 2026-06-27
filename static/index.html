@@ -7,7 +7,7 @@
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-title" content="Drop Review" />
     <title>Drop Aligner Review</title>
-  <link rel="stylesheet" href="/static/style.css?v=visual-manual-flow-20260607j" />
+  <link rel="stylesheet" href="/static/style.css?v=visual-boom-gated-20260622b" />
   </head>
   <body>
     <main class="app">
@@ -30,8 +30,8 @@
 
         <section class="reviewFocus">
           <div class="panelHeader">
-            <h2>Top candidates</h2>
-            <span id="candidateHelp" class="muted">Tap a number, then tap Save.</span>
+            <h2>Visual review</h2>
+            <span id="candidateHelp" class="muted">Click waveform to play. Place 1.1.1 only when setting green manually.</span>
           </div>
           <ol id="candidateList" class="candidateList"></ol>
           <details id="debugDetails" class="debugDetails">
@@ -48,13 +48,13 @@
           <button id="playMarkerBtn" class="secondary">Play marker</button>
           <button id="stopBtn" class="secondary">Stop</button>
           <button id="fullTrackBtn" class="secondary">Whole track</button>
-          <button id="aiWindowBtn" class="secondary active">AI window</button>
+          <button id="aiWindowBtn" class="secondary active">Blue window</button>
           <button class="secondary presetBtn" data-preset="5s">+-5s</button>
           <button class="secondary presetBtn" data-preset="500ms">+-500ms</button>
           <button class="secondary presetBtn" data-preset="50ms">+-50ms</button>
           <button class="secondary presetBtn" data-preset="5ms">+-5ms</button>
           <button class="secondary presetBtn" data-preset="1ms">+-1ms</button>
-          <button id="jumpAiBtn" class="secondary">Jump to AI</button>
+          <button id="jumpAiBtn" class="secondary">Jump to blue</button>
           <button id="exportPngBtn" class="secondary">Export PNG</button>
           <span id="audioStatus" class="muted"></span>
           <span id="playStatus" class="muted"></span>
@@ -70,7 +70,8 @@
           <button id="zoomInBtn" class="secondary">Zoom in</button>
           <button id="zoomResetBtn" class="secondary">Reset zoom</button>
           <div class="waveModeGroup" aria-label="Waveform visual mode">
-            <button id="rmsWaveBtn" class="secondary active" type="button">RMS</button>
+            <button id="boomWaveBtn" class="secondary active" type="button">Boom</button>
+            <button id="rmsWaveBtn" class="secondary" type="button">RMS</button>
             <button id="peakWaveBtn" class="secondary" type="button">Peaks</button>
           </div>
           <span id="zoomLabel" class="muted">Fit</span>
@@ -81,15 +82,11 @@
       <aside class="sidePane">
         <div class="buttons">
           <div class="acceptActions">
-            <button id="approveBtn" class="primary markerAccept ai">ACCEPT AI MARKER</button>
-            <button id="acceptKneeBtn" class="secondary markerAccept knee disabled">ACCEPT KNEE MARKER</button>
-            <button id="acceptGridBtn" class="secondary markerAccept grid disabled">ACCEPT BLUE LINE</button>
+            <button id="acceptGridBtn" class="primary markerAccept grid disabled">ACCEPT BLUE</button>
             <button id="saveCorrectionBtn" class="primary disabled">SAVE PLACED</button>
           </div>
           <div class="toolActions">
-            <button id="placeBtn" class="secondary">PLACE MANUAL</button>
-            <button id="aiAutoPlaceBtn" class="secondary">AI AUTO PLACE</button>
-            <button id="aiRefineBtn" class="secondary">AI REFINE</button>
+            <button id="placeBtn" class="secondary">PLACE 1.1.1</button>
             <button id="clearMarkerBtn" class="secondary disabled">CLEAR</button>
             <button id="skipBtn" class="secondary">SKIP</button>
             <button id="wavePlayBtn" class="wavePlayButton" type="button" aria-label="Play or pause">PLAY</button>
@@ -101,7 +98,7 @@
           <summary>Review details</summary>
           <div class="meta">
             <div class="metric">
-              <span>AI marker</span>
+              <span>Blue marker</span>
               <strong id="aiPick">--</strong>
             </div>
             <div class="metric">
@@ -157,7 +154,7 @@
               <strong id="laterMatchScore">--</strong>
             </div>
             <div class="metric">
-              <span>Knee marker</span>
+              <span>Micro marker</span>
               <strong id="microMarker">none</strong>
             </div>
             <div class="metric">
@@ -203,6 +200,6 @@
         </details>
       </aside>
     </main>
-    <script src="/static/app.js?v=visual-manual-flow-20260610a"></script>
+    <script src="/static/app.js?v=visual-boom-gated-20260622b"></script>
   </body>
 </html>

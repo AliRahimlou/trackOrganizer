@@ -473,6 +473,10 @@ body.visualFirst .waveWrapper {
   padding: 14px;
 }
 
+body.visualFirst .reviewFocus {
+  display: none;
+}
+
 .panelHeader {
   display: flex;
   align-items: baseline;
@@ -603,7 +607,7 @@ body.visualFirst .waveWrapper {
 }
 
 .acceptActions {
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
 .toolActions {

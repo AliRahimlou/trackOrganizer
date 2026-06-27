@@ -57,6 +57,8 @@ overrides/
 .review_previews/
 eval_reports/
 models/
+artifacts/
+backups/
 
 # ALSDrop generated assets (keep source code under alsdrop/)
 alsdrop/data/

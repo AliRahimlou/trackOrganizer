@@ -2,11 +2,22 @@
 
 Drop-aligner docs live in [drop_aligner/README.md](drop_aligner/README.md).
 
-The active detector combines the original DSP score with DrumPrint, MicroSnap,
-and a sustained full-groove transition layer so candidates are ranked by the
-start of a real drum section, not just the loudest transient.
+The active production path is visual-first Boom-waveform alignment. It works
+from the full drums-stem waveform, proves the marker against the sustained
+drum/bass body, checks the BPM one, and blocks stale non-visual detector writes.
 
-Fully automated library run:
+Visual-first `1.1.1` automation:
+
+```bash
+python3 run_visual_111_automation.py --force
+```
+
+This runs the same full-drums-waveform path used in manual review: locate the
+drop body visually, refine to the first launch edge, require the BPM-grid one,
+then validate the generated ALS/report with fail-closed production checks. Holds
+are written to the generated failure and audit CSVs instead of being approved.
+
+Legacy full automation:
 
 ```bash
 ./run_full_automation.sh
@@ -18,18 +29,20 @@ fusion layer override the old detector when the evidence gate marks the
 candidate safe. Close calls are written to each track's `drop_fusion_audit.json`
 and held to the existing detector path instead of blindly rewriting 1.1.1.
 
-Recommended pilot flow:
+Recommended production flow:
 
 ```bash
-python3 batch.py "/path/to/edm/library" --template "CH1.als" --recursive --debug-candidates --use-drumprint --microalign --workers 4 --force
-python3 web_review.py drop_batch_summary.csv --template "CH1.als" --review-medium-and-low --regenerate-als-on-correction --open-browser
-python3 review.py drop_batch_summary.csv --retrain
-python3 evaluate_ranker.py --corrections drop_corrections.jsonl --model models/drop_ranker.pkl
-python3 compare_drumprint.py drop_batch_summary.csv --template "CH1.als" --corrections drop_corrections.jsonl --workers 4
-python3 compare_microalign.py drop_batch_summary.csv --template "CH1.als" --corrections drop_corrections.jsonl --workers 4
-python3 pilot_report.py --batch-summary drop_batch_summary.csv --corrections drop_corrections.jsonl --evaluation models/evaluation_report.json --drumprint-ablation models/drumprint_eval/drumprint_ablation_report.json --microalign-ablation models/microalign_eval/microalign_ablation_report.json
+python3 build_fresh_visual_first_library_set.py --workers 4 --force
+python3 validate_visual_first_production.py /path/to/visual_first_report.json --out-dir /path/to/output-dir --workers 4
+python3 web_review.py /path/to/visual_first_summary.csv --template "alsFiles/128.als" --visual-first --no-open-browser
 ```
 
-Do not enable conservative auto-review broadly until MicroSnap improves median
-error, 10ms accuracy, or 25ms accuracy without meaningful HIGH-confidence
-regressions.
+`validate_visual_first_production.py` reruns the current visual-first detector by
+default and requires those fresh markers to match the saved production report.
+Use `--no-rerun-detector` only for a quick persisted-payload audit, not for a
+production-ready library gate.
+
+`batch.py`, `main.py`, `auto_review.py`, `apply_auto_place_initial.py`, and
+`reanalyze_remaining_hard_cases.py` are legacy non-visual write paths. They are
+blocked by default and require `--allow-legacy-detector-write` or
+`TRACK_ORGANIZER_ALLOW_LEGACY_WRITES=1` for an intentional experiment.

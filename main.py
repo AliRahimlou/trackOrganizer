@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional
 
 from drop_aligner.als import modify_als
 from drop_aligner.detector import DropDetectorConfig, detect_drop, extract_features
+from drop_aligner.legacy_write_guard import add_legacy_detector_write_arg, require_legacy_detector_write_opt_in
 from drop_aligner.learning import closest_candidate_to_pick, log_correction
 
 
@@ -42,6 +43,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-microalign", dest="use_microalign", action="store_false", help="Disable sample-level MicroSnap marker refinement")
     parser.add_argument("--user-pick", type=float, help="Optional manually corrected pick in seconds; logs correction data")
     parser.add_argument("--correction-log", default="drop_corrections.jsonl", help="Correction JSONL path")
+    add_legacy_detector_write_arg(parser)
     return parser
 
 
@@ -93,6 +95,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         output_path = str(audio.with_name(f"{audio.stem}_DROP_ALIGNED.als"))
     else:
         output_path = os.path.abspath(output_path)
+    require_legacy_detector_write_opt_in(
+        "main.py",
+        action="writing a legacy detector ALS/candidate/debug output",
+        explicit=bool(args.allow_legacy_detector_write),
+    )
 
     cfg = DropDetectorConfig(
         min_drop_time_sec=float(args.min_drop_sec),

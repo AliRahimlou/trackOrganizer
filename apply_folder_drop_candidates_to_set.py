@@ -14,6 +14,7 @@ import xml.etree.ElementTree as ET
 from typing import Dict, List, Optional, Tuple
 
 from drop_aligner.als import _duration_info
+from drop_aligner.legacy_write_guard import add_legacy_detector_write_arg, require_legacy_detector_write_opt_in
 
 
 ROLE_RE = re.compile(r"^(drums|inst|vocals)_", re.I)
@@ -328,7 +329,14 @@ def apply_local_candidates(
     min_delta_sec: float,
     only_missing: bool,
     dry_run: bool,
+    allow_legacy_detector_write: bool = False,
 ) -> Dict[str, int]:
+    if not dry_run:
+        require_legacy_detector_write_opt_in(
+            "apply_folder_drop_candidates_to_set.py",
+            action="retiming a combined ALS from local drop_candidates/DROP_ALIGNED files",
+            explicit=bool(allow_legacy_detector_write),
+        )
     root = ET.fromstring(gzip.open(als_in, "rb").read())
     stats = {
         "rows_total": 0,
@@ -386,6 +394,7 @@ def main() -> int:
     parser.add_argument("--min-delta-sec", type=float, default=0.040)
     parser.add_argument("--only-missing", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    add_legacy_detector_write_arg(parser)
     args = parser.parse_args()
     stats = apply_local_candidates(
         os.path.abspath(args.als),
@@ -393,6 +402,7 @@ def main() -> int:
         min_delta_sec=float(args.min_delta_sec),
         only_missing=bool(args.only_missing),
         dry_run=bool(args.dry_run),
+        allow_legacy_detector_write=bool(args.allow_legacy_detector_write),
     )
     print(stats)
     return 0

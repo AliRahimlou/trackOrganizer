@@ -103,6 +103,8 @@ def visual_drop_v2_candidates(
         post_drum_density8 = _window_mean(drum_density, idx, idx + 8)
         post_inst8 = _window_mean(inst, idx, idx + 8)
         post_vocal8 = _window_mean(vocal, idx, idx + 8)
+        pre_inst8 = _window_mean(inst, idx - 8, idx)
+        pre_vocal8 = _window_mean(vocal, idx - 8, idx)
         pre_drum_occ4 = _window_mean(drum_occ, idx - 4, idx)
         post_drum_occ4 = _window_mean(drum_occ, idx, idx + 4)
         post_drum_occ8 = _window_mean(drum_occ, idx, idx + 8)
@@ -127,11 +129,24 @@ def visual_drop_v2_candidates(
         on_one = bool(clock.get("on_one"))
         one_distance = clock.get("one_distance_ms")
         one_distance_ms = 999999.0 if one_distance is None else float(one_distance)
+        texture_release = bool(pre_inst8 >= post_inst8 + 0.220 and post_inst8 <= 0.320)
+        phrase_body_entry = bool(
+            phrase_prior >= 0.860
+            and body >= 0.650
+            and post4 >= max(0.620, 0.82 * max_body8)
+            and post8 >= max(0.620, 0.84 * max_body8)
+            and post_bass8 >= 0.500
+            and post_drum_occ4 >= 0.880
+            and post_drum_occ8 >= 0.900
+            and post_vocal8 <= 0.360
+            and texture_release
+        )
         edge_like = bool(
             transition >= 0.095
             or local_reentry_gap >= 0.135
             or continuity_jump >= 0.180
             or (pre_drum_occ4 <= 0.360 and post_drum_occ4 >= 0.780)
+            or phrase_body_entry
         )
         body_like = bool(
             body >= max(0.500, 0.72 * max_body8)
@@ -191,12 +206,16 @@ def visual_drop_v2_candidates(
                     "post_drum8": float(post_drum_density8),
                     "post_inst8": float(post_inst8),
                     "post_vocal8": float(post_vocal8),
+                    "pre_inst8": float(pre_inst8),
+                    "pre_vocal8": float(pre_vocal8),
                     "pre_drum_cont4": float(pre_drum_occ4),
                     "post_drum_cont4": float(post_drum_occ4),
                     "post_drum_cont8": float(post_drum_occ8),
                     "one_distance_ms": float(one_distance_ms),
                     "edge_like": bool(edge_like),
                     "body_like": bool(body_like),
+                    "texture_release": bool(texture_release),
+                    "phrase_body_entry": bool(phrase_body_entry),
                 },
                 "bpm_clock": dict(clock),
             }
@@ -222,6 +241,37 @@ def _metric(candidate: Mapping[str, Any], key: str) -> float:
     return float(_components(candidate).get(key, 0.0) or 0.0)
 
 
+def _micro_time(micro: Mapping[str, Any], key: str) -> Optional[float]:
+    try:
+        value = float(micro.get(key))
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(value) or value <= 0.0:
+        return None
+    return float(value)
+
+
+def _micro_metric(micro: Mapping[str, Any], key: str) -> float:
+    try:
+        value = float(micro.get(key, 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    if not np.isfinite(value):
+        return 0.0
+    return float(value)
+
+
+def _micro_body_hit_score(micro: Mapping[str, Any]) -> float:
+    return _clip01(
+        (0.24 * _micro_metric(micro, "micro_confidence"))
+        + (0.24 * _micro_metric(micro, "impact_boundary_confidence"))
+        + (0.18 * _micro_metric(micro, "attack_peak_strength"))
+        + (0.16 * _micro_metric(micro, "denoised_impact_strength"))
+        + (0.10 * _micro_metric(micro, "rms_rise_score"))
+        + (0.08 * _micro_metric(micro, "peak_rise_score"))
+    )
+
+
 def _clear_song_start_drop(candidate: Mapping[str, Any]) -> bool:
     return bool(
         _clock_bar(candidate) <= 21
@@ -231,8 +281,65 @@ def _clear_song_start_drop(candidate: Mapping[str, Any]) -> bool:
         and _metric(candidate, "post8_height") >= 0.560
         and _metric(candidate, "post_bass8") >= 0.300
         and _metric(candidate, "pre_drum_cont4") <= 0.250
+        and _metric(candidate, "post_drum_cont4") >= 0.840
+        and _metric(candidate, "post_drum_cont8") >= 0.870
+        and _metric(candidate, "post_inst8") <= 0.430
         and _metric(candidate, "transition") >= 0.150
     )
+
+
+def _phrase_body_entry(candidate: Mapping[str, Any]) -> bool:
+    visual = _components(candidate)
+    return bool(
+        visual.get("phrase_body_entry")
+        or (
+            _metric(candidate, "phrase_prior") >= 0.860
+            and _metric(candidate, "body_score") >= 0.650
+            and _metric(candidate, "post4_height") >= 0.620
+            and _metric(candidate, "post8_height") >= 0.620
+            and _metric(candidate, "post_bass8") >= 0.500
+            and _metric(candidate, "post_drum_cont4") >= 0.880
+            and _metric(candidate, "post_drum_cont8") >= 0.900
+            and _metric(candidate, "post_inst8") <= 0.320
+            and _metric(candidate, "post_vocal8") <= 0.360
+        )
+    )
+
+
+def _vocal_texture_buildup_to_later_primary_drop(current: Mapping[str, Any], later: Mapping[str, Any]) -> bool:
+    row_bar = _clock_bar(current)
+    later_bar = _clock_bar(later)
+    if row_bar > 21 or later_bar <= row_bar + 8 or later_bar > 57:
+        return False
+    if _metric(later, "phrase_prior") < 0.860:
+        return False
+
+    current_vocal = _metric(current, "post_vocal8")
+    later_vocal = _metric(later, "post_vocal8")
+    current_texture = max(current_vocal, _metric(current, "post_inst8"))
+    later_texture = max(later_vocal, _metric(later, "post_inst8"))
+    vocal_build = bool(
+        current_vocal >= 0.500
+        and later_vocal <= current_vocal - 0.240
+        and later_vocal <= 0.420
+    )
+    darker_release = bool(
+        later_texture <= current_texture - 0.140
+        or _metric(later, "post_bass8") >= _metric(current, "post_bass8") + 0.035
+    )
+    comparable_body = bool(
+        _metric(later, "body_score") >= max(0.560, _metric(current, "body_score") - 0.055)
+        and _metric(later, "post4_height") >= _metric(current, "post4_height") - 0.030
+        and _metric(later, "post8_height") >= _metric(current, "post8_height") - 0.030
+    )
+    real_drop_body = bool(
+        _metric(later, "post_bass8") >= max(0.400, _metric(current, "post_bass8") + 0.030)
+        and _metric(later, "post_drum8") >= 0.940
+        and _metric(later, "post_drum_cont4") >= 0.720
+        and _metric(later, "post_drum_cont8") >= 0.700
+        and float(later.get("score", 0.0) or 0.0) >= max(0.390, float(current.get("score", 0.0) or 0.0) - 0.250)
+    )
+    return bool(vocal_build and darker_release and comparable_body and real_drop_body)
 
 
 def _overwhelming_later_upgrade(current: Mapping[str, Any], later: Mapping[str, Any]) -> bool:
@@ -242,6 +349,36 @@ def _overwhelming_later_upgrade(current: Mapping[str, Any], later: Mapping[str, 
         and _metric(later, "post_bass8") >= _metric(current, "post_bass8") + 0.080
         and float(later.get("score", 0.0) or 0.0) >= float(current.get("score", 0.0) or 0.0) - 0.020
     )
+
+
+def _near_later_phrase_body_entry(current: Mapping[str, Any], later: Mapping[str, Any]) -> bool:
+    row_bar = _clock_bar(current)
+    later_bar = _clock_bar(later)
+    if row_bar > 24 or later_bar <= row_bar or later_bar > row_bar + 8 or later_bar > 57:
+        return False
+    if not _phrase_body_entry(later):
+        return False
+    if float(later.get("score", 0.0) or 0.0) < max(0.390, float(current.get("score", 0.0) or 0.0) - 0.140):
+        return False
+
+    current_build_or_fill = bool(
+        _metric(current, "phrase_prior") < 0.860
+        or _metric(current, "post_drum_cont4") <= 0.860
+        or _metric(current, "post_drum_cont8") <= 0.890
+        or _metric(current, "post_inst8") >= _metric(later, "post_inst8") + 0.160
+    )
+    later_is_real_body = bool(
+        _metric(later, "body_score") >= max(0.650, _metric(current, "body_score") - 0.020)
+        and _metric(later, "post4_height") >= _metric(current, "post4_height") - 0.055
+        and _metric(later, "post8_height") >= _metric(current, "post8_height") - 0.040
+        and _metric(later, "post_bass8") >= _metric(current, "post_bass8") - 0.010
+        and (
+            _metric(later, "post_drum_cont8") >= _metric(current, "post_drum_cont8") + 0.040
+            or _metric(later, "post_inst8") <= _metric(current, "post_inst8") - 0.140
+            or _metric(later, "post_bass8") >= _metric(current, "post_bass8") + 0.035
+        )
+    )
+    return bool(current_build_or_fill and later_is_real_body)
 
 
 def _later_beats_intro_candidate(current: Mapping[str, Any], later: Mapping[str, Any]) -> bool:
@@ -289,6 +426,37 @@ def select_visual_drop_v2(candidates: Sequence[Mapping[str, Any]]) -> Optional[D
     scan_rows = [row for row in rows if _clock_bar(row) <= 81]
     early_intro_rows = [row for row in scan_rows if _clock_bar(row) <= 21]
     if early_intro_rows:
+        texture_release_rows: List[Dict[str, Any]] = []
+        for later in scan_rows:
+            if _clock_bar(later) <= 21:
+                continue
+            matched_early = next(
+                (early for early in early_intro_rows if _vocal_texture_buildup_to_later_primary_drop(early, later)),
+                None,
+            )
+            if matched_early is None:
+                continue
+            promoted = dict(later)
+            promoted_visual = dict(_components(promoted))
+            promoted_visual["vocal_texture_buildup_release"] = True
+            promoted["visual_components"] = promoted_visual
+            promoted["visual_guard_replaced_candidate"] = {
+                "timestamp": float(matched_early.get("timestamp", 0.0) or 0.0),
+                "clock_bar": int(_clock_bar(matched_early)),
+                "score": float(matched_early.get("score", 0.0) or 0.0),
+                "post_vocal8": float(_metric(matched_early, "post_vocal8")),
+                "post_bass8": float(_metric(matched_early, "post_bass8")),
+                "reason": str(matched_early.get("reason") or ""),
+            }
+            texture_release_rows.append(promoted)
+        if texture_release_rows:
+            selected = dict(texture_release_rows[0])
+            selected["selected_by"] = "visual_drop_v2"
+            selected["reason"] = (
+                "visual-v2 skipped vocal/texture buildup and selected first darker primary drop block"
+            )
+            return selected
+
         protected_starts = [row for row in early_intro_rows if _clear_song_start_drop(row)]
         if protected_starts:
             first_start = protected_starts[0]
@@ -305,6 +473,18 @@ def select_visual_drop_v2(candidates: Sequence[Mapping[str, Any]]) -> Optional[D
                     "visual-v2 protected first clear song-start drop section; later sections were not stronger enough"
                 )
                 return selected
+        near_phrase_body_rows = [
+            later
+            for later in scan_rows
+            if any(_near_later_phrase_body_entry(early, later) for early in early_intro_rows)
+        ]
+        if near_phrase_body_rows:
+            selected = dict(near_phrase_body_rows[0])
+            selected["selected_by"] = "visual_drop_v2"
+            selected["reason"] = (
+                "visual-v2 skipped nearby intro fill/build and selected the first phrase body drop entry"
+            )
+            return selected
         intro_beating_later = [
             later
             for later in scan_rows
@@ -320,6 +500,8 @@ def select_visual_drop_v2(candidates: Sequence[Mapping[str, Any]]) -> Optional[D
             return selected
 
     for row in scan_rows:
+        if any(_near_later_phrase_body_entry(row, later) for later in scan_rows):
+            continue
         if any(_later_beats_intro_candidate(row, later) for later in scan_rows):
             continue
         selected = dict(row)
@@ -351,6 +533,8 @@ def _zoomed_marker(raw_time: float, micro: Mapping[str, Any], visual: Mapping[st
     except (TypeError, ValueError):
         micro_conf = 0.0
     offset = marker - float(raw_time)
+    if _phrase_body_entry({"visual_components": visual}) and offset < -0.012:
+        return float(raw_time)
     if -0.080 <= offset <= 1.200 and micro_conf >= 0.40:
         return float(marker)
     impact = micro.get("impact_body_time")
@@ -363,6 +547,74 @@ def _zoomed_marker(raw_time: float, micro: Mapping[str, Any], visual: Mapping[st
     if abs(offset) <= 0.150:
         return float(marker)
     return float(raw_time)
+
+
+def _body_beat_probe_marker(
+    audio_path: str,
+    raw_time: float,
+    selected: Mapping[str, Any],
+    base_micro: Mapping[str, Any],
+    bpm: float,
+) -> Optional[Dict[str, Any]]:
+    visual = _components(selected)
+    if not (
+        bool(visual.get("vocal_texture_buildup_release"))
+        and _clock_bar(selected) >= 29
+        and _metric(selected, "phrase_prior") >= 0.860
+        and _metric(selected, "post_drum8") >= 0.940
+        and _metric(selected, "post_bass8") >= 0.400
+        and (
+            _metric(selected, "transition") <= 0.080
+            or _metric(selected, "pre4_height") >= _metric(selected, "post4_height") - 0.060
+            or _metric(selected, "pre_drum_cont4") >= 0.350
+        )
+    ):
+        return None
+    if bpm <= 0.0:
+        return None
+    beat_sec = 60.0 / float(bpm)
+    if not (0.250 <= beat_sec <= 0.750):
+        return None
+
+    base_score = _micro_body_hit_score(base_micro)
+    best: Optional[Dict[str, Any]] = None
+    for beat_index in (1, 2, 3):
+        probe_time = float(raw_time) + (float(beat_index) * beat_sec)
+        try:
+            probe_micro = microalign_marker(audio_path, probe_time, search_before_ms=90, search_after_ms=220)
+        except Exception:
+            continue
+        marker = _micro_time(probe_micro, "microaligned_time") or probe_time
+        if abs(float(marker) - probe_time) > 0.140:
+            continue
+        score = _micro_body_hit_score(probe_micro)
+        row = {
+            "marker": float(marker),
+            "probe_time": float(probe_time),
+            "beat_index": int(beat_index),
+            "score": float(score),
+            "microalign": dict(probe_micro),
+        }
+        if best is None or score > float(best["score"]):
+            best = row
+    if best is None:
+        return None
+
+    best_micro = best["microalign"] if isinstance(best.get("microalign"), Mapping) else {}
+    stronger_attack = bool(
+        _micro_metric(best_micro, "attack_peak_strength") >= _micro_metric(base_micro, "attack_peak_strength") + 0.180
+        or _micro_metric(best_micro, "denoised_impact_strength") >= _micro_metric(base_micro, "denoised_impact_strength") + 0.180
+        or _micro_metric(best_micro, "impact_boundary_confidence")
+        >= _micro_metric(base_micro, "impact_boundary_confidence") + 0.070
+    )
+    if not (
+        float(best["score"]) >= max(0.880, base_score + 0.030)
+        and _micro_metric(best_micro, "micro_confidence") >= 0.880
+        and _micro_metric(best_micro, "impact_boundary_confidence") >= 0.880
+        and stronger_attack
+    ):
+        return None
+    return best
 
 
 def visual_drop_v2_marker(audio_path: str, *, sample_rate: int = 16000, use_cache: bool = True) -> Dict[str, Any]:
@@ -396,6 +648,37 @@ def visual_drop_v2_marker(audio_path: str, *, sample_rate: int = 16000, use_cach
         }
     visual = selected.get("visual_components") if isinstance(selected.get("visual_components"), Mapping) else {}
     marker = _zoomed_marker(raw_time, micro if isinstance(micro, Mapping) else {}, visual)
+    beatgrid = feature_map.get("beatgrid") if isinstance(feature_map.get("beatgrid"), Mapping) else {}
+    try:
+        bpm = float(beatgrid.get("bpm", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        bpm = 0.0
+    beat_probe = _body_beat_probe_marker(
+        audio_path,
+        raw_time,
+        selected,
+        micro if isinstance(micro, Mapping) else {},
+        bpm,
+    )
+    if beat_probe is not None:
+        marker = float(beat_probe["marker"])
+        if isinstance(micro, Mapping):
+            base_micro = dict(micro)
+        else:
+            base_micro = {}
+        probe_micro = dict(beat_probe.get("microalign") if isinstance(beat_probe.get("microalign"), Mapping) else {})
+        probe_micro["visual_drop_v2_body_beat_probe_used"] = True
+        probe_micro["visual_drop_v2_body_beat_probe_time"] = float(beat_probe["probe_time"])
+        probe_micro["visual_drop_v2_body_beat_probe_index"] = int(beat_probe["beat_index"])
+        probe_micro["visual_drop_v2_body_beat_probe_score"] = float(beat_probe["score"])
+        probe_micro["visual_drop_v2_body_beat_probe_base_score"] = float(_micro_body_hit_score(base_micro))
+        probe_micro["visual_drop_v2_body_beat_probe_base_time"] = float(raw_time)
+        probe_micro["visual_drop_v2_body_beat_probe_base_micro"] = base_micro
+        probe_micro["reason"] = (
+            f"{probe_micro.get('reason') or 'MicroSnap reviewed'}; "
+            "visual-v2 body beat probe selected stronger drop impact"
+        )
+        micro = probe_micro
     selected["visual_raw_chunk_time"] = float(raw_time)
     selected["timestamp"] = float(marker)
     selected["snapped_sec"] = float(marker)

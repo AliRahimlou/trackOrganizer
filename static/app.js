@@ -14,6 +14,7 @@ let userPick = null;
 let pickedCandidate = null;
 let saveInFlight = false;
 let reviewActionInFlight = false;
+let placeValidationInFlight = false;
 let refinedPick = null;
 let refinedInfo = null;
 let pendingAutoPlacePick = null;
@@ -25,7 +26,21 @@ let viewportEnd = 1;
 let waveTile = null;
 let waveTiles = [];
 let waveView = "window";
-let waveformVisualMode = window.localStorage?.getItem("dropReviewWaveformVisualMode") === "peaks" ? "peaks" : "rms";
+const WAVEFORM_MODE_STORAGE_KEY = "dropReviewWaveformVisualMode";
+const WAVEFORM_MODE_VERSION_KEY = "dropReviewWaveformVisualModeVersion";
+const WAVEFORM_MODE_VERSION = "boom-bars-v17-mask-segment-render";
+function initialWaveformVisualMode() {
+  const validModes = new Set(["boom", "rms", "peaks"]);
+  try {
+    const storedVersion = window.localStorage?.getItem(WAVEFORM_MODE_VERSION_KEY) || "";
+    const storedMode = window.localStorage?.getItem(WAVEFORM_MODE_STORAGE_KEY) || "";
+    if (storedVersion === WAVEFORM_MODE_VERSION && validModes.has(storedMode)) return storedMode;
+  } catch (_) {
+    // Local storage can be unavailable in restricted browser contexts.
+  }
+  return "boom";
+}
+let waveformVisualMode = initialWaveformVisualMode();
 let tileRequestSeq = 0;
 let tileRequestTimer = null;
 let tileAbortController = null;
@@ -60,15 +75,44 @@ const HYPER_RMS_POWER = 0.82;
 const HYPER_RMS_PEAK_GHOST_ALPHA = 0.06;
 const HYPER_RMS_MIN_SMOOTH_SECONDS = 0.006;
 const HYPER_RMS_MAX_SMOOTH_SECONDS = 0.120;
+const BOOM_BODY_SMOOTH_SECONDS = 0.180;
+const BOOM_BODY_TARGET_BAR_PX = 5;
+const BOOM_BODY_MIN_BAR_PX = 1.2;
+const BOOM_BODY_MAX_BAR_PX = 7;
+const BOOM_BODY_NOISE_FLOOR = 0.180;
+const BOOM_BODY_FLOOR_BLEND = 0.74;
+const BOOM_BODY_CEILING_PERCENTILE = 0.965;
+const BOOM_BODY_MIN_NORMALIZED = 0.380;
+const BOOM_BODY_SIDE_MIN_NORMALIZED = 0.500;
+const BOOM_BODY_DARK_POWER = 0.54;
+const BOOM_GUI_BODY_VISIBLE_DENSITY = 0.220;
+const BOOM_GUI_BODY_STRONG_DENSITY = 0.360;
+const BOOM_GUI_CONTEXT_BODY_DENSITY = 0.300;
+const BOOM_GUI_CONTEXT_BODY_SCALE = 0.22;
+const BOOM_GUI_FRONT_EDGE_ALPHA_BOOST = 0.18;
+const BOOM_GUI_FRONT_EDGE_TICK_SECONDS = 0.020;
+const BOOM_PLACE_POST_SECONDS = 0.260;
+const BOOM_PLACE_PRE_SECONDS = 0.110;
+const BOOM_PLACE_EDGE_GRACE_SECONDS = 0.080;
+const BOOM_PLACE_SNAP_MAX_SECONDS = 0.120;
+const BOOM_PLACE_SNAP_VIEW_FRACTION = 0.025;
+const BOOM_PLACE_MIN_POST_NORMALIZED = 0.340;
+const BOOM_PLACE_MIN_PEAK_NORMALIZED = 0.430;
+const BOOM_PLACE_MIN_CONTRAST = 0.070;
 const RMS_INSPECTION_MIN_SAMPLE_SPACING = 0.10;
 const RMS_INSPECTION_ZERO_CROSSING_SPACING = 0.65;
 const RMS_INSPECTION_PEAK_ALPHA = 0.30;
 const RMS_DROP_INSPECTION_RADIUS_SECONDS = 0.006;
-const VISUAL_CHUNK_MIN_ALPHA = 0.08;
-const VISUAL_CHUNK_MAX_ALPHA = 0.28;
+const VISUAL_CHUNK_MIN_ALPHA = 0.10;
+const VISUAL_CHUNK_MAX_ALPHA = 0.54;
 const VISUAL_CHUNK_MIN_WIDTH_PX = 3;
 const VISUAL_CHUNK_MAX_VIEW_SECONDS = 600;
+const VISUAL_CHUNK_NOISE_GATE = 0.22;
 const VISUAL_CHUNK_CANDIDATE_MARKER_VIEW_SECONDS = 18;
+const VISUAL_SELECTED_DROP_MIN_SECONDS = 0.080;
+const VISUAL_SELECTED_DROP_MAX_SECONDS = 1.100;
+const VISUAL_SELECTED_DROP_SMOOTH_SECONDS = 0.018;
+const VISUAL_SELECTED_DROP_LOW_RUN_SECONDS = 0.035;
 const VISUAL_DIRECT_PLACE_VIEW_SECONDS = 6;
 const TILE_REQUEST_DEBOUNCE_MS = 120;
 const RESIZE_TILE_DEBOUNCE_MS = 120;
@@ -143,6 +187,20 @@ function visualFirstMode() {
 
 function visualDirectPlaceReady() {
   return Boolean(visualFirstMode() && currentItem && waveDuration && viewportDuration() <= VISUAL_DIRECT_PLACE_VIEW_SECONDS + 0.001);
+}
+
+function tileMatchesViewport(tile) {
+  if (!tile || tile.ok === false) return false;
+  const tolerance = Math.max(0.002, viewportDuration() * 0.002);
+  return Math.abs(tileStartSec(tile) - viewportStart) <= tolerance && Math.abs(tileEndSec(tile) - viewportEnd) <= tolerance;
+}
+
+function visualDirectPlaceBlockReason() {
+  if (!visualDirectPlaceReady()) return "";
+  const tile = primaryDrumsTile();
+  if (!tile || !tileMatchesViewport(tile)) return "loading_boom_mask";
+  if (!tileHasPlaceableBoomEvidence(tile)) return "no_boom_front_edge";
+  return "";
 }
 
 function availableStemCount() {
@@ -778,16 +836,32 @@ function blueMarkerInfo() {
       source: "manual",
     };
   }
+  if (visualFirstMode()) {
+    const time =
+      optionalMarkerTime(pendingAutoPlacePick) ||
+      optionalMarkerTime(currentItem?.ai_pick) ||
+      candidateTime(currentItem?.selected_candidate) ||
+      selectedMicroTime();
+    if (time === null) return { time: null, label: "", barNumber: null };
+    const candidate = closestCandidateNearTime(time, 0.030) || currentItem?.selected_candidate || null;
+    return {
+      time,
+      label: "",
+      barNumber: nearestBpmOne(time)?.barNumber || null,
+      candidate,
+      source: "candidate",
+    };
+  }
   const candidate = pickedCandidate || defaultBlueAnchorCandidate();
   const candidateAnchor = candidateTime(candidate);
   const anchor = candidateAnchor || selectedMicroTime() || optionalMarkerTime(currentItem?.ai_pick);
   const grid = nearestBpmOne(anchor);
-  const exact = visualFirstMode() ? optionalMarkerTime(anchor) : blueExactCandidateTime(candidate, grid);
-  const time = optionalMarkerTime(exact) || (visualFirstMode() ? null : grid?.time) || optionalMarkerTime(anchor);
+  const exact = blueExactCandidateTime(candidate, grid);
+  const time = optionalMarkerTime(exact) || grid?.time || optionalMarkerTime(anchor);
   if (!time) return { time: null, label: "", barNumber: null };
   const closestCandidate = closestCandidateNearTime(time);
   const rawRank = pickedCandidate?.picked_candidate_rank ?? closestCandidate?.rank;
-  const label = rawRank ? `#${rawRank}` : "AI";
+  const label = visualFirstMode() ? "" : rawRank ? `#${rawRank}` : "AI";
   return {
     time,
     label,
@@ -822,13 +896,18 @@ function markerTime(kind) {
   return markerTimes()[kind] || null;
 }
 
+function reviewUiBusy() {
+  return Boolean(reviewActionInFlight || saveInFlight || placeValidationInFlight);
+}
+
 function updateMarkerAcceptButton(id, label, time) {
   const button = $(id);
   if (!button) return;
-  const enabled = time !== null && !reviewActionInFlight && !saveInFlight;
+  const busy = reviewUiBusy();
+  const enabled = time !== null && !busy;
   button.disabled = !enabled;
   button.classList.toggle("disabled", !enabled);
-  button.textContent = reviewActionInFlight
+  button.textContent = busy
     ? "WORKING..."
     : enabled
       ? `ACCEPT ${label} ${fmtTime(time)}`
@@ -839,9 +918,10 @@ function setReviewActionInFlight(value) {
   reviewActionInFlight = Boolean(value);
   const skipButton = $("skipBtn");
   if (skipButton) {
-    skipButton.disabled = reviewActionInFlight;
-    skipButton.classList.toggle("disabled", reviewActionInFlight);
-    skipButton.textContent = reviewActionInFlight ? "WORKING..." : "SKIP";
+    const busy = reviewUiBusy();
+    skipButton.disabled = busy;
+    skipButton.classList.toggle("disabled", busy);
+    skipButton.textContent = busy ? "WORKING..." : "SKIP";
   }
   updateSaveButton();
 }
@@ -877,7 +957,8 @@ function updateSaveButton() {
   const times = markerTimes();
   const saveButton = $("saveCorrectionBtn");
   const hasPick = userPick !== null;
-  const busy = saveInFlight || reviewActionInFlight;
+  const busy = reviewUiBusy();
+  if (!saveButton) return;
   saveButton.disabled = !hasPick || busy;
   saveButton.classList.toggle("disabled", !hasPick || busy);
   saveButton.textContent = saveInFlight
@@ -885,19 +966,58 @@ function updateSaveButton() {
     : times.manual === null
       ? "SAVE PLACED"
       : `SAVE ${fmtTime(times.manual)}`;
-  $("clearMarkerBtn").disabled = !hasPick || busy;
-  $("clearMarkerBtn").classList.toggle("disabled", !hasPick || busy);
-  updateMarkerAcceptButton("approveBtn", "AI", times.ai);
-  updateMarkerAcceptButton("acceptKneeBtn", "KNEE", times.knee);
+  if ($("clearMarkerBtn")) {
+    $("clearMarkerBtn").disabled = !hasPick || busy;
+    $("clearMarkerBtn").classList.toggle("disabled", !hasPick || busy);
+  }
+  if ($("skipBtn")) {
+    $("skipBtn").disabled = busy;
+    $("skipBtn").classList.toggle("disabled", busy);
+    $("skipBtn").textContent = busy ? "WORKING..." : "SKIP";
+  }
   updateGridMarkerUi();
   updateAiPickDisplay();
-  $("userPick").textContent = times.manual === null ? "none" : `${fmtTime(times.manual)} (${times.manual.toFixed(6)}s)`;
-  $("microMarker").textContent = times.knee === null ? "none" : `${fmtTime(times.knee)} (${times.knee.toFixed(6)}s)`;
+  if ($("userPick")) $("userPick").textContent = times.manual === null ? "none" : `${fmtTime(times.manual)} (${times.manual.toFixed(6)}s)`;
+  if ($("microMarker")) $("microMarker").textContent = times.knee === null ? "none" : `${fmtTime(times.knee)} (${times.knee.toFixed(6)}s)`;
   updateMetric("microOffset", micro?.snap_offset_ms, (value) => `${value.toFixed(2)} ms`);
   updateMetric("microConfidence", micro?.micro_confidence, (value) => value.toFixed(3));
   updateMetric("attackCleanliness", micro?.attack_cleanliness, (value) => value.toFixed(3));
   updateMetric("zeroCrossingQuality", micro?.zero_crossing_quality, (value) => value.toFixed(3));
+  updatePlaceButton();
   drawWaveform();
+}
+
+function updatePlaceButton() {
+  const button = $("placeBtn");
+  if (!button) return;
+  if (!visualFirstMode()) {
+    const enabled = Boolean(currentItem) && !reviewUiBusy();
+    button.disabled = !enabled;
+    button.classList.toggle("disabled", !enabled);
+    button.textContent = "PLACE MANUAL";
+    button.title = "";
+    return;
+  }
+  const blockReason = visualDirectPlaceBlockReason();
+  const enabled = Boolean(currentItem) && !reviewUiBusy() && !blockReason;
+  button.disabled = !enabled;
+  button.classList.toggle("disabled", !enabled);
+  button.textContent =
+    placeValidationInFlight
+      ? "CHECKING BOOM"
+      : blockReason === "loading_boom_mask"
+      ? "LOADING BOOM"
+      : blockReason === "no_boom_front_edge"
+        ? "NO BOOM EDGE"
+        : "PLACE 1.1.1";
+  button.title =
+    placeValidationInFlight
+      ? "Validating the Boom front edge before placing."
+      : blockReason === "loading_boom_mask"
+      ? "Waiting for the current waveform Boom mask."
+      : blockReason === "no_boom_front_edge"
+        ? "No hard Boom front edge is visible in this zoom window."
+        : "";
 }
 
 function cloneCandidateForCorrection(candidate, time) {
@@ -923,6 +1043,7 @@ function setBlueAnchorCandidate(candidate) {
 }
 
 function clearUserPick() {
+  if (reviewUiBusy()) return;
   userPick = null;
   pickedCandidate = null;
   updateSaveButton();
@@ -1162,8 +1283,24 @@ function sampleY(sample, laneTop, laneHeight, tile = waveTile) {
   return laneTop + laneHeight / 2 - Math.max(-1, Math.min(1, Number(sample) * waveformGain(tile))) * (laneHeight * 0.40);
 }
 
-function rmsVisualCeiling(tile = waveTile) {
-  const ceiling = Number(tile?.rms_visual_ceiling || tile?.rms_percentile_95 || tile?.rms_percentile_99 || tile?.rms_peak || 0);
+function scopedTileMetric(tile, key, scope = "local") {
+  if (scope === "global") {
+    const globalValue = Number(tile?.[`global_${key}`]);
+    if (Number.isFinite(globalValue) && globalValue > 0) return globalValue;
+  }
+  const localValue = Number(tile?.[key]);
+  if (Number.isFinite(localValue) && localValue > 0) return localValue;
+  return null;
+}
+
+function rmsVisualCeiling(tile = waveTile, scope = "local") {
+  const ceiling = Number(
+    scopedTileMetric(tile, "rms_visual_ceiling", scope) ||
+      scopedTileMetric(tile, "rms_percentile_95", scope) ||
+      scopedTileMetric(tile, "rms_percentile_99", scope) ||
+      scopedTileMetric(tile, "rms_peak", scope) ||
+      0,
+  );
   if (Number.isFinite(ceiling) && ceiling > 1e-6) return ceiling;
   const rms = Array.isArray(tile?.rms) ? tile.rms.map(Number).filter((value) => Number.isFinite(value) && value > 0) : [];
   if (!rms.length) return Math.max(Number(tile?.amplitude_peak || 1), 1e-6);
@@ -1171,30 +1308,43 @@ function rmsVisualCeiling(tile = waveTile) {
   return Math.max(rms[Math.floor(rms.length * 0.95)] || rms[rms.length - 1] || 1, 1e-6);
 }
 
-function rmsMaximizerMakeup(tile = waveTile) {
-  const explicit = Number(tile?.visual_maximizer_makeup_gain);
+function rmsMaximizerMakeup(tile = waveTile, scope = "local") {
+  const explicit = Number(scope === "global" ? tile?.global_visual_maximizer_makeup_gain : tile?.visual_maximizer_makeup_gain);
   if (Number.isFinite(explicit) && explicit > 0) {
     return Math.max(HYPER_RMS_MIN_MAKEUP, Math.min(HYPER_RMS_MAX_MAKEUP, explicit));
   }
-  const p95 = Number(tile?.rms_percentile_95 || rmsVisualCeiling(tile));
+  const p95 = Number(scopedTileMetric(tile, "rms_percentile_95", scope) || rmsVisualCeiling(tile, scope));
   const reference = Math.max(p95, 1e-6);
   return Math.max(HYPER_RMS_MIN_MAKEUP, Math.min(HYPER_RMS_MAX_MAKEUP, HYPER_RMS_TARGET / reference));
 }
 
-function softLimitMaximizedRms(value, tile = waveTile) {
-  const makeup = rmsMaximizerMakeup(tile);
-  const ceiling = Math.max(0.5, Math.min(1, Number(tile?.visual_maximizer_ceiling || HYPER_RMS_CEILING)));
-  const knee = Math.max(0.2, Math.min(ceiling - 0.02, Number(tile?.visual_maximizer_knee || HYPER_RMS_KNEE)));
+function softLimitMaximizedRms(value, tile = waveTile, scope = "local") {
+  const makeup = rmsMaximizerMakeup(tile, scope);
+  const ceiling = Math.max(
+    0.5,
+    Math.min(1, Number(scope === "global" ? tile?.global_visual_maximizer_ceiling : tile?.visual_maximizer_ceiling) || HYPER_RMS_CEILING),
+  );
+  const knee = Math.max(
+    0.2,
+    Math.min(ceiling - 0.02, Number(scope === "global" ? tile?.global_visual_maximizer_knee : tile?.visual_maximizer_knee) || HYPER_RMS_KNEE),
+  );
   const lifted = Math.max(0, Number(value) || 0) * makeup;
   if (lifted <= knee) return lifted;
   const range = Math.max(0.001, ceiling - knee);
   return knee + range * Math.tanh((lifted - knee) / range);
 }
 
-function hyperRmsAmplitude(value, tile = waveTile) {
-  const limited = softLimitMaximizedRms(value, tile);
-  const ceiling = Math.max(0.5, Math.min(1, Number(tile?.visual_maximizer_ceiling || HYPER_RMS_CEILING)));
+function hyperRmsAmplitude(value, tile = waveTile, scope = "local") {
+  const limited = softLimitMaximizedRms(value, tile, scope);
+  const ceiling = Math.max(
+    0.5,
+    Math.min(1, Number(scope === "global" ? tile?.global_visual_maximizer_ceiling : tile?.visual_maximizer_ceiling) || HYPER_RMS_CEILING),
+  );
   return Math.max(0, Math.min(1, Math.pow(limited / ceiling, HYPER_RMS_POWER)));
+}
+
+function boomRmsAmplitude(value, tile = waveTile) {
+  return hyperRmsAmplitude(value, tile, tile?.global_visual_maximizer_makeup_gain ? "global" : "local");
 }
 
 function smoothRmsValues(values, binSpan) {
@@ -1235,6 +1385,575 @@ function movingAverage(values, radius) {
   });
 }
 
+function isDrumsTile(tile) {
+  const role = String(tile?.role || "").toLowerCase();
+  const label = String(tile?.label || "").toLowerCase();
+  return role === "drums" || label.includes("drum");
+}
+
+function boomRoleTuning(tile) {
+  const drums = isDrumsTile(tile);
+  return {
+    floorBlend: drums ? BOOM_BODY_FLOOR_BLEND : 0.82,
+    minimumNormalized: drums ? BOOM_BODY_MIN_NORMALIZED : BOOM_BODY_SIDE_MIN_NORMALIZED,
+    chunkMinimumNormalized: drums ? 0.280 : 0.430,
+    alphaScale: drums ? 1.0 : 0.62,
+    floorLift: drums ? 1.0 : 1.08,
+  };
+}
+
+function scopedBoomMetric(tile, key) {
+  return scopedTileMetric(tile, key, tile?.global_visual_maximizer_makeup_gain ? "global" : "local");
+}
+
+function boomAmplitudeMetric(tile, key) {
+  const rawValue = scopedBoomMetric(tile, key);
+  if (rawValue === null) return null;
+  const amplitude = boomRmsAmplitude(rawValue, tile);
+  return Number.isFinite(amplitude) ? amplitude : null;
+}
+
+function boomBodySeries(tile, rawRms, binSpan) {
+  const energy = rawRms.map((value) => boomRmsAmplitude(value, tile));
+  const bodyRadius = Math.max(1, Math.round((BOOM_BODY_SMOOTH_SECONDS / Math.max(binSpan, 1e-9)) / 2));
+  return {
+    energy,
+    body: movingAverage(energy, bodyRadius),
+  };
+}
+
+function boomVisualStats(tile, rawRms = null, binSpanValue = null) {
+  const values = Array.isArray(rawRms) ? rawRms : Array.isArray(tile?.rms) ? tile.rms : [];
+  if (values.length < 2) return null;
+  const start = tileStartSec(tile);
+  const span = Math.max(tileEndSec(tile) - start, 1 / Math.max(sampleRate(), 1));
+  const binSpan = Number(binSpanValue) > 0 ? Number(binSpanValue) : span / Math.max(1, values.length);
+  const { body, energy } = boomBodySeries(tile, values, binSpan);
+  const q55 = percentileValue(body, 0.55);
+  const q70 = percentileValue(body, 0.70);
+  const q75 = percentileValue(body, 0.75);
+  const q84 = percentileValue(body, 0.84);
+  const q90 = percentileValue(body, 0.90);
+  const q94 = percentileValue(body, 0.94);
+  const q96 = percentileValue(body, BOOM_BODY_CEILING_PERCENTILE);
+  const tuning = boomRoleTuning(tile);
+  const globalFloor = boomAmplitudeMetric(tile, "rms_boom_floor");
+  const globalCeiling = boomAmplitudeMetric(tile, "rms_boom_ceiling");
+  const floor = Math.max(
+    BOOM_BODY_NOISE_FLOOR,
+    (globalFloor || 0) * tuning.floorLift,
+    q55 + Math.max(0, q90 - q55) * tuning.floorBlend,
+    q70 * (isDrumsTile(tile) ? 0.98 : 1.08),
+    q84 * (isDrumsTile(tile) ? 0.82 : 0.96),
+    q94 * (isDrumsTile(tile) ? 0.52 : 0.68),
+  );
+  const ceiling = Math.max(floor + 0.045, globalCeiling || 0, q96, q94, q90);
+  return {
+    energy,
+    body,
+    binSpan,
+    floor,
+    ceiling,
+    q75,
+    q84,
+    q90,
+    q94,
+    tuning,
+  };
+}
+
+function boomFrontEdgeWindowOk(stats, index, binSpan) {
+  if (!stats || !Array.isArray(stats.energy) || !stats.energy.length) return false;
+  const safeIndex = Math.max(0, Math.min(stats.energy.length - 1, Math.round(Number(index) || 0)));
+  const edgeGraceBins = Math.max(1, Math.round(BOOM_PLACE_EDGE_GRACE_SECONDS / Math.max(Number(binSpan) || 0, 1e-9)));
+  const minimumRawDensity = Math.min(0.280, BOOM_BODY_MIN_NORMALIZED * 0.78);
+  const hardMask = stats.energy.map((value) => {
+    const energy = Number(value) || 0;
+    const rawDensity = normalizeBoomDensity(energy, stats);
+    return energy >= stats.floor && (rawDensity >= minimumRawDensity || energy >= stats.q90);
+  });
+  const bridgeGapBins = Math.max(1, Math.round(0.035 / Math.max(Number(binSpan) || 0, 1e-9)));
+  let cursor = 0;
+  while (cursor < hardMask.length) {
+    if (hardMask[cursor]) {
+      cursor += 1;
+      continue;
+    }
+    const gapStart = cursor;
+    while (cursor < hardMask.length && !hardMask[cursor]) cursor += 1;
+    const gapEnd = cursor;
+    const leftActive = gapStart > 0 && hardMask[gapStart - 1];
+    const rightActive = gapEnd < hardMask.length && hardMask[gapEnd];
+    if (leftActive && rightActive && gapEnd - gapStart <= bridgeGapBins) {
+      for (let fillIndex = gapStart; fillIndex < gapEnd; fillIndex += 1) hardMask[fillIndex] = true;
+    }
+  }
+  let runStart = null;
+  for (let i = safeIndex; i >= 0; i -= 1) {
+    if (!hardMask[i]) break;
+    runStart = i;
+  }
+  return runStart !== null && safeIndex <= runStart + edgeGraceBins;
+}
+
+function normalizeBoomDensity(value, stats) {
+  if (!stats) return 0;
+  return Math.max(0, Math.min(1, (Number(value || 0) - stats.floor) / Math.max(stats.ceiling - stats.floor, 0.001)));
+}
+
+function primaryDrumsTile() {
+  return usableWaveTiles().find((tile) => isDrumsTile(tile)) || (isDrumsTile(waveTile) ? waveTile : null);
+}
+
+function serverBoomMaskAllows(tile, time, maskKey = "boom_placeable_mask", radiusBins = 1) {
+  const mask = Array.isArray(tile?.[maskKey]) ? tile[maskKey] : null;
+  if (!mask || !mask.length) return null;
+  const start = tileStartSec(tile);
+  const end = tileEndSec(tile);
+  if (time < start || time > end) return false;
+  const span = Math.max(end - start, 1 / Math.max(sampleRate(), 1));
+  const index = Math.max(0, Math.min(mask.length - 1, Math.floor(((time - start) / span) * mask.length)));
+  const radius = Math.max(0, Math.round(Number(radiusBins) || 0));
+  for (let offset = -radius; offset <= radius; offset += 1) {
+    const testIndex = index + offset;
+    if (testIndex >= 0 && testIndex < mask.length && Boolean(mask[testIndex])) return true;
+  }
+  return false;
+}
+
+function closestServerBoomMaskTime(tile, time, maskKey = "boom_placeable_mask") {
+  const mask = Array.isArray(tile?.[maskKey]) ? tile[maskKey].map(Boolean) : null;
+  if (!mask || !mask.length) return null;
+  const start = tileStartSec(tile);
+  const end = tileEndSec(tile);
+  const span = Math.max(end - start, 1 / Math.max(sampleRate(), 1));
+  const target = Number(time);
+  if (!Number.isFinite(target)) return null;
+  let best = null;
+  let runStart = null;
+  for (let index = 0; index <= mask.length; index += 1) {
+    const active = index < mask.length && Boolean(mask[index]);
+    if (active && runStart === null) runStart = index;
+    if (active || runStart === null) continue;
+    const runEnd = index - 1;
+    const edgeTime = start + (runStart / mask.length) * span;
+    const runEndTime = start + ((runEnd + 1) / mask.length) * span;
+    const distanceToRun = target < edgeTime ? edgeTime - target : target > runEndTime ? target - runEndTime : 0;
+    const frontEdgeDistance = Math.abs(target - edgeTime);
+    const row = {
+      time: clampOriginalTime(edgeTime),
+      runStart,
+      runEnd,
+      distanceToRun,
+      frontEdgeDistance,
+      binSpan: span / Math.max(mask.length, 1),
+    };
+    if (
+      !best ||
+      row.distanceToRun < best.distanceToRun ||
+      (Math.abs(row.distanceToRun - best.distanceToRun) <= 1e-9 && row.frontEdgeDistance < best.frontEdgeDistance) ||
+      (Math.abs(row.distanceToRun - best.distanceToRun) <= 1e-9 &&
+        Math.abs(row.frontEdgeDistance - best.frontEdgeDistance) <= 1e-9 &&
+        row.runStart < best.runStart)
+    ) {
+      best = row;
+    }
+    runStart = null;
+  }
+  return best;
+}
+
+function boomPlacementSnapWindowSeconds(tile = primaryDrumsTile()) {
+  const span = Math.max(viewportDuration(), tile ? tileEndSec(tile) - tileStartSec(tile) : 0, 0);
+  const maskLength = Array.isArray(tile?.boom_placeable_mask) ? tile.boom_placeable_mask.length : 0;
+  const binSpan = maskLength > 0 && span > 0 ? span / maskLength : minViewSeconds();
+  return Math.max(
+    binSpan * 3,
+    Math.min(BOOM_PLACE_SNAP_MAX_SECONDS, Math.max(BOOM_PLACE_EDGE_GRACE_SECONDS, span * BOOM_PLACE_SNAP_VIEW_FRACTION)),
+  );
+}
+
+function boomMaskFrontEdgeSnap(time, tile = primaryDrumsTile()) {
+  const snap = closestServerBoomMaskTime(tile, time, "boom_placeable_mask");
+  if (!snap) return null;
+  const snapWindow = boomPlacementSnapWindowSeconds(tile);
+  if (snap.distanceToRun > snapWindow && snap.frontEdgeDistance > snapWindow) return null;
+  const evidence = boomPlacementEvidence(snap.time, tile);
+  return {
+    ...snap,
+    evidence,
+    ok: Boolean(evidence.ok),
+    snapWindow,
+  };
+}
+
+function resolveBoomPlacementTime(rawTime) {
+  const target = clampOriginalTime(rawTime);
+  if (!visualFirstMode()) return { ok: true, time: target, rawTime: target, snapped: false, evidence: { ok: true } };
+  const tile = primaryDrumsTile();
+  const rawEvidence = boomPlacementEvidence(target, tile);
+  const snap = boomMaskFrontEdgeSnap(target, tile);
+  if (snap?.ok) {
+    return {
+      ok: true,
+      time: snap.time,
+      rawTime: target,
+      snapped: Math.abs(Number(snap.time) - Number(target)) > Math.max(minViewSeconds(), snap.binSpan || 0),
+      evidence: snap.evidence,
+      snap,
+    };
+  }
+  if (rawEvidence.ok) {
+    return { ok: true, time: target, rawTime: target, snapped: false, evidence: rawEvidence, snap };
+  }
+  return { ok: false, time: target, rawTime: target, snapped: false, evidence: rawEvidence, snap };
+}
+
+async function validateVisualPlacementOnServer(markerTime, options = {}) {
+  if (!visualFirstMode() || !currentItem) return { valid: true };
+  const context = String(options.context || "manual");
+  const allowBlueContext = context === "blue";
+  const explicitCandidate = options.candidate && typeof options.candidate === "object" ? options.candidate : null;
+  const candidateForValidation = allowBlueContext
+    ? explicitCandidate || blueAnchorCandidate || currentItem.selected_candidate || null
+    : null;
+  const pickedCandidatePayload = candidateForValidation ? cloneCandidateForCorrection(candidateForValidation, markerTime) : null;
+  return fetchJson("/api/validate_visual_marker", {
+    method: "POST",
+    body: JSON.stringify({
+      id: currentItem.id,
+      marker_time: markerTime,
+      context,
+      picked_candidate: pickedCandidatePayload,
+    }),
+  });
+}
+
+function serverBoomSeries(tile, expectedLength = 0) {
+  const density = Array.isArray(tile?.boom_body_density)
+    ? tile.boom_body_density.map((value) => Math.max(0, Math.min(1, Number(value) || 0)))
+    : [];
+  const bodyMask = Array.isArray(tile?.boom_body_mask) ? tile.boom_body_mask.map(Boolean) : [];
+  const relevantMask = Array.isArray(tile?.boom_relevant_mask) ? tile.boom_relevant_mask.map(Boolean) : [];
+  const placeableMask = Array.isArray(tile?.boom_placeable_mask) ? tile.boom_placeable_mask.map(Boolean) : [];
+  const length = Math.max(density.length, bodyMask.length, relevantMask.length, placeableMask.length);
+  if (length < 2) return null;
+  const expected = Math.max(0, Math.round(Number(expectedLength) || 0));
+  if (expected > 0 && Math.abs(length - expected) > Math.max(2, expected * 0.02)) return null;
+  const normalizedDensity = Array.from({ length }, (_value, index) => density[index] || 0);
+  const normalizedBodyMask = Array.from({ length }, (_value, index) => Boolean(bodyMask[index]));
+  const normalizedRelevantMask = Array.from({ length }, (_value, index) => {
+    if (relevantMask.length) return Boolean(relevantMask[index]);
+    return Boolean(placeableMask[index]) || (Boolean(bodyMask[index]) && (density[index] || 0) >= BOOM_GUI_BODY_VISIBLE_DENSITY);
+  });
+  const normalizedPlaceableMask = Array.from({ length }, (_value, index) => Boolean(placeableMask[index]));
+  return {
+    density: normalizedDensity,
+    bodyMask: normalizedBodyMask,
+    relevantMask: normalizedRelevantMask,
+    placeableMask: normalizedPlaceableMask,
+    hasBody: normalizedBodyMask.some(Boolean),
+    hasRelevant: normalizedRelevantMask.some(Boolean),
+    hasPlaceable: normalizedPlaceableMask.some(Boolean),
+  };
+}
+
+function serverBoomDisplayActive(serverSeries, index, tile = waveTile) {
+  if (!serverSeries) return false;
+  const safeIndex = Math.max(0, Math.min(serverSeries.density.length - 1, Math.round(Number(index) || 0)));
+  if (serverSeries.placeableMask[safeIndex]) return true;
+  return Boolean(serverSeries.relevantMask[safeIndex]);
+}
+
+function serverBoomInspectionActiveAtTime(tile, time, serverSeries = null, radiusBins = 1) {
+  const series = serverSeries || serverBoomSeries(tile);
+  if (!series) return !visualFirstMode();
+  const start = tileStartSec(tile);
+  const end = tileEndSec(tile);
+  if (time < start || time > end) return false;
+  const span = Math.max(end - start, 1 / Math.max(sampleRate(), 1));
+  const index = Math.max(0, Math.min(series.density.length - 1, Math.floor(((time - start) / span) * series.density.length)));
+  const radius = Math.max(0, Math.round(Number(radiusBins) || 0));
+  for (let offset = -radius; offset <= radius; offset += 1) {
+    const testIndex = index + offset;
+    if (testIndex >= 0 && testIndex < series.density.length && serverBoomDisplayActive(series, testIndex, tile)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function serverBoomRunStarts(mask) {
+  if (!Array.isArray(mask) || !mask.length) return [];
+  const starts = [];
+  let active = false;
+  mask.forEach((value, index) => {
+    const on = Boolean(value);
+    if (on && !active) starts.push(index);
+    active = on;
+  });
+  return starts;
+}
+
+function serverBoomActiveRuns(serverSeries, length, tile = waveTile) {
+  const safeLength = Math.max(0, Math.round(Number(length) || 0));
+  if (!serverSeries || safeLength <= 0) return [];
+  const runs = [];
+  let startIndex = null;
+  for (let index = 0; index <= safeLength; index += 1) {
+    const active = index < safeLength && serverBoomDisplayActive(serverSeries, index, tile);
+    if (active && startIndex === null) {
+      startIndex = index;
+    } else if (!active && startIndex !== null) {
+      runs.push({ startIndex, endIndex: index });
+      startIndex = null;
+    }
+  }
+  return runs;
+}
+
+function drawBoomMaskedCenterline(ctx, width, mid, serverSeries, length, tile, start, binSpan) {
+  if (!serverSeries || !Number.isFinite(binSpan) || binSpan <= 0) return;
+  ctx.save();
+  ctx.strokeStyle = "rgba(23,32,42,0.16)";
+  ctx.lineWidth = 1;
+  ctx.setLineDash([2, 5]);
+  serverBoomActiveRuns(serverSeries, length, tile).forEach((run) => {
+    const x0 = Math.max(0, timeToX(start + run.startIndex * binSpan));
+    const x1 = Math.min(width, timeToX(start + run.endIndex * binSpan));
+    if (x1 - x0 < 2) return;
+    ctx.beginPath();
+    ctx.moveTo(x0, Math.round(mid) + 0.5);
+    ctx.lineTo(x1, Math.round(mid) + 0.5);
+    ctx.stroke();
+  });
+  ctx.setLineDash([]);
+  ctx.restore();
+}
+
+function boomPlacementEvidence(time, tile = primaryDrumsTile()) {
+  const rawRms = Array.isArray(tile?.rms) ? tile.rms : [];
+  if (!visualFirstMode()) return { ok: true, reason: "no_visual_gate" };
+  if (!tile) return { ok: false, reason: "no_drum_boom_tile", normalizedPost: 0, normalizedPeak: 0 };
+  if (!isDrumsTile(tile)) return { ok: false, reason: "not_drum_stem", normalizedPost: 0, normalizedPeak: 0 };
+  if (rawRms.length < 4) return { ok: false, reason: "insufficient_boom_bins", normalizedPost: 0, normalizedPeak: 0 };
+  const start = tileStartSec(tile);
+  const end = tileEndSec(tile);
+  if (time < start || time > end) return { ok: false, reason: "outside_current_boom_tile", normalizedPost: 0, normalizedPeak: 0 };
+  const serverMaskAllowed = serverBoomMaskAllows(tile, time, "boom_placeable_mask", 2);
+  if (serverMaskAllowed === null) {
+    return { ok: false, reason: "missing_server_boom_placeable_mask", normalizedPost: 0, normalizedPeak: 0 };
+  }
+  if (serverMaskAllowed === false) {
+    return { ok: false, reason: "server_boom_mask_not_placeable", normalizedPost: 0, normalizedPeak: 0 };
+  }
+  const span = Math.max(end - start, 1 / Math.max(sampleRate(), 1));
+  const binSpan = span / Math.max(1, rawRms.length);
+  const stats = boomVisualStats(tile, rawRms, binSpan);
+  if (!stats) return { ok: true, reason: "no_stats" };
+  const markerIndex = Math.max(0, Math.min(stats.body.length - 1, Math.floor((time - start) / Math.max(binSpan, 1e-9))));
+  const preStart = Math.max(0, Math.floor((time - BOOM_PLACE_PRE_SECONDS - start) / Math.max(binSpan, 1e-9)));
+  const preEnd = Math.max(preStart, Math.min(stats.body.length, Math.floor((time - start) / Math.max(binSpan, 1e-9))));
+  const postStart = markerIndex;
+  const postEnd = Math.min(stats.body.length, Math.ceil((time + BOOM_PLACE_POST_SECONDS - start) / Math.max(binSpan, 1e-9)));
+  const preValues = stats.body.slice(preStart, preEnd);
+  const postValues = stats.body.slice(postStart, postEnd);
+  if (!postValues.length) return { ok: false, reason: "no_post_body", normalizedPost: 0, normalizedPeak: 0 };
+  const preFloor = preValues.length ? percentileValue(preValues, 0.58) : percentileValue(stats.body, 0.34);
+  const postBody = percentileValue(postValues, 0.72);
+  const postPeak = Math.max(...postValues);
+  const normalizedPost = normalizeBoomDensity(postBody, stats);
+  const normalizedPeak = normalizeBoomDensity(postPeak, stats);
+  const contrast = Math.max(0, postBody - preFloor);
+  const hardBodyFloor = postBody >= stats.floor && postPeak >= stats.floor + BOOM_PLACE_MIN_CONTRAST * 0.50;
+  const enoughBody = normalizedPost >= BOOM_PLACE_MIN_POST_NORMALIZED || postBody >= stats.q90;
+  const enoughPeak = normalizedPeak >= BOOM_PLACE_MIN_PEAK_NORMALIZED || postPeak >= stats.q94;
+  const enoughContrast =
+    contrast >= BOOM_PLACE_MIN_CONTRAST ||
+    (postBody >= stats.q90 && normalizedPost >= BOOM_PLACE_MIN_POST_NORMALIZED + 0.08);
+  const edgeWindow = boomFrontEdgeWindowOk(stats, markerIndex, binSpan);
+  let reason = "boom_body_after_marker";
+  if (!edgeWindow) reason = "not_boom_front_edge";
+  else if (!hardBodyFloor) reason = "below_global_boom_floor";
+  else if (!enoughBody) reason = "low_post_body";
+  else if (!enoughPeak) reason = "weak_post_peak";
+  else if (!enoughContrast) reason = "low_contrast";
+  return {
+    ok: edgeWindow && hardBodyFloor && enoughBody && enoughPeak && enoughContrast,
+    reason,
+    normalizedPost,
+    normalizedPeak,
+    contrast,
+    postBody,
+    postPeak,
+    floor: stats.floor,
+  };
+}
+
+function tileHasPlaceableBoomEvidence(tile = primaryDrumsTile()) {
+  if (!visualFirstMode() || !tile || !isDrumsTile(tile)) return false;
+  const serverPlaceableCount = Number(tile?.boom_placeable_count);
+  if (Number.isFinite(serverPlaceableCount) && serverPlaceableCount <= 0) return false;
+  if (Array.isArray(tile?.boom_placeable_mask)) return tile.boom_placeable_mask.some(Boolean);
+  return false;
+}
+
+function selectedDropTime() {
+  return optionalMarkerTime(currentItem?.ai_pick) || candidateTime(currentItem?.selected_candidate);
+}
+
+function valuesInTimeRange(values, start, binSpan, rangeStart, rangeEnd) {
+  const out = [];
+  values.forEach((value, index) => {
+    const time = start + (index + 0.5) * binSpan;
+    if (time >= rangeStart && time <= rangeEnd) out.push(value);
+  });
+  return out;
+}
+
+function selectedDropHighlightBounds(tile, rawRms, binSpan) {
+  if (!visualFirstMode() || !isDrumsTile(tile) || !Array.isArray(rawRms) || rawRms.length < 4) return null;
+  const marker = selectedDropTime();
+  if (marker === null) return null;
+  const start = tileStartSec(tile);
+  const end = tileEndSec(tile);
+  if (marker < start || marker > end) return null;
+
+  const energy = rawRms.map((value) => boomRmsAmplitude(value, tile));
+  const radius = Math.max(1, Math.round((VISUAL_SELECTED_DROP_SMOOTH_SECONDS / Math.max(binSpan, 1e-9)) / 2));
+  const serverSeries = serverBoomSeries(tile, rawRms.length);
+  const smoothed = serverSeries ? serverSeries.density : movingAverage(energy, radius);
+  const evidence = boomPlacementEvidence(marker, tile);
+  const selectedProof =
+    currentItem?.selected_candidate?.gui_mask_proof ||
+    currentItem?.gui_mask_proof ||
+    currentItem?.selected_candidate?.visual_components?.gui_mask_proof ||
+    null;
+  const actualBodyRelief = Boolean(
+    selectedProof?.accepted_by_actual_visual_body_proof ||
+      selectedProof?.actual_body_sparse_impact ||
+      currentItem?.selected_candidate?.visual_components?.actual_body_boom_repair_sparse_impact,
+  );
+  if (!evidence.ok && !actualBodyRelief) return null;
+  const markerIndex = Math.max(0, Math.min(smoothed.length - 1, Math.floor((marker - start) / Math.max(binSpan, 1e-9))));
+
+  if (serverSeries) {
+    const snap = closestServerBoomMaskTime(tile, marker, "boom_placeable_mask");
+    const snapLimit = Math.max(BOOM_PLACE_EDGE_GRACE_SECONDS, (snap?.binSpan || binSpan) * 3);
+    if (!actualBodyRelief && (!snap || (snap.distanceToRun > snapLimit && snap.frontEdgeDistance > snapLimit))) return null;
+    const markerOnServer = serverBoomDisplayActive(serverSeries, markerIndex, tile);
+    const startIndex =
+      actualBodyRelief || markerOnServer || !snap
+        ? markerIndex
+        : Math.max(0, Math.min(smoothed.length - 1, Math.round(Number(snap.runStart) || 0)));
+    const maxIndex = Math.min(
+      smoothed.length - 1,
+      Math.ceil((start + startIndex * binSpan + VISUAL_SELECTED_DROP_MAX_SECONDS - start) / Math.max(binSpan, 1e-9)),
+    );
+    const minEnd = start + startIndex * binSpan + VISUAL_SELECTED_DROP_MIN_SECONDS;
+    const lowRunBins = Math.max(1, Math.round(VISUAL_SELECTED_DROP_LOW_RUN_SECONDS / Math.max(binSpan, 1e-9)));
+    let endIndex = Math.max(startIndex, snap ? Math.round(Number(snap.runEnd) || startIndex) : startIndex);
+    let lowRun = 0;
+    for (let index = startIndex; index <= maxIndex; index += 1) {
+      const time = start + (index + 1) * binSpan;
+      endIndex = index;
+      const serverActive = serverBoomDisplayActive(serverSeries, index, tile);
+      if (!serverActive && time >= minEnd) {
+        lowRun += 1;
+        if (lowRun >= lowRunBins) {
+          endIndex = Math.max(startIndex, index - lowRun + 1);
+          break;
+        }
+      } else {
+        lowRun = 0;
+      }
+    }
+    const highlightStart =
+      actualBodyRelief || markerOnServer || !snap
+        ? marker
+        : start + startIndex * binSpan;
+    const stableEnd = Math.max(
+      minEnd,
+      Math.min(highlightStart + VISUAL_SELECTED_DROP_MAX_SECONDS, start + (endIndex + 1) * binSpan),
+    );
+    const densitySlice = smoothed.slice(startIndex, Math.min(smoothed.length, endIndex + 1));
+    const density = densitySlice.length ? Math.max(...densitySlice) : smoothed[markerIndex] || 0;
+    return {
+      start: clampOriginalTime(highlightStart),
+      end: Math.min(end, stableEnd),
+      density,
+    };
+  }
+
+  const preValues = valuesInTimeRange(smoothed, start, binSpan, marker - 0.220, marker - 0.018);
+  const postValues = valuesInTimeRange(smoothed, start, binSpan, marker, marker + 0.650);
+  if (!postValues.length) return null;
+
+  const preFloor = preValues.length ? percentileValue(preValues, 0.55) : percentileValue(smoothed, 0.30);
+  const postBody = percentileValue(postValues, 0.76);
+  const postPeak = percentileValue(postValues, 0.92);
+  const boomStats = boomVisualStats(tile, rawRms, binSpan);
+  const threshold = serverSeries
+    ? Math.max(0.08, Math.min(0.62, preFloor + Math.max(0.03, postBody - preFloor) * 0.34))
+    : Math.max(
+        0.12,
+        boomStats?.floor || 0,
+        preFloor + Math.max(0.03, postBody - preFloor) * 0.34,
+      );
+  const lowThreshold = Math.max(0.08, threshold * 0.82);
+  const maxIndex = Math.min(
+    smoothed.length - 1,
+    Math.ceil((marker + VISUAL_SELECTED_DROP_MAX_SECONDS - start) / Math.max(binSpan, 1e-9)),
+  );
+  const minEnd = marker + VISUAL_SELECTED_DROP_MIN_SECONDS;
+  const lowRunBins = Math.max(1, Math.round(VISUAL_SELECTED_DROP_LOW_RUN_SECONDS / Math.max(binSpan, 1e-9)));
+  let endIndex = markerIndex;
+  let lowRun = 0;
+  for (let index = markerIndex; index <= maxIndex; index += 1) {
+    const time = start + (index + 1) * binSpan;
+    endIndex = index;
+    const serverInactive = serverSeries && !serverSeries.bodyMask[index] && !serverSeries.placeableMask[index];
+    if ((serverInactive || smoothed[index] < lowThreshold) && time >= minEnd) {
+      lowRun += 1;
+      if (lowRun >= lowRunBins) {
+        endIndex = Math.max(markerIndex, index - lowRun + 1);
+        break;
+      }
+    } else {
+      lowRun = 0;
+    }
+  }
+
+  const stableEnd = Math.max(
+    minEnd,
+    Math.min(marker + VISUAL_SELECTED_DROP_MAX_SECONDS, start + (endIndex + 1) * binSpan),
+  );
+  return {
+    start: marker,
+    end: Math.min(end, stableEnd),
+    density: Math.max(postBody, postPeak * 0.78),
+  };
+}
+
+function drawSelectedDropHighlight(ctx, width, laneTop, laneHeight, tile, bounds) {
+  if (!bounds || bounds.end <= bounds.start) return;
+  const x0 = Math.max(0, timeToX(bounds.start));
+  const x1 = Math.min(width, timeToX(bounds.end));
+  if (x1 - x0 < VISUAL_CHUNK_MIN_WIDTH_PX) return;
+  const color = stemStroke(tile);
+  const density = Math.max(0, Math.min(1, Number(bounds.density) || 0));
+  const alpha = 0.30 + 0.24 * Math.pow(density, 0.70);
+  const y = laneTop + laneHeight * 0.08;
+  const h = laneHeight * 0.84;
+  ctx.save();
+  ctx.fillStyle = rgbaFromHex(color, alpha);
+  ctx.fillRect(x0, y, x1 - x0, h);
+  ctx.strokeStyle = rgbaFromHex(color, Math.min(0.72, alpha + 0.14));
+  ctx.lineWidth = 1.35;
+  ctx.strokeRect(x0 + 0.5, y + 0.5, Math.max(0, x1 - x0 - 1), Math.max(0, h - 1));
+  ctx.restore();
+}
+
 function drawEnergyChunks(ctx, width, laneTop, laneHeight, tile = waveTile, rmsValues = null, binSpanValue = null) {
   if (!visualFirstMode() || viewportDuration() > VISUAL_CHUNK_MAX_VIEW_SECONDS) return;
   const rawRms = Array.isArray(rmsValues) ? rmsValues : Array.isArray(tile?.rms) ? tile.rms : [];
@@ -1242,24 +1961,70 @@ function drawEnergyChunks(ctx, width, laneTop, laneHeight, tile = waveTile, rmsV
   const start = tileStartSec(tile);
   const span = Math.max(tileEndSec(tile) - start, 1 / Math.max(sampleRate(), 1));
   const binSpan = Number(binSpanValue) > 0 ? Number(binSpanValue) : span / Math.max(1, rawRms.length);
-  const energy = rawRms.map((value) => hyperRmsAmplitude(value, tile));
-  const chunkSmoothSeconds = Math.max(0.08, Math.min(0.85, viewportDuration() / 260));
-  const radius = Math.max(1, Math.round((chunkSmoothSeconds / Math.max(binSpan, 1e-9)) / 2));
-  const smoothed = movingAverage(energy, radius);
-  const low = percentileValue(smoothed, 0.34);
-  const high = percentileValue(smoothed, 0.82);
-  const threshold = Math.max(0.10, low + (Math.max(0.02, high - low) * 0.42));
-  const minDuration = Math.max(0.06, Math.min(0.75, viewportDuration() / 310));
-  const mergeGap = Math.max(0.035, Math.min(0.28, viewportDuration() / 520));
+  const selectedBounds = selectedDropHighlightBounds(tile, rawRms, binSpan);
+  const boomMode = waveformVisualMode === "boom";
+  const boomStats = boomMode ? boomVisualStats(tile, rawRms, binSpan) : null;
+  const serverSeries = boomMode ? serverBoomSeries(tile, rawRms.length) : null;
+  if (boomMode && visualFirstMode() && !serverSeries) return;
+  let smoothed = [];
+  let threshold = VISUAL_CHUNK_NOISE_GATE;
+  let densityCeiling = 1.0;
+  let chunkMinimumNormalized = 0.18;
+  let alphaScale = 1.0;
+  if (boomMode && serverSeries) {
+    smoothed = serverSeries.density;
+    threshold = 0.0001;
+    densityCeiling = 1.0;
+    chunkMinimumNormalized = 0;
+    alphaScale = boomRoleTuning(tile).alphaScale;
+  } else if (boomMode && boomStats) {
+    smoothed = boomStats.body;
+    threshold = Math.max(VISUAL_CHUNK_NOISE_GATE, boomStats.floor);
+    densityCeiling = Math.max(threshold + 0.001, boomStats.ceiling);
+    chunkMinimumNormalized = boomStats.tuning.chunkMinimumNormalized;
+    alphaScale = boomStats.tuning.alphaScale;
+  } else {
+    const energy = rawRms.map((value) => hyperRmsAmplitude(value, tile));
+    const chunkSmoothSeconds = 0.120;
+    const radius = Math.max(1, Math.round((chunkSmoothSeconds / Math.max(binSpan, 1e-9)) / 2));
+    smoothed = movingAverage(energy, radius);
+    const low = percentileValue(smoothed, 0.34);
+    const high = percentileValue(smoothed, 0.82);
+    const top = percentileValue(smoothed, 0.93);
+    threshold = Math.max(
+      VISUAL_CHUNK_NOISE_GATE,
+      low + (Math.max(0.02, high - low) * 0.70),
+    );
+    densityCeiling = Math.max(threshold + 0.001, top);
+  }
+  const minDuration = boomMode ? 0.090 : 0.060;
+  const mergeGap = boomMode ? 0.030 : 0.045;
   const chunks = [];
   let active = null;
 
   smoothed.forEach((value, index) => {
-    if (value >= threshold) {
-      if (!active) active = { startIndex: index, endIndex: index, sum: 0, max: 0 };
+    const serverActive = serverSeries ? serverBoomDisplayActive(serverSeries, index, tile) : null;
+    const activeBin = serverSeries ? serverActive : value >= threshold;
+    if (activeBin) {
+      if (!active) {
+        active = {
+          startIndex: index,
+          endIndex: index,
+          sum: 0,
+          max: 0,
+          maskCount: 0,
+          placeableCount: 0,
+          firstPlaceableIndex: null,
+        };
+      }
       active.endIndex = index;
       active.sum += value;
       active.max = Math.max(active.max, value);
+      if (serverSeries?.bodyMask[index]) active.maskCount += 1;
+      if (serverSeries?.placeableMask[index]) {
+        active.placeableCount += 1;
+        if (active.firstPlaceableIndex === null) active.firstPlaceableIndex = index;
+      }
     } else if (active) {
       chunks.push(active);
       active = null;
@@ -1278,29 +2043,185 @@ function drawEnergyChunks(ctx, width, laneTop, laneHeight, tile = waveTile, rmsV
       prev.sum += chunk.sum;
       prev.count += count;
       prev.max = Math.max(prev.max, chunk.max);
+      prev.maskCount += chunk.maskCount || 0;
+      prev.placeableCount += chunk.placeableCount || 0;
+      if (chunk.firstPlaceableIndex !== null) {
+        prev.firstPlaceableIndex =
+          prev.firstPlaceableIndex === null
+            ? chunk.firstPlaceableIndex
+            : Math.min(prev.firstPlaceableIndex, chunk.firstPlaceableIndex);
+      }
       return;
     }
-    merged.push({ start: chunkStart, end: chunkEnd, sum: chunk.sum, count, max: chunk.max });
+    merged.push({
+      start: chunkStart,
+      end: chunkEnd,
+      sum: chunk.sum,
+      count,
+      max: chunk.max,
+      maskCount: chunk.maskCount || 0,
+      placeableCount: chunk.placeableCount || 0,
+      firstPlaceableIndex: chunk.firstPlaceableIndex,
+    });
   });
 
   const color = stemStroke(tile);
   ctx.save();
   merged.forEach((chunk) => {
-    const duration = chunk.end - chunk.start;
-    const x0 = Math.max(0, timeToX(chunk.start));
+    if (
+      selectedBounds &&
+      chunk.end >= selectedBounds.start - 0.010 &&
+      chunk.start <= selectedBounds.end + 0.010
+    ) {
+      return;
+    }
+    if (serverSeries && chunk.placeableCount <= 0) return;
+    const renderStart = serverSeries && Number.isFinite(chunk.firstPlaceableIndex)
+      ? start + chunk.firstPlaceableIndex * binSpan
+      : chunk.start;
+    const duration = chunk.end - renderStart;
+    const x0 = Math.max(0, timeToX(renderStart));
     const x1 = Math.min(width, timeToX(chunk.end));
     if (duration < minDuration || x1 - x0 < VISUAL_CHUNK_MIN_WIDTH_PX) return;
     const average = chunk.sum / Math.max(1, chunk.count);
-    const alpha = VISUAL_CHUNK_MIN_ALPHA + (VISUAL_CHUNK_MAX_ALPHA - VISUAL_CHUNK_MIN_ALPHA) * Math.max(average, chunk.max * 0.72);
+    const density = Math.max(average, chunk.max * 0.82);
+    if (!serverSeries && density < Math.max(threshold, VISUAL_CHUNK_NOISE_GATE)) return;
+    const normalizedDensity = serverSeries
+      ? Math.max(
+          density,
+          chunk.placeableCount > 0 ? BOOM_PLACE_MIN_POST_NORMALIZED : BOOM_BODY_MIN_NORMALIZED,
+        )
+      : Math.max(0, Math.min(1, (density - threshold) / Math.max(densityCeiling - threshold, 0.001)));
+    if (!serverSeries && boomMode && normalizedDensity < chunkMinimumNormalized) return;
+    const frontEdgeBoost = serverSeries && chunk.placeableCount > 0 ? BOOM_GUI_FRONT_EDGE_ALPHA_BOOST : 0;
+    const alpha = Math.min(
+      0.76,
+      alphaScale * (
+        VISUAL_CHUNK_MIN_ALPHA +
+        (VISUAL_CHUNK_MAX_ALPHA - VISUAL_CHUNK_MIN_ALPHA) *
+          Math.pow(Math.max(0, Math.min(1, boomMode ? normalizedDensity : density)), 0.95)
+      ) + frontEdgeBoost,
+    );
     const y = laneTop + laneHeight * 0.08;
     const h = laneHeight * 0.84;
     ctx.fillStyle = rgbaFromHex(color, alpha);
     ctx.fillRect(x0, y, x1 - x0, h);
-    ctx.strokeStyle = rgbaFromHex(color, Math.min(0.36, alpha + 0.08));
+    ctx.strokeStyle = rgbaFromHex(color, Math.min(0.62, alpha + 0.10));
     ctx.lineWidth = 1;
     ctx.strokeRect(x0 + 0.5, y + 0.5, Math.max(0, x1 - x0 - 1), Math.max(0, h - 1));
   });
   ctx.restore();
+  drawSelectedDropHighlight(ctx, width, laneTop, laneHeight, tile, selectedBounds);
+}
+
+function drawBoomBodyBars(ctx, width, laneTop, laneHeight, tile = waveTile) {
+  const rawRms = Array.isArray(tile?.rms) ? tile.rms : [];
+  if (rawRms.length < 2) return false;
+  const start = tileStartSec(tile);
+  const span = Math.max(tileEndSec(tile) - start, 1 / Math.max(sampleRate(), 1));
+  const binSpan = span / Math.max(1, rawRms.length);
+  const pps = pixelsPerSecond();
+  const binsPerBar = Math.max(1, Math.round(BOOM_BODY_TARGET_BAR_PX / Math.max(binSpan * pps, 0.001)));
+  const boomStats = boomVisualStats(tile, rawRms, binSpan);
+  if (!boomStats) return false;
+  const serverSeries = serverBoomSeries(tile, rawRms.length);
+  const body = serverSeries ? serverSeries.density : boomStats.body;
+  const color = stemStroke(tile);
+  const mid = laneTop + laneHeight / 2;
+
+  ctx.save();
+  if (visualFirstMode() && !serverSeries) {
+    ctx.restore();
+    return true;
+  }
+  if (visualFirstMode() && serverSeries) {
+    drawBoomMaskedCenterline(ctx, width, mid, serverSeries, body.length, tile, start, binSpan);
+  } else {
+    ctx.strokeStyle = "rgba(23,32,42,0.24)";
+    ctx.lineWidth = 1;
+    ctx.setLineDash([2, 5]);
+    ctx.beginPath();
+    ctx.moveTo(0, Math.round(mid) + 0.5);
+    ctx.lineTo(width, Math.round(mid) + 0.5);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  drawEnergyChunks(ctx, width, laneTop, laneHeight, tile, rawRms, binSpan);
+
+  for (let i = 0; i < body.length; i += binsPerBar) {
+    const endIndex = Math.min(body.length, i + binsPerBar);
+    const slice = body.slice(i, endIndex);
+    if (!slice.length) continue;
+    const serverPlaceableSlice = serverSeries ? serverSeries.placeableMask.slice(i, endIndex) : [];
+    const serverPlaceable = serverPlaceableSlice.some(Boolean);
+    const serverDisplay = serverSeries
+      ? slice.some((_value, offset) => serverBoomDisplayActive(serverSeries, i + offset, tile))
+      : true;
+    if (serverSeries && !serverDisplay) continue;
+    const peak = Math.max(...slice);
+    const avg = slice.reduce((sum, value) => sum + value, 0) / slice.length;
+    let density = Math.max(avg, peak * 0.88);
+    if (serverSeries && !serverPlaceable && density < BOOM_GUI_BODY_VISIBLE_DENSITY) continue;
+    const normalized = serverSeries
+      ? (
+          serverPlaceable
+            ? Math.max(density, BOOM_PLACE_MIN_POST_NORMALIZED)
+            : density
+        )
+      : normalizeBoomDensity(density, boomStats);
+    if (!serverSeries && normalized < boomStats.tuning.minimumNormalized) continue;
+    const t0 = start + i * binSpan;
+    const t1 = start + endIndex * binSpan;
+    const x0 = timeToX(t0);
+    const x1 = timeToX(t1);
+    if (x1 < -12 || x0 > width + 12) continue;
+    const x = (x0 + x1) / 2;
+    const barWidth = Math.max(BOOM_BODY_MIN_BAR_PX, Math.min(BOOM_BODY_MAX_BAR_PX, (x1 - x0) * 0.62));
+    const amp = Math.pow(normalized, BOOM_BODY_DARK_POWER);
+    const halfHeight = Math.max(1.2, amp * laneHeight * 0.43);
+    const bodyContextScale =
+      serverSeries && !serverPlaceable && density < BOOM_GUI_BODY_STRONG_DENSITY ? BOOM_GUI_CONTEXT_BODY_SCALE : 1.0;
+    const frontEdgeScale = serverSeries && serverPlaceable ? 1.08 : 1.0;
+    ctx.globalAlpha = Math.min(
+      0.98,
+      (0.04 + 0.92 * amp) * boomStats.tuning.alphaScale * bodyContextScale * frontEdgeScale,
+    );
+    ctx.strokeStyle = color;
+    ctx.lineWidth = barWidth;
+    ctx.lineCap = "round";
+    ctx.beginPath();
+    ctx.moveTo(x, mid - halfHeight);
+    ctx.lineTo(x, mid + halfHeight);
+    ctx.stroke();
+  }
+
+  if (serverSeries?.hasPlaceable) {
+    const tickWidth = Math.max(1.4, Math.min(4, BOOM_GUI_FRONT_EDGE_TICK_SECONDS * pixelsPerSecond()));
+    ctx.save();
+    ctx.strokeStyle = color;
+    ctx.globalAlpha = isDrumsTile(tile) ? 0.92 : 0.42;
+    ctx.lineWidth = tickWidth;
+    ctx.lineCap = "butt";
+    serverBoomRunStarts(serverSeries.placeableMask).forEach((index) => {
+      const t = start + index * binSpan;
+      const x = timeToX(t);
+      if (x < -8 || x > width + 8) return;
+      const density = Number(serverSeries.density[index]) || 0;
+      const tickHeight = laneHeight * (0.28 + 0.42 * Math.pow(Math.max(density, BOOM_PLACE_MIN_POST_NORMALIZED), 0.72));
+      ctx.beginPath();
+      ctx.moveTo(x, mid - tickHeight / 2);
+      ctx.lineTo(x, mid + tickHeight / 2);
+      ctx.stroke();
+    });
+    ctx.restore();
+  }
+
+  ctx.restore();
+  if (viewportDuration() <= 0.350 && tileHasPlaceableBoomEvidence(tile)) {
+    drawSampleInspectionOverlay(ctx, width, laneTop, laneHeight, tile);
+  }
+  return true;
 }
 
 function rmsY(value, laneTop, laneHeight, tile = waveTile, polarity = 1) {
@@ -1309,6 +2230,7 @@ function rmsY(value, laneTop, laneHeight, tile = waveTile, polarity = 1) {
 }
 
 function waveformModeText() {
+  if (waveformVisualMode === "boom") return "Global-gated boom-body bars";
   return waveformVisualMode === "rms" ? "Maximized RMS envelope" : "ultra min/max peaks";
 }
 
@@ -1326,13 +2248,18 @@ function sampleInspectionLabel(tile = waveTile) {
 }
 
 function markerInspectionRadius() {
-  return waveformVisualMode === "rms" ? RMS_DROP_INSPECTION_RADIUS_SECONDS : 0.05;
+  return waveformVisualMode === "peaks" ? 0.05 : RMS_DROP_INSPECTION_RADIUS_SECONDS;
 }
 
 function setWaveformVisualMode(mode) {
-  waveformVisualMode = mode === "peaks" ? "peaks" : "rms";
+  if (visualFirstMode() && mode !== "boom") {
+    mode = "boom";
+    setStatus("Visual-first review uses the Boom waveform only.");
+  }
+  waveformVisualMode = mode === "peaks" ? "peaks" : mode === "rms" ? "rms" : "boom";
   try {
-    window.localStorage?.setItem("dropReviewWaveformVisualMode", waveformVisualMode);
+    window.localStorage?.setItem(WAVEFORM_MODE_STORAGE_KEY, waveformVisualMode);
+    window.localStorage?.setItem(WAVEFORM_MODE_VERSION_KEY, WAVEFORM_MODE_VERSION);
   } catch (_) {
     // Local storage can be unavailable in restricted browser contexts.
   }
@@ -1342,8 +2269,19 @@ function setWaveformVisualMode(mode) {
 }
 
 function syncWaveformModeButtons() {
-  $("rmsWaveBtn")?.classList.toggle("active", waveformVisualMode === "rms");
-  $("peakWaveBtn")?.classList.toggle("active", waveformVisualMode === "peaks");
+  if (visualFirstMode() && waveformVisualMode !== "boom") waveformVisualMode = "boom";
+  const boomButton = $("boomWaveBtn");
+  const rmsButton = $("rmsWaveBtn");
+  const peakButton = $("peakWaveBtn");
+  boomButton?.classList.toggle("active", waveformVisualMode === "boom");
+  rmsButton?.classList.toggle("active", waveformVisualMode === "rms");
+  peakButton?.classList.toggle("active", waveformVisualMode === "peaks");
+  [rmsButton, peakButton].forEach((button) => {
+    if (!button) return;
+    button.hidden = visualFirstMode();
+    button.disabled = visualFirstMode();
+    button.classList.toggle("disabled", visualFirstMode());
+  });
 }
 
 function waveLaneSources() {
@@ -1460,28 +2398,35 @@ function drawPeaks(ctx, width, laneTop, laneHeight, tile = waveTile) {
   const mins = tile?.mins || [];
   const maxs = tile?.maxs || [];
   if (!mins.length || !maxs.length) return;
+  const serverSeries = visualFirstMode() ? serverBoomSeries(tile, Math.max(mins.length, maxs.length)) : null;
+  if (visualFirstMode() && !serverSeries) return;
   const start = tileStartSec(tile);
   const span = Math.max(tileEndSec(tile) - start, 1 / Math.max(sampleRate(), 1));
   const binSpan = span / Math.max(1, mins.length);
   const strokeWidth = Math.max(0.55, Math.min(4, binSpan * pixelsPerSecond()));
   const detailRatio = mins.length / Math.max(width, 1);
   drawEnergyChunks(ctx, width, laneTop, laneHeight, tile);
-
-  ctx.beginPath();
-  for (let i = 0; i < maxs.length; i += 1) {
-    const t = start + (i + 0.5) * binSpan;
-    const x = timeToX(t);
-    const y = sampleY(maxs[i], laneTop, laneHeight, tile);
-    if (i === 0) ctx.moveTo(x, y);
-    else ctx.lineTo(x, y);
-  }
-  for (let i = mins.length - 1; i >= 0; i -= 1) {
-    const t = start + (i + 0.5) * binSpan;
-    ctx.lineTo(timeToX(t), sampleY(mins[i], laneTop, laneHeight, tile));
-  }
-  ctx.closePath();
   ctx.fillStyle = stemFill(tile);
-  ctx.fill();
+  const runs = serverSeries ? serverBoomActiveRuns(serverSeries, Math.min(mins.length, maxs.length), tile) : [
+    { startIndex: 0, endIndex: Math.min(mins.length, maxs.length) },
+  ];
+  runs.forEach((run) => {
+    if (run.endIndex <= run.startIndex) return;
+    ctx.beginPath();
+    for (let i = run.startIndex; i < run.endIndex; i += 1) {
+      const t = start + (i + 0.5) * binSpan;
+      const x = timeToX(t);
+      const y = sampleY(maxs[i], laneTop, laneHeight, tile);
+      if (i === run.startIndex) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }
+    for (let i = run.endIndex - 1; i >= run.startIndex; i -= 1) {
+      const t = start + (i + 0.5) * binSpan;
+      ctx.lineTo(timeToX(t), sampleY(mins[i], laneTop, laneHeight, tile));
+    }
+    ctx.closePath();
+    ctx.fill();
+  });
 
   ctx.save();
   ctx.globalAlpha = detailRatio > 2 ? 0.62 : 0.92;
@@ -1491,6 +2436,7 @@ function drawPeaks(ctx, width, laneTop, laneHeight, tile = waveTile) {
     const t = start + (i + 0.5) * binSpan;
     const x = timeToX(t);
     if (x < -strokeWidth || x > width + strokeWidth) continue;
+    if (visualFirstMode() && !serverBoomDisplayActive(serverSeries, i, tile)) continue;
     const y1 = sampleY(maxs[i], laneTop, laneHeight, tile);
     const y2 = sampleY(mins[i], laneTop, laneHeight, tile);
     ctx.beginPath();
@@ -1505,6 +2451,8 @@ function drawPeakGhost(ctx, width, laneTop, laneHeight, tile = waveTile) {
   const mins = tile?.mins || [];
   const maxs = tile?.maxs || [];
   if (!mins.length || !maxs.length) return;
+  const serverSeries = visualFirstMode() ? serverBoomSeries(tile, Math.max(mins.length, maxs.length)) : null;
+  if (visualFirstMode() && !serverSeries) return;
   const start = tileStartSec(tile);
   const span = Math.max(tileEndSec(tile) - start, 1 / Math.max(sampleRate(), 1));
   const binSpan = span / Math.max(1, mins.length);
@@ -1517,6 +2465,7 @@ function drawPeakGhost(ctx, width, laneTop, laneHeight, tile = waveTile) {
     const t = start + (i + 0.5) * binSpan;
     const x = timeToX(t);
     if (x < -strokeWidth || x > width + strokeWidth) continue;
+    if (visualFirstMode() && !serverBoomDisplayActive(serverSeries, i, tile)) continue;
     const y1 = sampleY(maxs[i], laneTop, laneHeight, tile);
     const y2 = sampleY(mins[i], laneTop, laneHeight, tile);
     ctx.beginPath();
@@ -1531,6 +2480,8 @@ function drawPeakBoundaryOverlay(ctx, width, laneTop, laneHeight, tile = waveTil
   const mins = tile?.mins || [];
   const maxs = tile?.maxs || [];
   if (!mins.length || !maxs.length) return;
+  const serverSeries = visualFirstMode() ? serverBoomSeries(tile, Math.max(mins.length, maxs.length)) : null;
+  if (visualFirstMode() && !serverSeries) return;
   const start = tileStartSec(tile);
   const span = Math.max(tileEndSec(tile) - start, 1 / Math.max(sampleRate(), 1));
   const binSpan = span / Math.max(1, mins.length);
@@ -1538,30 +2489,38 @@ function drawPeakBoundaryOverlay(ctx, width, laneTop, laneHeight, tile = waveTil
   ctx.globalAlpha = RMS_INSPECTION_PEAK_ALPHA;
   ctx.strokeStyle = stemStroke(tile);
   ctx.lineWidth = Math.max(0.75, Math.min(1.8, binSpan * pixelsPerSecond()));
-  ctx.beginPath();
-  for (let i = 0; i < maxs.length; i += 1) {
-    const t = start + (i + 0.5) * binSpan;
-    const x = timeToX(t);
-    const y = sampleY(maxs[i], laneTop, laneHeight, tile);
-    if (i === 0) ctx.moveTo(x, y);
-    else ctx.lineTo(x, y);
-  }
-  ctx.stroke();
-  ctx.beginPath();
-  for (let i = 0; i < mins.length; i += 1) {
-    const t = start + (i + 0.5) * binSpan;
-    const x = timeToX(t);
-    const y = sampleY(mins[i], laneTop, laneHeight, tile);
-    if (i === 0) ctx.moveTo(x, y);
-    else ctx.lineTo(x, y);
-  }
-  ctx.stroke();
+  const runs = serverSeries ? serverBoomActiveRuns(serverSeries, Math.min(mins.length, maxs.length), tile) : [
+    { startIndex: 0, endIndex: Math.min(mins.length, maxs.length) },
+  ];
+  runs.forEach((run) => {
+    if (run.endIndex - run.startIndex < 2) return;
+    ctx.beginPath();
+    for (let i = run.startIndex; i < run.endIndex; i += 1) {
+      const t = start + (i + 0.5) * binSpan;
+      const x = timeToX(t);
+      const y = sampleY(maxs[i], laneTop, laneHeight, tile);
+      if (i === run.startIndex) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+    ctx.beginPath();
+    for (let i = run.startIndex; i < run.endIndex; i += 1) {
+      const t = start + (i + 0.5) * binSpan;
+      const x = timeToX(t);
+      const y = sampleY(mins[i], laneTop, laneHeight, tile);
+      if (i === run.startIndex) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+  });
   ctx.restore();
 }
 
 function drawSampleInspectionOverlay(ctx, width, laneTop, laneHeight, tile = waveTile) {
   const samples = tile?.samples || [];
   if (samples.length < 2) return false;
+  const serverSeries = visualFirstMode() ? serverBoomSeries(tile) : null;
+  if (visualFirstMode() && !serverSeries) return false;
   const sr = Number(tile?.sample_rate || sampleRate());
   const startSample = Number(tile.sample_start || tile.start_sample || 0);
   const visibleStart = Math.max(0, Math.floor(viewportStart * sr) - startSample - 2);
@@ -1571,44 +2530,56 @@ function drawSampleInspectionOverlay(ctx, width, laneTop, laneHeight, tile = wav
   const spacing = pixelsPerSecond() / Math.max(sr, 1);
   if (spacing < RMS_INSPECTION_MIN_SAMPLE_SPACING) return false;
 
-  const points = [];
+  const segments = [];
+  let currentSegment = [];
   for (let index = visibleStart; index < visibleEnd; index += 1) {
     const time = (startSample + index) / sr;
+    if (visualFirstMode() && !serverBoomInspectionActiveAtTime(tile, time, serverSeries, 1)) {
+      if (currentSegment.length >= 2) segments.push(currentSegment);
+      currentSegment = [];
+      continue;
+    }
     const sample = Number(samples[index]);
-    points.push([timeToX(time), sampleY(sample, laneTop, laneHeight, tile), sample]);
+    currentSegment.push([timeToX(time), sampleY(sample, laneTop, laneHeight, tile), sample]);
   }
+  if (currentSegment.length >= 2) segments.push(currentSegment);
+  if (!segments.length) return false;
 
   ctx.save();
   ctx.strokeStyle = "rgba(17,24,32,0.82)";
   ctx.lineWidth = spacing >= 2 ? 1.35 : 0.85;
-  ctx.beginPath();
-  points.forEach(([x, y], index) => {
-    if (index === 0) ctx.moveTo(x, y);
-    else ctx.lineTo(x, y);
+  segments.forEach((points) => {
+    ctx.beginPath();
+    points.forEach(([x, y], index) => {
+      if (index === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
   });
-  ctx.stroke();
 
   if (spacing >= RMS_INSPECTION_ZERO_CROSSING_SPACING) {
     const mid = laneTop + laneHeight / 2;
     ctx.strokeStyle = "rgba(17,24,32,0.72)";
     ctx.fillStyle = "rgba(17,24,32,0.72)";
-    for (let i = 1; i < points.length; i += 1) {
-      const prev = points[i - 1];
-      const curr = points[i];
-      if ((prev[2] <= 0 && curr[2] > 0) || (prev[2] >= 0 && curr[2] < 0)) {
-        const ratio = Math.abs(prev[2]) / Math.max(Math.abs(prev[2]) + Math.abs(curr[2]), 1e-9);
-        const x = prev[0] + (curr[0] - prev[0]) * ratio;
-        ctx.beginPath();
-        ctx.moveTo(x, mid - 8);
-        ctx.lineTo(x, mid + 8);
-        ctx.stroke();
-        if (spacing >= 8) {
+    segments.forEach((points) => {
+      for (let i = 1; i < points.length; i += 1) {
+        const prev = points[i - 1];
+        const curr = points[i];
+        if ((prev[2] <= 0 && curr[2] > 0) || (prev[2] >= 0 && curr[2] < 0)) {
+          const ratio = Math.abs(prev[2]) / Math.max(Math.abs(prev[2]) + Math.abs(curr[2]), 1e-9);
+          const x = prev[0] + (curr[0] - prev[0]) * ratio;
           ctx.beginPath();
-          ctx.arc(x, mid, 2.2, 0, Math.PI * 2);
-          ctx.fill();
+          ctx.moveTo(x, mid - 8);
+          ctx.lineTo(x, mid + 8);
+          ctx.stroke();
+          if (spacing >= 8) {
+            ctx.beginPath();
+            ctx.arc(x, mid, 2.2, 0, Math.PI * 2);
+            ctx.fill();
+          }
         }
       }
-    }
+    });
   }
 
   ctx.restore();
@@ -1618,50 +2589,61 @@ function drawSampleInspectionOverlay(ctx, width, laneTop, laneHeight, tile = wav
 function drawRmsEnvelope(ctx, width, laneTop, laneHeight, tile = waveTile) {
   const rawRms = Array.isArray(tile?.rms) ? tile.rms : [];
   if (rawRms.length < 2) return false;
+  const serverSeries = visualFirstMode() ? serverBoomSeries(tile, rawRms.length) : null;
+  if (visualFirstMode() && !serverSeries) return false;
   const start = tileStartSec(tile);
   const span = Math.max(tileEndSec(tile) - start, 1 / Math.max(sampleRate(), 1));
   const binSpan = span / Math.max(1, rawRms.length);
   const rms = smoothRmsValues(rawRms, binSpan);
   drawEnergyChunks(ctx, width, laneTop, laneHeight, tile, rawRms, binSpan);
+  const runs = serverSeries ? serverBoomActiveRuns(serverSeries, rms.length, tile) : [
+    { startIndex: 0, endIndex: rms.length },
+  ];
 
-  ctx.beginPath();
-  for (let i = 0; i < rms.length; i += 1) {
-    const t = start + (i + 0.5) * binSpan;
-    const x = timeToX(t);
-    const y = rmsY(rms[i], laneTop, laneHeight, tile, 1);
-    if (i === 0) ctx.moveTo(x, y);
-    else ctx.lineTo(x, y);
-  }
-  for (let i = rms.length - 1; i >= 0; i -= 1) {
-    const t = start + (i + 0.5) * binSpan;
-    ctx.lineTo(timeToX(t), rmsY(rms[i], laneTop, laneHeight, tile, -1));
-  }
-  ctx.closePath();
   ctx.fillStyle = stemFill(tile);
-  ctx.fill();
+  runs.forEach((run) => {
+    if (run.endIndex <= run.startIndex) return;
+    ctx.beginPath();
+    for (let i = run.startIndex; i < run.endIndex; i += 1) {
+      const t = start + (i + 0.5) * binSpan;
+      const x = timeToX(t);
+      const y = rmsY(rms[i], laneTop, laneHeight, tile, 1);
+      if (i === run.startIndex) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }
+    for (let i = run.endIndex - 1; i >= run.startIndex; i -= 1) {
+      const t = start + (i + 0.5) * binSpan;
+      ctx.lineTo(timeToX(t), rmsY(rms[i], laneTop, laneHeight, tile, -1));
+    }
+    ctx.closePath();
+    ctx.fill();
+  });
 
   ctx.save();
   ctx.strokeStyle = stemStroke(tile);
   ctx.lineWidth = 1.45;
   ctx.globalAlpha = 0.88;
-  ctx.beginPath();
-  for (let i = 0; i < rms.length; i += 1) {
-    const t = start + (i + 0.5) * binSpan;
-    const x = timeToX(t);
-    const y = rmsY(rms[i], laneTop, laneHeight, tile, 1);
-    if (i === 0) ctx.moveTo(x, y);
-    else ctx.lineTo(x, y);
-  }
-  ctx.stroke();
-  ctx.beginPath();
-  for (let i = 0; i < rms.length; i += 1) {
-    const t = start + (i + 0.5) * binSpan;
-    const x = timeToX(t);
-    const y = rmsY(rms[i], laneTop, laneHeight, tile, -1);
-    if (i === 0) ctx.moveTo(x, y);
-    else ctx.lineTo(x, y);
-  }
-  ctx.stroke();
+  runs.forEach((run) => {
+    if (run.endIndex - run.startIndex < 2) return;
+    ctx.beginPath();
+    for (let i = run.startIndex; i < run.endIndex; i += 1) {
+      const t = start + (i + 0.5) * binSpan;
+      const x = timeToX(t);
+      const y = rmsY(rms[i], laneTop, laneHeight, tile, 1);
+      if (i === run.startIndex) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+    ctx.beginPath();
+    for (let i = run.startIndex; i < run.endIndex; i += 1) {
+      const t = start + (i + 0.5) * binSpan;
+      const x = timeToX(t);
+      const y = rmsY(rms[i], laneTop, laneHeight, tile, -1);
+      if (i === run.startIndex) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+  });
   ctx.restore();
 
   drawPeakBoundaryOverlay(ctx, width, laneTop, laneHeight, tile);
@@ -1673,57 +2655,75 @@ function drawRmsEnvelope(ctx, width, laneTop, laneHeight, tile = waveTile) {
 function drawSamples(ctx, width, laneTop, laneHeight, tile = waveTile) {
   const samples = tile?.samples || [];
   if (samples.length < 2) return;
+  const serverSeries = visualFirstMode() ? serverBoomSeries(tile) : null;
+  if (visualFirstMode() && !serverSeries) return;
   const sr = Number(tile?.sample_rate || sampleRate());
   const startSample = Number(tile.sample_start || tile.start_sample || 0);
   const visibleStart = Math.max(0, Math.floor(viewportStart * sr) - startSample - 2);
   const visibleEnd = Math.min(samples.length, Math.ceil(viewportEnd * sr) - startSample + 2);
   if (visibleEnd - visibleStart < 2) return;
-  const points = [];
+  const segments = [];
+  let currentSegment = [];
   for (let index = visibleStart; index < visibleEnd; index += 1) {
     const time = (startSample + index) / sr;
-    points.push([timeToX(time), sampleY(samples[index], laneTop, laneHeight, tile), Number(samples[index])]);
+    if (visualFirstMode() && !serverBoomInspectionActiveAtTime(tile, time, serverSeries, 1)) {
+      if (currentSegment.length >= 2) segments.push(currentSegment);
+      currentSegment = [];
+      continue;
+    }
+    const sample = Number(samples[index]);
+    currentSegment.push([timeToX(time), sampleY(sample, laneTop, laneHeight, tile), sample]);
   }
+  if (currentSegment.length >= 2) segments.push(currentSegment);
+  if (!segments.length) return;
 
   ctx.strokeStyle = stemStroke(tile);
   ctx.lineWidth = 1.4;
-  ctx.beginPath();
-  points.forEach(([x, y], index) => {
-    if (index === 0) ctx.moveTo(x, y);
-    else ctx.lineTo(x, y);
+  segments.forEach((points) => {
+    ctx.beginPath();
+    points.forEach(([x, y], index) => {
+      if (index === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
   });
-  ctx.stroke();
 
-  const spacing = Math.abs(points[1][0] - points[0][0]);
+  const firstSegment = segments.find((points) => points.length >= 2);
+  const spacing = firstSegment ? Math.abs(firstSegment[1][0] - firstSegment[0][0]) : 0;
   if (spacing >= 5) {
     ctx.fillStyle = stemStroke(tile);
-    for (const [x, y] of points) {
-      ctx.beginPath();
-      ctx.arc(x, y, 2.2, 0, Math.PI * 2);
-      ctx.fill();
-    }
+    segments.forEach((points) => {
+      for (const [x, y] of points) {
+        ctx.beginPath();
+        ctx.arc(x, y, 2.2, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    });
   }
 
   if (spacing >= 3) {
     ctx.strokeStyle = "#111820";
     ctx.fillStyle = "#111820";
-    for (let i = 1; i < points.length; i += 1) {
-      const prev = points[i - 1];
-      const curr = points[i];
-      if ((prev[2] <= 0 && curr[2] > 0) || (prev[2] >= 0 && curr[2] < 0)) {
-        const ratio = Math.abs(prev[2]) / Math.max(Math.abs(prev[2]) + Math.abs(curr[2]), 1e-9);
-        const x = prev[0] + (curr[0] - prev[0]) * ratio;
-        const mid = laneTop + laneHeight / 2;
-        ctx.beginPath();
-        ctx.moveTo(x, mid - 7);
-        ctx.lineTo(x, mid + 7);
-        ctx.stroke();
-        if (spacing >= 8) {
+    segments.forEach((points) => {
+      for (let i = 1; i < points.length; i += 1) {
+        const prev = points[i - 1];
+        const curr = points[i];
+        if ((prev[2] <= 0 && curr[2] > 0) || (prev[2] >= 0 && curr[2] < 0)) {
+          const ratio = Math.abs(prev[2]) / Math.max(Math.abs(prev[2]) + Math.abs(curr[2]), 1e-9);
+          const x = prev[0] + (curr[0] - prev[0]) * ratio;
+          const mid = laneTop + laneHeight / 2;
           ctx.beginPath();
-          ctx.arc(x, mid, 2.5, 0, Math.PI * 2);
-          ctx.fill();
+          ctx.moveTo(x, mid - 7);
+          ctx.lineTo(x, mid + 7);
+          ctx.stroke();
+          if (spacing >= 8) {
+            ctx.beginPath();
+            ctx.arc(x, mid, 2.5, 0, Math.PI * 2);
+            ctx.fill();
+          }
         }
       }
-    }
+    });
   }
 }
 
@@ -1763,10 +2763,9 @@ function drawMarkers() {
   overlay.innerHTML = "";
   if (!currentItem || !waveDuration) return;
   const blue = blueMarkerInfo();
-  drawMarker(overlay, currentItem.ai_pick, "ai", "AI");
-  drawMarker(overlay, blue.time, "grid", blue.label ? `BLUE ${blue.label}` : "BLUE", { labelTop: 24 });
-  drawMarker(overlay, kneeMarkerTime(), "knee", "KNEE");
-  const showCandidateMarkers = !visualFirstMode() || viewportDuration() <= VISUAL_CHUNK_CANDIDATE_MARKER_VIEW_SECONDS;
+  drawMarker(overlay, blue.time, "grid", "BLUE", { labelTop: 24 });
+  if (!visualFirstMode()) drawMarker(overlay, kneeMarkerTime(), "knee", "KNEE");
+  const showCandidateMarkers = !visualFirstMode();
   if (showCandidateMarkers) {
     (currentItem.top_10_candidates || []).forEach((cand, index) => {
       const labelTop = isMobileLayout() ? 4 + Math.min(index, 9) * 19 : 4;
@@ -1797,6 +2796,7 @@ function drawWaveform() {
   lanes.forEach((lane, index) => {
     if (lane?.ok === false) return;
     const top = index * laneHeight;
+    if (waveformVisualMode === "boom" && drawBoomBodyBars(ctx, width, top, laneHeight, lane)) return;
     if (waveformVisualMode === "rms" && drawRmsEnvelope(ctx, width, top, laneHeight, lane)) return;
     if (lane?.mode === "samples") drawSamples(ctx, width, top, laneHeight, lane);
     else drawPeaks(ctx, width, top, laneHeight, lane);
@@ -1819,6 +2819,7 @@ function scheduleDrawWaveform() {
 function renderCandidates(item) {
   const list = $("candidateList");
   list.innerHTML = "";
+  if (visualFirstMode()) return;
   for (const cand of item.top_10_candidates || []) {
     const li = document.createElement("li");
     const dp = drumMetric(cand, "drumprint_pattern_score");
@@ -1975,26 +2976,27 @@ function updateAudioStatus() {
   if (!currentItem || !waveDuration) return;
   const primary = waveTile || usableWaveTiles()[0] || null;
   const stemCount = Math.max(1, usableWaveTiles().length || availableStemCount());
-  const mode = waveformVisualMode === "rms" && primary?.rms?.length
+  const usesRmsBins = (waveformVisualMode === "rms" || waveformVisualMode === "boom") && primary?.rms?.length;
+  const mode = usesRmsBins
     ? waveformModeText()
     : primary?.mode === "samples" ? "raw samples" : "ultra min/max peaks";
   const cache = primary?.cache_hit ? "cache hit" : "cache build";
   const detailCount =
-    waveformVisualMode === "rms" && primary?.rms?.length
+    usesRmsBins
       ? `${(primary?.rms || []).length} rms bins`
       : primary?.mode === "samples"
       ? `${(primary?.samples || []).length} samples`
       : `${(primary?.mins || []).length} bins`;
   const secPerBin =
-    waveformVisualMode === "rms" && primary?.rms?.length
+    usesRmsBins
       ? Math.max(0, Number(primary?.end_sec || 0) - Number(primary?.start_sec || 0)) / Math.max((primary?.rms || []).length, 1)
       : primary?.mode === "samples"
       ? 1 / Math.max(sampleRate(), 1)
       : Math.max(0, Number(primary?.end_sec || 0) - Number(primary?.start_sec || 0)) / Math.max((primary?.mins || []).length, 1);
-  const maximizerText = waveformVisualMode === "rms" && primary?.rms?.length
+  const maximizerText = usesRmsBins
     ? ` | max ${rmsMaximizerMakeup(primary).toFixed(2)}x`
     : "";
-  const inspectionText = waveformVisualMode === "rms" && primary?.rms?.length
+  const inspectionText = usesRmsBins
     ? ` | ${sampleInspectionLabel(primary)}`
     : "";
   $("audioStatus").textContent =
@@ -2031,6 +3033,7 @@ function setViewport(start, end, nextView = waveView) {
   if (!visualDirectPlaceReady()) hoverPlaceTime = null;
   $("waveWrapper")?.classList.toggle("directPlace", visualDirectPlaceReady() && correctionMode);
   scheduleDrawWaveform();
+  updatePlaceButton();
   scheduleWaveformTile();
 }
 
@@ -2076,6 +3079,7 @@ function requestWaveformTile() {
       waveDuration = Number(data.duration || waveTile?.duration || waveDuration || currentItem.full_duration_sec || 0);
       drawWaveform();
       syncZoomControls();
+      updatePlaceButton();
     })
     .catch((err) => {
       if (err.name === "AbortError") return;
@@ -2092,7 +3096,8 @@ function setViewportAround(center, radius, nextView = "preset") {
 
 function focusAiWindow() {
   if (!currentItem || !waveDuration) return;
-  const ai = Number(currentItem.ai_pick || 0);
+  const ai = optionalMarkerTime(currentItem.ai_pick);
+  if (ai === null) return resetZoom();
   setViewport(ai - DEFAULT_WINDOW_BEFORE, ai + DEFAULT_WINDOW_AFTER, "window");
 }
 
@@ -2170,12 +3175,44 @@ function timeFromClientX(clientX) {
   return clampOriginalTime(viewportStart + x / Math.max(pixelsPerSecond(), 0.001));
 }
 
-function placeAtClientX(clientX) {
-  if (!correctionMode || !currentItem || !waveDuration) return;
-  setUserPick(timeFromClientX(clientX));
-  hoverPlaceTime = null;
-  setCorrectionMode(false);
-  setStatus(`1.1.1 placed at ${fmtTime(userPick)} (${userPick.toFixed(6)}s). Tap SAVE PLACED when it looks right.`);
+async function placeAtClientX(clientX) {
+  if (!correctionMode || !currentItem || !waveDuration || placeValidationInFlight) return;
+  const target = timeFromClientX(clientX);
+  const placement = resolveBoomPlacementTime(target);
+  if (!placement.ok) {
+    const evidence = placement.evidence || {};
+    const postPct = Math.round((Number(evidence.normalizedPost) || 0) * 100);
+    const peakPct = Math.round((Number(evidence.normalizedPeak) || 0) * 100);
+    const nearest = placement.snap?.time;
+    const nearestText = nearest !== undefined && nearest !== null ? ` Nearest Boom edge is ${fmtTime(nearest)}.` : "";
+    setStatus(
+      `Rejected ${fmtTime(target)}: too low/flat for a drop front (${evidence.reason}, body ${postPct}%, peak ${peakPct}%). ` +
+        `Zoom to the first dark boom body edge before placing 1.1.1.${nearestText}`,
+    );
+    setPlaybackStatus(`Low/flat point rejected at ${fmtTime(target)}`);
+    return;
+  }
+  placeValidationInFlight = true;
+  updatePlaceButton();
+  setStatus(`Checking Boom proof at ${fmtTime(placement.time)} before placing 1.1.1...`);
+  try {
+    const serverValidation = await validateVisualPlacementOnServer(placement.time);
+    if (!serverValidation.valid) {
+      setStatus(`Rejected ${fmtTime(placement.time)}: ${serverValidation.error || "not a validated Boom front edge"}`);
+      setPlaybackStatus(`Server Boom proof rejected ${fmtTime(placement.time)}`);
+      return;
+    }
+    setUserPick(placement.time);
+    hoverPlaceTime = null;
+    setCorrectionMode(false);
+    const snapText = placement.snapped ? ` Snapped from ${fmtTime(target)} to the Boom front edge.` : "";
+    setStatus(`1.1.1 placed at ${fmtTime(userPick)} (${userPick.toFixed(6)}s).${snapText} Tap SAVE PLACED when it looks right.`);
+  } catch (err) {
+    setStatus(`Placement check failed: ${err.message}`);
+  } finally {
+    placeValidationInFlight = false;
+    updatePlaceButton();
+  }
 }
 
 function visualZoomAtClientX(clientX) {
@@ -2214,7 +3251,7 @@ function loadWaveform(item) {
 function activeCenterTime() {
   if (userPick !== null) return userPick;
   if (selectedMicroTime() !== null) return selectedMicroTime();
-  return Number(currentItem?.ai_pick || 0);
+  return optionalMarkerTime(currentItem?.ai_pick) ?? waveDuration / 2;
 }
 
 function applyPreset(name) {
@@ -2640,7 +3677,7 @@ function togglePlay() {
     if (currentItem?.audio_url) {
       const start = Number(currentItem.preview_offset_sec || 0);
       const end = start + Number(currentItem.preview_duration_sec || 0);
-      playAudioPreview(currentItem.audio_url, start, "AI window", end);
+      playAudioPreview(currentItem.audio_url, start, "Blue window", end);
       return;
     }
     setStatus("No short preview audio available. ffmpeg is required so the browser does not load the full track.");
@@ -2690,10 +3727,17 @@ function renderState(state) {
   setCorrectionMode(false);
   waveView = "window";
   document.body.classList.toggle("visualFirst", visualFirstMode());
-  $("approveBtn").textContent = visualFirstMode() ? "ACCEPT AI" : "ACCEPT AI MARKER";
-  $("placeBtn").textContent = visualFirstMode() ? "PLACE 1.1.1" : "PLACE MANUAL";
-  $("aiAutoPlaceBtn").textContent = visualFirstMode() ? "AI SCAN" : "AI AUTO PLACE";
-  $("candidateHelp").textContent = visualFirstMode() ? "Click waveform to play. Tap a number or double-click to zoom. Press PLACE 1.1.1, then click the true transient." : "Tap a number, then tap Save.";
+  if ($("placeBtn")) $("placeBtn").textContent = visualFirstMode() ? "PLACE 1.1.1" : "PLACE MANUAL";
+  if ($("candidateHelp")) {
+    $("candidateHelp").textContent = visualFirstMode()
+      ? "Click waveform to play. Place 1.1.1 only when setting green manually."
+      : "Place or accept the marker, then save.";
+  }
+  if ($("retrainBtn")) {
+    $("retrainBtn").hidden = visualFirstMode();
+    $("retrainBtn").disabled = visualFirstMode();
+    $("retrainBtn").classList.toggle("disabled", visualFirstMode());
+  }
   syncWaveformModeButtons();
   renderAutoAcceptGate(null);
   updateSaveButton();
@@ -2721,7 +3765,7 @@ function renderState(state) {
     $("zeroCrossingQuality").textContent = "--";
     renderAutoAcceptGate(null);
     destroyWave();
-    $("candidateList").innerHTML = "";
+    if ($("candidateList")) $("candidateList").innerHTML = "";
     $("debugImage").style.display = "none";
     $("debugMissing").style.display = "block";
     return;
@@ -2768,15 +3812,35 @@ async function refresh() {
 
 async function approve() {
   if (!currentItem) return;
-  if (reviewActionInFlight || saveInFlight) return;
+  if (reviewUiBusy()) return;
+  const blue = blueMarkerInfo();
+  const blueTime = optionalMarkerTime(blue.time);
+  if (blueTime === null) {
+    setStatus("No Boom-proof blue marker is available to accept for this track.");
+    return;
+  }
+  const blueCandidate = blue.candidate || currentItem.selected_candidate || null;
   setReviewActionInFlight(true);
-  setStatus(`Accepting AI marker at ${fmtTime(markerTimes().ai)}...`);
+  setStatus(visualFirstMode() ? `Checking Boom proof for blue marker at ${fmtTime(blueTime)}...` : `Accepting blue marker at ${fmtTime(blueTime)}...`);
   try {
+    if (visualFirstMode()) {
+      const serverValidation = await validateVisualPlacementOnServer(blueTime, { context: "blue", candidate: blueCandidate });
+      if (!serverValidation.valid) {
+        setStatus(`Blue accept blocked: ${serverValidation.error || "blue marker is not a validated Boom front edge"}`);
+        setPlaybackStatus(`Blue accept blocked at ${fmtTime(blueTime)}`);
+        return;
+      }
+      setStatus(`Accepting validated blue marker at ${fmtTime(blueTime)}...`);
+    }
     const data = await fetchJson("/api/approve", {
       method: "POST",
-      body: JSON.stringify({ id: currentItem.id }),
+      body: JSON.stringify({
+        id: currentItem.id,
+        marker_time: visualFirstMode() ? blueTime : undefined,
+        picked_candidate: visualFirstMode() ? cloneCandidateForCorrection(blueCandidate, blueTime) : undefined,
+      }),
     });
-    setStatus("AI marker accepted and logged.");
+    setStatus("Blue marker accepted and logged.");
     renderState(data.state);
   } catch (err) {
     setStatus(`Accept failed: ${err.message}`);
@@ -2785,21 +3849,50 @@ async function approve() {
   }
 }
 
+async function acceptBlueMarker() {
+  if (visualFirstMode()) {
+    await approve();
+    return;
+  }
+  await acceptMarker("grid");
+}
+
 async function saveCorrection() {
   if (!currentItem) return;
   if (userPick === null) {
-    setStatus("Pick a candidate number or place a marker first.");
+    setStatus("Place a marker first.");
     return;
   }
-  if (saveInFlight || reviewActionInFlight) return;
+  if (reviewUiBusy()) return;
   saveInFlight = true;
   updateSaveButton();
-  const candidateForLearning = pickedCandidate || closestCandidateNearTime(userPick, 0.12);
-  const learningCandidate = candidateForLearning ? cloneCandidateForCorrection(candidateForLearning, userPick) : null;
-  const learningRank = learningCandidate?.picked_candidate_rank || learningCandidate?.rank || null;
-  const saveLabel = learningRank ? `candidate #${learningRank}` : "placed marker";
-  setStatus(`Saving ${saveLabel} at ${fmtTime(userPick)}...`);
   try {
+    if (visualFirstMode()) {
+      const placement = resolveBoomPlacementTime(userPick);
+      if (placement.ok && placement.snapped) {
+        setUserPick(placement.time);
+        setStatus(`Marker snapped to the Boom front edge at ${fmtTime(userPick)} before saving.`);
+      }
+      setStatus(`Checking Boom proof before saving ${fmtTime(userPick)}...`);
+      const serverValidation = await validateVisualPlacementOnServer(userPick);
+      if (!serverValidation.valid) {
+        const evidence = placement.evidence || {};
+        const postPct = Math.round((Number(evidence.normalizedPost) || 0) * 100);
+        const peakPct = Math.round((Number(evidence.normalizedPeak) || 0) * 100);
+        const localReason = placement.ok ? "" : ` Local view: ${evidence.reason}, body ${postPct}%, peak ${peakPct}%.`;
+        setStatus(
+          `Save blocked: ${fmtTime(userPick)} is not a validated Boom front edge. ` +
+            `${serverValidation.error || "Server Boom proof rejected the marker."}${localReason}`,
+        );
+        setPlaybackStatus(`Save blocked at ${fmtTime(userPick)}`);
+        return;
+      }
+    }
+    const candidateForLearning = visualFirstMode() ? null : pickedCandidate || closestCandidateNearTime(userPick, 0.12);
+    const learningCandidate = candidateForLearning ? cloneCandidateForCorrection(candidateForLearning, userPick) : null;
+    const learningRank = learningCandidate?.picked_candidate_rank || learningCandidate?.rank || null;
+    const saveLabel = learningRank ? `candidate #${learningRank}` : "placed marker";
+    setStatus(`Saving ${saveLabel} at ${fmtTime(userPick)}...`);
     const data = await fetchJson("/api/correct", {
       method: "POST",
       body: JSON.stringify({
@@ -2822,6 +3915,7 @@ async function saveCorrection() {
 
 async function refineMarker() {
   if (!currentItem) return;
+  if (reviewUiBusy()) return;
   setStatus("Running sample-level marker refinement...");
   const marker = userPick === null ? activeCenterTime() : userPick;
   const data = await fetchJson("/api/refine_marker", {
@@ -2842,6 +3936,7 @@ async function refineMarker() {
 
 async function autoPlace() {
   if (!currentItem) return;
+  if (reviewUiBusy()) return;
   const mode = visualFirstMode() ? "visual_only" : "normal";
   setStatus(
     visualFirstMode()
@@ -2908,7 +4003,15 @@ async function autoPlace() {
 
 async function acceptMarker(kind) {
   if (!currentItem) return;
-  if (reviewActionInFlight || saveInFlight) return;
+  if (reviewUiBusy()) return;
+  if (visualFirstMode()) {
+    if (kind === "ai" || kind === "grid") {
+      await approve();
+    } else {
+      setStatus("Visual-first review only accepts the Boom-proof blue marker or a saved green placement.");
+    }
+    return;
+  }
   const hasPendingAutoPlace = kind === "ai" && optionalMarkerTime(pendingAutoPlacePick) !== null;
   if (kind === "ai" && !hasPendingAutoPlace) {
     await approve();
@@ -2918,10 +4021,11 @@ async function acceptMarker(kind) {
   if (acceptedTime === null) return;
   const blue = kind === "grid" ? blueMarkerInfo() : null;
   const label = kind === "grid" && blue?.label ? `BLUE ${blue.label}` : String(kind || "marker").toUpperCase();
+  const reviewedFrom = kind === "grid" ? "web_accept_blue_marker" : hasPendingAutoPlace ? "web_accept_blue_marker" : `web_accept_${kind}_marker`;
   const payload = {
     id: currentItem.id,
     user_pick: acceptedTime,
-    reviewed_from: hasPendingAutoPlace ? "web_accept_auto_place_marker" : `web_accept_${kind}_marker`,
+    reviewed_from: reviewedFrom,
   };
   if (hasPendingAutoPlace) {
     payload.picked_candidate = cloneCandidateForCorrection(pendingAutoPlaceCandidate || currentItem.selected_candidate, acceptedTime);
@@ -2949,7 +4053,7 @@ async function acceptMarker(kind) {
 
 async function skip() {
   if (!currentItem) return;
-  if (reviewActionInFlight || saveInFlight) return;
+  if (reviewUiBusy()) return;
   setReviewActionInFlight(true);
   setStatus(`Skipping ${currentItem.track_name || "track"}...`);
   try {
@@ -2967,6 +4071,7 @@ async function skip() {
 }
 
 async function navigate(direction) {
+  if (reviewUiBusy()) return;
   const data = await fetchJson("/api/navigate", {
     method: "POST",
     body: JSON.stringify({ direction }),
@@ -2976,6 +4081,10 @@ async function navigate(direction) {
 }
 
 async function retrain() {
+  if (visualFirstMode()) {
+    setStatus("Retrain is disabled in visual-first review. Use Boom-profile training outside the WebGUI.");
+    return;
+  }
   setStatus("Training candidate model and running promotion gate...");
   const data = await fetchJson("/api/retrain", { method: "POST", body: "{}" });
   setStatus(data);
@@ -2983,6 +4092,17 @@ async function retrain() {
 }
 
 function placeMode() {
+  if (reviewUiBusy()) return;
+  const blockReason = visualDirectPlaceBlockReason();
+  if (blockReason === "loading_boom_mask") {
+    setStatus("Waiting for the current Boom mask before placing 1.1.1.");
+    scheduleWaveformTile(0);
+    return;
+  }
+  if (blockReason === "no_boom_front_edge") {
+    setStatus("No hard Boom front edge is visible here. Zoom or move to the first dark drop body edge before placing 1.1.1.");
+    return;
+  }
   if (visualFirstMode() && currentItem && waveDuration && !visualDirectPlaceReady()) {
     const focus =
       optionalMarkerTime(userPick) ??
@@ -3022,7 +4142,7 @@ function attachEvents() {
   });
   on("approveBtn", "click", () => acceptMarker("ai"));
   on("acceptKneeBtn", "click", () => acceptMarker("knee"));
-  on("acceptGridBtn", "click", () => acceptMarker("grid"));
+  on("acceptGridBtn", "click", acceptBlueMarker);
   on("placeBtn", "click", placeMode);
   on("aiRefineBtn", "click", refineMarker);
   on("aiAutoPlaceBtn", "click", autoPlace);
@@ -3039,6 +4159,7 @@ function attachEvents() {
     event.stopPropagation();
     togglePlay();
   });
+  on("boomWaveBtn", "click", () => setWaveformVisualMode("boom"));
   on("rmsWaveBtn", "click", () => setWaveformVisualMode("rms"));
   on("peakWaveBtn", "click", () => setWaveformVisualMode("peaks"));
   $("playViewBtn").addEventListener("click", playCurrentZoom);
@@ -3046,7 +4167,14 @@ function attachEvents() {
   $("stopBtn").addEventListener("click", stopPlayback);
   $("fullTrackBtn").addEventListener("click", () => applyPreset("full"));
   $("aiWindowBtn").addEventListener("click", () => applyPreset("window"));
-  $("jumpAiBtn").addEventListener("click", () => scrollToOriginalTime(currentItem?.ai_pick || 0));
+  $("jumpAiBtn").addEventListener("click", () => {
+    const blue = blueMarkerInfo().time;
+    if (blue === null) {
+      setStatus("No Boom-proof blue marker is available for this track.");
+      return;
+    }
+    scrollToOriginalTime(blue);
+  });
   $("exportPngBtn").addEventListener("click", exportPng);
   $("zoomOutBtn").addEventListener("click", () => zoomBy(-1));
   $("zoomInBtn").addEventListener("click", () => zoomBy(1));
@@ -3108,8 +4236,16 @@ function attachEvents() {
       return;
     }
     const next = timeFromClientX(event.clientX);
-    if (hoverPlaceTime === null || Math.abs(Number(next) - Number(hoverPlaceTime)) > minViewSeconds()) {
-      hoverPlaceTime = next;
+    const placement = resolveBoomPlacementTime(next);
+    if (!placement.ok) {
+      if (hoverPlaceTime !== null) {
+        hoverPlaceTime = null;
+        scheduleDrawWaveform();
+      }
+      return;
+    }
+    if (hoverPlaceTime === null || Math.abs(Number(placement.time) - Number(hoverPlaceTime)) > minViewSeconds()) {
+      hoverPlaceTime = placement.time;
       scheduleDrawWaveform();
     }
   });
@@ -3242,11 +4378,10 @@ function attachEvents() {
   window.addEventListener("keydown", (event) => {
     if (event.target && ["INPUT", "TEXTAREA"].includes(event.target.tagName)) return;
     const key = event.key.toLowerCase();
-    if (key === "y") acceptMarker("ai");
-    if (key === "b") acceptMarker("grid");
+    if (key === "y" || key === "b") acceptBlueMarker();
     if (key === "n") placeMode();
     if (key === "s") skip();
-    if (key === "r") retrain();
+    if (key === "r" && !visualFirstMode()) retrain();
     if (key === "c") clearUserPick();
     if (key === "=" || key === "+") zoomBy(1);
     if (key === "-" || key === "_") zoomBy(-1);

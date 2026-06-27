@@ -195,16 +195,44 @@ def verify_als(
         report["errors"].append("No WarpMarkers node found.")
         return report
 
+    expected_drop: Optional[float] = None
+    expected_drop_error: Optional[str] = None
+    if candidates_json:
+        try:
+            expected_drop = float(_candidate_json_drop(candidates_json))
+            report["candidate_drop_time"] = float(expected_drop)
+        except Exception as exc:
+            expected_drop_error = str(exc) or exc.__class__.__name__
+
     markers = _marker_values(markers_node)
     report["warp_marker_count"] = len(markers)
     zero_markers = [m for m in markers if m["sec_time"] is not None and abs(float(m["sec_time"])) <= ZERO_TOLERANCE]
+    zero_drop_markers = [
+        m
+        for m in zero_markers
+        if m.get("beat_time") is not None and abs(float(m["beat_time"])) <= BEAT_TOLERANCE
+    ]
     _add_check(checks, "preserves_sec_time_zero_marker", bool(zero_markers), f"zero_markers={len(zero_markers)}")
 
     drops = _drop_markers(markers)
-    report["drop_marker_count"] = len(drops)
-    if drops:
+    expected_zero_drop = bool(expected_drop is not None and abs(float(expected_drop)) <= float(tolerance_sec))
+    report["drop_marker_count"] = len(drops) if not expected_zero_drop else len(zero_drop_markers)
+    if expected_zero_drop and zero_drop_markers:
+        report["drop_marker_time"] = 0.0
+    elif drops:
         report["drop_marker_time"] = float(drops[0]["sec_time"])
-    if allow_multiple:
+    if expected_zero_drop:
+        if allow_multiple:
+            passed = bool(zero_drop_markers)
+        else:
+            passed = len(zero_drop_markers) == 1
+        _add_check(
+            checks,
+            "contains_zero_drop_marker_for_zero_drop",
+            passed,
+            f"zero_drop_markers={len(zero_drop_markers)}; expected_drop={float(expected_drop):.9f}",
+        )
+    elif allow_multiple:
         _add_check(checks, "contains_nonzero_drop_marker", bool(drops), f"drop_markers={len(drops)}")
     else:
         _add_check(checks, "contains_exactly_one_nonzero_drop_marker", len(drops) == 1, f"drop_markers={len(drops)}")
@@ -284,9 +312,22 @@ def verify_als(
 
     if candidates_json:
         try:
-            expected = _candidate_json_drop(candidates_json)
+            if expected_drop_error:
+                raise ValueError(expected_drop_error)
+            expected = float(expected_drop) if expected_drop is not None else _candidate_json_drop(candidates_json)
             report["candidate_drop_time"] = float(expected)
-            if not drops:
+            if expected_zero_drop:
+                if not zero_drop_markers:
+                    _add_check(checks, "drop_marker_matches_candidate_json", False, "no zero drop marker")
+                else:
+                    nearest_delta = min(abs(float(marker["sec_time"]) - float(expected)) for marker in zero_drop_markers)
+                    _add_check(
+                        checks,
+                        "drop_marker_matches_candidate_json",
+                        nearest_delta <= float(tolerance_sec),
+                        f"nearest_delta_sec={nearest_delta:.9f}; tolerance_sec={float(tolerance_sec):.9f}",
+                    )
+            elif not drops:
                 _add_check(checks, "drop_marker_matches_candidate_json", False, "no drop marker")
             else:
                 nearest_delta = min(abs(float(marker["sec_time"]) - float(expected)) for marker in drops)

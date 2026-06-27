@@ -13,6 +13,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 from drop_aligner.als import modify_als
 from drop_aligner.candidate_chooser import candidate_effective_time
 from drop_aligner.exclusions import row_has_excluded_path
+from drop_aligner.legacy_write_guard import add_legacy_detector_write_arg, require_legacy_detector_write_opt_in
 from drop_aligner.multistem import choose_multistem_candidate
 from verify_als import verify_als
 from project_config import DEFAULT_ALS_TEMPLATE, DROP_BATCH_SUMMARY
@@ -417,6 +418,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--force", action="store_true", help="Reanalyze even when multistem_reanalysis already exists")
     parser.add_argument("--dry-run", action="store_true", help="Analyze but do not write CSV/JSON/ALS")
     parser.add_argument("--shadow-report", help="Write a JSON report of every proposed autonomous decision")
+    add_legacy_detector_write_arg(parser)
     return parser
 
 
@@ -429,6 +431,12 @@ def main() -> int:
         raise SystemExit(f"Summary not found: {summary}")
     if bool(args.apply_auto) and bool(args.regenerate_als) and not template.exists():
         raise SystemExit(f"Template not found: {template}")
+    if not bool(args.dry_run):
+        require_legacy_detector_write_opt_in(
+            "reanalyze_remaining_hard_cases.py",
+            action="rewriting legacy multistem summary/candidate JSON/ALS output",
+            explicit=bool(args.allow_legacy_detector_write),
+        )
 
     rows, fieldnames = _read_summary(summary)
     output_fields = _fieldnames(fieldnames)

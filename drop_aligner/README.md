@@ -107,14 +107,20 @@ the detector falls back to the handcrafted score. Training also writes
 `models/training_report.json` with accepted/corrected counts, average delta, and
 model feature importances.
 
-Batch folder processing:
+Legacy batch folder processing:
+
+This is not the production marker path anymore. Production marker generation
+uses `build_fresh_visual_first_library_set.py` and the visual-first WebGUI guard.
+The legacy batch writer is blocked by default and requires
+`--allow-legacy-detector-write` for an intentional experiment.
 
 ```bash
 python3 batch.py "/path/to/folder" \
   --template "CH1.als" \
   --recursive \
   --debug-candidates \
-  --workers 4
+  --workers 4 \
+  --allow-legacy-detector-write
 ```
 
 Supported audio files are `.wav`, `.flac`, `.aiff`, `.aif`, and `.mp3`.
@@ -137,7 +143,8 @@ python3 batch.py "/path/to/folder" \
   --stem-role drums \
   --use-drumprint \
   --microalign \
-  --debug-candidates
+  --debug-candidates \
+  --allow-legacy-detector-write
 ```
 
 When `--microalign` is enabled, candidate JSON includes `microalign` data and
@@ -147,7 +154,7 @@ the summary CSV includes `micro_confidence`, `snap_offset_ms`, and
 Dry run:
 
 ```bash
-python3 batch.py "/path/to/folder" --template "CH1.als" --recursive --dry-run
+python3 batch.py "/path/to/folder" --template "CH1.als" --recursive --dry-run --allow-legacy-detector-write
 ```
 
 The summary CSV columns are `filename`, `detected_drop_time`, `confidence`,
@@ -223,60 +230,62 @@ python3 web_review.py
 ```
 
 By default this uses `/Users/alirahimlou/Desktop/MUSIC/STEMS/drop_batch_summary.csv`,
-`alsFiles/128.als`, opens `http://127.0.0.1:7860`, regenerates corrected ALS
-files, and retrains every 25 approvals/corrections. If the summary CSV is
-missing, it runs the default drums-stem batch first. Use explicit arguments only
-when reviewing a different folder or template:
+`alsFiles/128.als`, opens `http://127.0.0.1:7860`, starts in visual-first full
+waveform mode, regenerates corrected ALS files, and retrains every 25
+approvals/corrections. Production review should pass a fresh visual-first
+summary from `build_fresh_visual_first_library_set.py`; do not use auto-batch
+fallback for production. Use explicit arguments when reviewing a different
+folder or template:
 
 ```bash
 python3 web_review.py "/path/to/drop_batch_summary.csv" --template "alsFiles/128.als"
 ```
 
-The browser review shows one track at a time
-with the debug PNG, interactive waveform/audio preview, AI marker, candidate
-markers, full-groove/DrumPrint/MicroSnap metrics, and correction marker
-placement. The waveform is rendered from backend tiles instead of full-track
+The browser review shows one track at a time with the interactive drums-stem
+waveform/audio preview, blue detector marker, green manual marker, and review
+metrics. The waveform is rendered from backend tiles instead of full-track
 browser decoding: normal zoom uses min/max peak tiles, deep zoom uses raw
 samples, and extreme zoom shows sample points and zero crossings. Marker
-placement and `+/-1 sample` nudging snap to the source sample rate. Actions:
+placement snaps to the source sample rate. Actions:
 
-- `YES, correct` logs an approval with `user_pick = ai_pick`
-- `NO, place correct marker` lets you click the waveform and nudge by 1ms/10ms
-- `AI REFINE MARKER` runs MicroSnap on the current marker and shows the refined marker
-- `AI AUTO PLACE` runs MicroSnap on the top candidates and suggests a final marker
-- `ACCEPT AI REFINED MARKER` logs your approval of that refined marker and rewrites/verifies the ALS
-- `Export PNG` writes a high-resolution PNG of the current zoom window
-- `SAVE CORRECTED ALS` logs the correction and rewrites/verifies the ALS when
-  `--regenerate-als-on-correction` is set
-- `SKIP` leaves the track unlogged
+- `ACCEPT BLUE` logs the detector marker as `web_accept_blue_marker`.
+- `PLACE 1.1.1` lets you click the waveform to set the green/manual marker.
+- `SAVE PLACED` logs the green/manual correction and rewrites/verifies the ALS
+  when `--regenerate-als-on-correction` is set.
+- `CLEAR` removes the green/manual marker before saving.
+- `PLAY` toggles playback for the current track/window.
+- `SKIP` leaves the track unlogged.
 - `RETRAIN NOW` runs the same quality-gated candidate promotion flow as
-  `review.py --retrain`
+  `review.py --retrain`.
 
 Progress is saved to `review_state.json` beside the batch summary. Audio stays
 local; if `ffmpeg` is available the server makes a short WAV preview around the
 detected marker for browser compatibility.
 
-Visual-first review:
+Visual-first review is the standard mode:
 
 ```bash
 python3 web_review.py "/path/to/drop_batch_summary.csv" \
   --template "alsFiles/128.als" \
-  --visual-first \
   --regenerate-als-on-correction
 ```
 
-This opens each track on the full waveform instead of the AI marker window.
+This opens each track on the full waveform instead of a marker-only window.
 The waveform draws darker sustained-energy chunks so the first big visual block
 is easier to spot. Double-click a block to zoom into it, repeat until the edge is
-clear, place `1.1.1`, optionally run `AI REFINE`, then save the marker through
-the normal ALS regeneration and verification path.
+clear, then either `ACCEPT BLUE` if the blue marker is correct or place `1.1.1`
+and `SAVE PLACED` if the green/manual marker is needed.
 
-Automatic MicroSnap suggestions:
+Legacy automatic MicroSnap suggestions:
+
+This old non-visual auto-review path is disabled by default for marker writes.
+Use it only as an experiment with explicit legacy opt-in.
 
 ```bash
 python3 auto_review.py drop_batch_summary.csv --template "CH1.als" \
   --mode conservative \
-  --write-auto-log auto_marks.jsonl
+  --write-auto-log auto_marks.jsonl \
+  --allow-legacy-detector-write
 ```
 
 Modes are `conservative`, `normal`, and `aggressive`. Automatic placements are

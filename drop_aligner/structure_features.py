@@ -15,7 +15,7 @@ from .detector import DropDetectorConfig, FeatureBundle, extract_features
 from .multistem import find_stem_group, infer_bpm_from_path
 
 
-STRUCTURE_FEATURE_VERSION = 4
+STRUCTURE_FEATURE_VERSION = 5
 
 
 def _clip01(value: Any) -> float:
@@ -143,7 +143,7 @@ def _write_cache(audio_path: str, *, sample_rate: int, payload: Mapping[str, Any
 def _load_stem_features(audio_path: str, *, sample_rate: int) -> tuple[Dict[str, FeatureBundle], Dict[str, Any]]:
     group = find_stem_group(audio_path)
     bpm = infer_bpm_from_path(audio_path)
-    cfg = DropDetectorConfig(sample_rate=int(sample_rate), use_drumprint=False)
+    cfg = DropDetectorConfig(sample_rate=int(sample_rate), use_drumprint=False, hpss=False)
     features_by_role: Dict[str, FeatureBundle] = {}
     errors: Dict[str, str] = {}
     for role, path in group.roles.items():

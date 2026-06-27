@@ -53,9 +53,23 @@ from drop_aligner.microalign import choose_microaligned_candidate, microalign_ca
 from drop_aligner.musical_clock import bpm_clock_for_time, feature_grid_for_time, phrase_strength_for_bar
 from drop_aligner.multistem import choose_multistem_candidate, find_stem_group
 from drop_aligner.structure_map import analyze_track_structure
+from drop_aligner.structure_features import compute_bar_feature_map
 from drop_aligner.summary_rerank import rerank_summary_with_model
-from drop_aligner.visual_first import visual_first_marker
-from drop_aligner.waveform import WaveformCache
+from drop_aligner.boom_profile import load_boom_profile, marker_boom_proof
+from drop_aligner.visual_first import (
+    EXTENDED_VISUAL_MAX_CLOCK_BAR,
+    VISUAL_FIRST_PRODUCTION_SAMPLE_RATE,
+    boom_body_section_candidates,
+    visual_first_marker,
+)
+from drop_aligner.waveform import (
+    WaveformCache,
+    accept_gui_boom_mask_with_front_edge_proof,
+    enforce_strict_gui_boom_mask_contract,
+    gui_boom_mask_proof,
+    gui_boom_mask_proof_for_tile,
+    gui_boom_mask_strict_contract_issue,
+)
 from review import _run_retrain
 from verify_als import verify_als
 from project_config import STEMS_ROOT_DIR
@@ -74,6 +88,12 @@ WAVEFORM_STEM_ROLES = (
     ("vocals", "Vocals"),
 )
 POST_STRUCTURE_CHOOSER_PATH = Path(__file__).resolve().parent / "models" / "drop_post_structure_candidate_chooser.pkl"
+VISUAL_SAVE_MAX_LATE_FRONT_EDGE_OFFSET_SEC = 0.080
+VISUAL_SAVE_MAX_PRE_FRONT_EDGE_OFFSET_SEC = 0.020
+VISUAL_SAVE_MAX_ONE_DISTANCE_MS = 90.0
+VISUAL_SAVE_GUI_MASK_VIEW_SEC = 6.0
+VISUAL_SAVE_GUI_MASK_WIDTH = 1200
+VISUAL_SAVE_GUI_MASK_RADIUS_BINS = 2
 
 
 def _float_or_none(value: Any) -> Optional[float]:
@@ -155,6 +175,21 @@ def _clip01(value: Any) -> float:
     if number is None:
         return 0.0
     return max(0.0, min(1.0, float(number)))
+
+
+def _percentile(values: Sequence[Any], pct: float, default: float = 0.0) -> float:
+    clean = sorted(float(value) for value in values if _float_or_none(value) is not None)
+    if not clean:
+        return float(default)
+    if len(clean) == 1:
+        return float(clean[0])
+    position = max(0.0, min(100.0, float(pct))) / 100.0 * (len(clean) - 1)
+    lower = int(math.floor(position))
+    upper = int(math.ceil(position))
+    if lower == upper:
+        return float(clean[lower])
+    frac = position - lower
+    return float(clean[lower] * (1.0 - frac) + clean[upper] * frac)
 
 
 def _candidate_marker_time(candidate: Mapping[str, Any]) -> Optional[float]:
@@ -655,6 +690,8 @@ def _candidate_dedupe_priority(candidate: Mapping[str, Any]) -> float:
         priority = max(priority, 110.0)
     if selected_by == "visual_structure_section_guard":
         priority = max(priority, 109.5)
+    if selected_by.startswith("visual_"):
+        priority = max(priority, 109.25)
     if selected_by == "visual_gui_first_fat_block":
         priority = max(priority, 109.0)
     if selected_by == "visual_primary_phrase_prior":
@@ -1495,7 +1532,7 @@ def _far_later_nonvisual_first_drop_override(
         )
         evidence = _candidate_evidence_score(candidate)
         role_bonus = 0.08 if str(candidate.get("structure_role") or "") == "first_drop" else 0.0
-        saved_bonus = 0.04 if "saved_visual_batch_auto_marker" in str(candidate.get("selected_by") or "") else 0.0
+        saved_bonus = 0.0
         return (
             float(score) + (0.35 * float(evidence)) + role_bonus + saved_bonus,
             -abs(marker - first_time),
@@ -2845,6 +2882,80 @@ def _stable_id(row: Mapping[str, str]) -> str:
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
 
 
+def _normalize_summary_row(row: Mapping[str, str]) -> Dict[str, str]:
+    normalized = dict(row)
+    fresh_audio = str(
+        normalized.get("DrumsPath")
+        or normalized.get("drums_path")
+        or normalized.get("audio_path")
+        or normalized.get("filename")
+        or ""
+    )
+    fresh_marker = str(
+        normalized.get("MarkerSec")
+        or normalized.get("marker_sec")
+        or normalized.get("detected_drop_time")
+        or ""
+    )
+    fresh_output = str(
+        normalized.get("FreshAlignedAls")
+        or normalized.get("fresh_aligned_als")
+        or normalized.get("output_als")
+        or ""
+    )
+    fresh_selected_by = str(
+        normalized.get("SelectedBy")
+        or normalized.get("selected_by")
+        or "fresh_visual_first_library"
+    )
+    if fresh_audio and not normalized.get("filename"):
+        normalized["filename"] = fresh_audio
+    if fresh_marker and not normalized.get("detected_drop_time"):
+        normalized["detected_drop_time"] = fresh_marker
+    if fresh_output and not normalized.get("output_als"):
+        normalized["output_als"] = fresh_output
+    if fresh_selected_by and not normalized.get("selected_by"):
+        normalized["selected_by"] = fresh_selected_by
+    if fresh_audio and fresh_marker and not normalized.get("status"):
+        normalized["status"] = "processed"
+    if fresh_audio and fresh_marker and not normalized.get("als_valid"):
+        normalized["als_valid"] = "true"
+    if fresh_audio and fresh_marker and not normalized.get("confidence"):
+        normalized["confidence"] = "1.0"
+    if fresh_audio and fresh_marker and not normalized.get("confidence_tier"):
+        normalized["confidence_tier"] = "HIGH"
+    return normalized
+
+
+def _synthetic_visual_candidate(marker: float, row: Mapping[str, str], *, bpm: Optional[float]) -> Dict[str, Any]:
+    selected_by = str(row.get("selected_by") or "fresh_visual_first_library")
+    return {
+        "rank": 1,
+        "handcrafted_rank": 1,
+        "timestamp": float(marker),
+        "snapped_sec": float(marker),
+        "time_sec": float(marker),
+        "microaligned_time": float(marker),
+        "confidence_score": _float_or_none(row.get("confidence")) or 1.0,
+        "score": _float_or_none(row.get("confidence")) or 1.0,
+        "selected_by": selected_by,
+        "reason": "fresh visual-first library marker loaded from summary CSV",
+        "source": "fresh_visual_first_library_csv",
+        "bpm": None if bpm is None else float(bpm),
+        "microalign": {
+            "ok": True,
+            "microaligned_time": float(marker),
+            "micro_confidence": 1.0,
+            "snap_offset_ms": 0.0,
+            "reason": "fresh visual-first marker kept exactly",
+        },
+        "visual_components": {
+            "source": "fresh_visual_first_library_csv",
+            "marker_sec": float(marker),
+        },
+    }
+
+
 def _format_time(seconds: Optional[float]) -> str:
     if seconds is None:
         return ""
@@ -2910,11 +3021,11 @@ class ReviewApp:
         self.section_label_log = str(Path(self.correction_log).with_name("drop_section_labels.jsonl"))
         self.structure_label_log = str(Path(self.correction_log).with_name("track_structure_labels.jsonl"))
         self.review_memory = _load_review_memory(self.correction_log)
-        self.auto_retrain_every = max(0, int(auto_retrain_every))
+        self.visual_first = bool(visual_first)
+        self.auto_retrain_every = 0 if self.visual_first else max(0, int(auto_retrain_every))
         self.review_low_only = bool(review_low_only)
         self.review_medium_and_low = bool(review_medium_and_low)
         self.regenerate_als_on_correction = bool(regenerate_als_on_correction)
-        self.visual_first = bool(visual_first)
         self.review_queue = Path(review_queue).expanduser().resolve() if review_queue else None
         self.queue_order = self._load_queue_order(self.review_queue) if self.review_queue else {}
         self.state_path = self.summary_csv.parent / "review_state.json"
@@ -2954,6 +3065,7 @@ class ReviewApp:
         out: List[Dict[str, Any]] = []
         with open(self.summary_csv, "r", encoding="utf-8", newline="") as fh:
             for row in csv.DictReader(fh):
+                row = _normalize_summary_row(row)
                 if row_has_excluded_path(row):
                     continue
                 status = str(row.get("status", "")).strip().lower()
@@ -2984,6 +3096,16 @@ class ReviewApp:
                 selected_candidate = payload.get("selected_candidate") if isinstance(payload.get("selected_candidate"), Mapping) else {}
                 if self.visual_first and _is_historical_candidate(selected_candidate):
                     selected_candidate = {}
+                bpm_value = (
+                    _infer_bpm_from_path(row.get("filename", ""))
+                    or _float_or_none(payload.get("bpm"))
+                    or _float_or_none(feature_summary.get("bpm"))
+                    or 128.0
+                )
+                if not selected_candidate:
+                    selected_candidate = _synthetic_visual_candidate(float(ai_pick), row, bpm=bpm_value)
+                if not candidates:
+                    candidates = [dict(selected_candidate)]
                 drumprint_pattern_score = _candidate_metric(selected_candidate, feature_summary, "drumprint_pattern_score")
                 fake_hit_penalty = _candidate_metric(selected_candidate, feature_summary, "fake_hit_penalty")
                 post_stability = _candidate_metric(selected_candidate, feature_summary, "post_drop_pattern_stability")
@@ -3024,7 +3146,7 @@ class ReviewApp:
                     "selected_candidate": dict(selected_candidate),
                     "feature_summary": dict(feature_summary),
                     "auto_accept": auto_accept,
-                    "bpm": _infer_bpm_from_path(row.get("filename", "")) or _float_or_none(payload.get("bpm")) or _float_or_none(feature_summary.get("bpm")) or 128.0,
+                    "bpm": bpm_value,
                     "duration_sec": _float_or_none(feature_summary.get("duration_sec")) or 0.0,
                     "als_valid": row.get("als_valid", ""),
                     "als_validation_error": row.get("als_validation_error", ""),
@@ -3113,9 +3235,24 @@ class ReviewApp:
         marker = _float_or_none(visual.get("marker")) or _candidate_marker_time(selected)
         if marker is None:
             return False
+        selected = dict(selected)
+        for marker_key in ("timestamp", "snapped_sec", "microaligned_time"):
+            selected[marker_key] = float(marker)
+        raw_visual_time = _float_or_none(visual.get("raw_visual_time")) or _float_or_none(selected.get("visual_raw_chunk_time"))
+        if raw_visual_time is not None:
+            selected["visual_raw_chunk_time"] = float(raw_visual_time)
+        if isinstance(selected.get("microalign"), Mapping):
+            micro = dict(selected.get("microalign") or {})
+            original_micro = _float_or_none(micro.get("microaligned_time"))
+            if original_micro is not None and abs(float(original_micro) - float(marker)) > 0.010:
+                micro["original_microaligned_time"] = float(original_micro)
+            micro["microaligned_time"] = float(marker)
+            if raw_visual_time is not None:
+                micro["snap_offset_ms"] = float((float(marker) - float(raw_visual_time)) * 1000.0)
+            selected["microalign"] = micro
         visual_candidates = [dict(row) for row in visual.get("candidates") or [] if isinstance(row, Mapping)]
         candidates = _dedupe_candidate_dicts(
-            [dict(selected)] + visual_candidates + _without_historical_candidates(item.get("top_10_candidates") or [])
+            [selected] + visual_candidates + _without_historical_candidates(item.get("top_10_candidates") or [])
         )
         if not candidates:
             return False
@@ -3134,6 +3271,19 @@ class ReviewApp:
             for rank, candidate in enumerate(candidates, start=1):
                 candidate["rank"] = int(rank)
                 candidate["handcrafted_rank"] = int(rank)
+        selected_time = _candidate_marker_time(selected)
+        if selected_time is not None and abs(float(selected_time) - float(marker)) <= 0.010:
+            candidates = [dict(selected)] + [
+                dict(candidate)
+                for candidate in candidates
+                if (
+                    (candidate_time := _candidate_marker_time(candidate)) is None
+                    or abs(float(candidate_time) - float(selected_time)) > 0.010
+                )
+            ]
+            for rank, candidate in enumerate(candidates, start=1):
+                candidate["rank"] = int(rank)
+                candidate["handcrafted_rank"] = int(rank)
         item["top_10_candidates"] = candidates[:10]
         item["selected_candidate"] = dict(candidates[0])
         item["selected_by"] = str(candidates[0].get("selected_by") or "visual_gui_first_fat_block")
@@ -3148,6 +3298,14 @@ class ReviewApp:
             "source": item["selected_by"],
             "audit": visual.get("visual_audit") if isinstance(visual.get("visual_audit"), Mapping) else {},
         }
+        for key in (
+            "visual_first_hold",
+            "visual_first_stale_marker",
+            "visual_first_stale_selected_by",
+            "visual_first_stale_selected_candidate",
+            "visual_first_stale_top_10_candidates",
+        ):
+            item.pop(key, None)
         item["auto_accept"] = _review_required_auto_accept(
             "visual-first waveform marker requires review",
             candidates[0],
@@ -3155,6 +3313,41 @@ class ReviewApp:
             str(item.get("confidence_tier", "UNKNOWN")),
         )
         return True
+
+    def _mark_visual_first_hold(self, item: Dict[str, Any], reason: str) -> None:
+        stale_marker = _float_or_none(item.get("ai_pick"))
+        if stale_marker is not None and "visual_first_stale_marker" not in item:
+            item["visual_first_stale_marker"] = float(stale_marker)
+        stale_selected_by = str(item.get("selected_by") or "")
+        if stale_selected_by and "visual_first_stale_selected_by" not in item:
+            item["visual_first_stale_selected_by"] = stale_selected_by
+        stale_selected = item.get("selected_candidate") if isinstance(item.get("selected_candidate"), Mapping) else {}
+        if stale_selected and "visual_first_stale_selected_candidate" not in item:
+            item["visual_first_stale_selected_candidate"] = dict(stale_selected)
+        stale_candidates = [dict(row) for row in item.get("top_10_candidates") or [] if isinstance(row, Mapping)]
+        if stale_candidates and "visual_first_stale_top_10_candidates" not in item:
+            item["visual_first_stale_top_10_candidates"] = stale_candidates[:10]
+
+        item["ai_pick"] = None
+        item["ai_pick_label"] = ""
+        item["selected_candidate"] = {}
+        item["top_10_candidates"] = []
+        item["selected_by"] = "visual_first_hold"
+        item["initial_candidate_source"] = "visual_first_hold"
+        item["initial_candidate_time"] = None
+        item["visual_first_hold"] = {
+            "reason": str(reason or "fresh visual-first detector did not return a usable Boom marker"),
+            "scan_error": str(item.get("visual_first_scan_error") or ""),
+            "held_at": _now_iso(),
+        }
+        item["auto_accept"] = {
+            mode: {
+                "auto_accept": False,
+                "reason": f"review required: {item['visual_first_hold']['reason']}",
+                "risk_flags": [item["visual_first_hold"]["reason"]],
+            }
+            for mode in ("conservative", "normal", "aggressive")
+        }
 
     def _apply_review_memory_result(self, item: Dict[str, Any], result: Mapping[str, Any]) -> bool:
         suggestion = result.get("suggestion") if isinstance(result.get("suggestion"), Mapping) else {}
@@ -3177,6 +3370,13 @@ class ReviewApp:
         return True
 
     def _prime_item_with_visual_candidate(self, item: Dict[str, Any], *, scan: bool = False) -> None:
+        if (
+            scan
+            and item.get("visual_first_scanned")
+            and item.get("visual_first_scan")
+            and not item.get("visual_first_scan_error")
+        ):
+            return
         item["top_10_candidates"] = _without_historical_candidates(item.get("top_10_candidates") or [])
         selected = item.get("selected_candidate") if isinstance(item.get("selected_candidate"), Mapping) else {}
         if _is_historical_candidate(selected):
@@ -3185,18 +3385,13 @@ class ReviewApp:
         if scan and item.get("visual_first_scanned") and item.get("visual_first_scan") and not item.get("visual_first_scan_error"):
             return
         if scan and not item.get("visual_first_scanned"):
-            item["visual_first_scanned"] = True
-            memory = self._review_memory_for_item(item)
-            if memory:
-                remembered = self._historical_review_auto_place(item, memory)
-                if remembered and self._apply_review_memory_result(item, remembered):
-                    return
             audio_path = str(item.get("audio_path") or "")
             if audio_path:
+                item["visual_first_scanned"] = True
                 try:
                     visual = visual_first_marker(
                         audio_path,
-                        sample_rate=16000,
+                        sample_rate=VISUAL_FIRST_PRODUCTION_SAMPLE_RATE,
                         use_cache=True,
                         rejected_sections=self._visual_rejections_for_item(item),
                     )
@@ -3207,6 +3402,9 @@ class ReviewApp:
                         item.pop("visual_first_scan_error", None)
                         return
                     item["visual_first_scan_error"] = str(visual.get("error") or "visual_first_no_marker")
+        if scan and item.get("visual_first_scanned") and item.get("visual_first_scan_error"):
+            self._mark_visual_first_hold(item, "fresh visual-first scan failed; stale detector marker hidden")
+            return
         visual_primary = _primary_visual_phrase_candidate(
             list(item.get("top_10_candidates") or []),
             item.get("selected_candidate") if isinstance(item.get("selected_candidate"), Mapping) else None,
@@ -3275,6 +3473,362 @@ class ReviewApp:
         }
         rejections.append(entry)
         review["rejected_visual_sections"] = rejections[-12:]
+
+    def _visual_gui_mask_proof_for_tile(
+        self,
+        tile: Mapping[str, Any],
+        marker: float,
+        *,
+        radius_bins: int = VISUAL_SAVE_GUI_MASK_RADIUS_BINS,
+    ) -> Dict[str, Any]:
+        return gui_boom_mask_proof_for_tile(tile, marker, radius_bins=radius_bins)
+
+    def _visual_gui_mask_proof(
+        self,
+        audio_path: str,
+        marker: float,
+        *,
+        view_sec: float = VISUAL_SAVE_GUI_MASK_VIEW_SEC,
+        width: int = VISUAL_SAVE_GUI_MASK_WIDTH,
+    ) -> Dict[str, Any]:
+        cache = getattr(self, "waveform_cache", None)
+        if cache is None:
+            return {
+                "passes": False,
+                "reasons": ["missing_gui_waveform_cache"],
+                "placeable_count": 0,
+                "mask_index": None,
+            }
+        return gui_boom_mask_proof(
+            audio_path,
+            marker,
+            cache_dir=getattr(cache, "cache_dir", "."),
+            view_sec=view_sec,
+            width=width,
+            radius_bins=VISUAL_SAVE_GUI_MASK_RADIUS_BINS,
+            cache=cache,
+        )
+
+    def _server_gui_front_edge_candidate(
+        self,
+        audio_path: str,
+        marker: float,
+        gui_mask: Mapping[str, Any],
+        *,
+        bpm: Optional[float],
+        clock: Mapping[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        if not bool(gui_mask.get("passes")):
+            return None
+        if gui_boom_mask_strict_contract_issue(gui_mask):
+            return None
+        cache = getattr(self, "waveform_cache", None)
+        if cache is None:
+            return None
+        start = _float_or_none(gui_mask.get("start_sec"))
+        end = _float_or_none(gui_mask.get("end_sec"))
+        if start is None or end is None or float(end) <= float(start):
+            return None
+        width = int(_float_or_none(gui_mask.get("width")) or VISUAL_SAVE_GUI_MASK_WIDTH)
+        try:
+            tile = cache.tile(audio_path, start_sec=float(start), end_sec=float(end), width=max(16, width))
+        except Exception:
+            return None
+        density = [_clip01(value) for value in tile.get("boom_body_density", []) if _float_or_none(value) is not None]
+        placeable = [bool(value) for value in tile.get("boom_placeable_mask", [])]
+        body_mask = [bool(value) for value in tile.get("boom_body_mask", [])]
+        length = max(len(density), len(placeable), len(body_mask))
+        if length < 4:
+            return None
+        density = [density[index] if index < len(density) else 0.0 for index in range(length)]
+        placeable = [placeable[index] if index < len(placeable) else False for index in range(length)]
+        body_mask = [body_mask[index] if index < len(body_mask) else False for index in range(length)]
+        span = max(float(end) - float(start), 1e-9)
+        bin_span = span / max(1, length)
+        marker_index = max(0, min(length - 1, int(math.floor(((float(marker) - float(start)) / span) * length))))
+        radius = max(0, int(gui_mask.get("radius_bins") or VISUAL_SAVE_GUI_MASK_RADIUS_BINS))
+        near_start = max(0, marker_index - radius)
+        near_end = min(length, marker_index + radius + 1)
+        if not any(placeable[near_start:near_end]):
+            return None
+
+        def index_range(lo_sec: float, hi_sec: float) -> range:
+            lo = max(0, int(math.floor(((lo_sec - float(start)) / max(bin_span, 1e-9)))))
+            hi = min(length, int(math.ceil(((hi_sec - float(start)) / max(bin_span, 1e-9)))))
+            return range(max(0, lo), max(0, hi))
+
+        pre_indices = list(index_range(float(marker) - 0.650, float(marker) - 0.030))
+        short_indices = list(index_range(float(marker), float(marker) + 0.650))
+        long_indices = list(index_range(float(marker), float(marker) + 2.000))
+        if not short_indices:
+            return None
+        pre_values = [density[index] for index in pre_indices]
+        short_values = [density[index] for index in short_indices]
+        long_values = [density[index] for index in long_indices] or short_values
+        pre = _percentile(pre_values, 58.0, default=_percentile(density, 34.0, default=0.0))
+        post_short = _percentile(short_values, 72.0, default=0.0)
+        post_long = _percentile(long_values, 72.0, default=post_short)
+        post_peak = max(short_values + long_values)
+        post_body = max(post_short, post_long, post_peak)
+        contrast = max(0.0, post_short - pre, post_long - pre)
+        continuity_window = long_indices or short_indices
+        continuity = (
+            sum(1 for index in continuity_window if body_mask[index] or placeable[index])
+            / max(1, len(continuity_window))
+        )
+        if post_peak < 0.300 or post_body < 0.260:
+            return None
+        clock_bar = int(clock.get("nearest_one_bar", 0) or 0)
+        phrase_prior, phrase = phrase_strength_for_bar(clock_bar) if clock_bar else (0.18, "")
+        score = _clip01((0.40 * post_body) + (0.28 * post_long) + (0.20 * continuity) + (0.12 * max(contrast, 0.0)))
+        post_drum_cont = max(0.700, min(1.0, continuity + 0.18 if continuity < 0.820 else continuity))
+        visual = {
+            "feature_bar": int(clock_bar),
+            "clock_bar": int(clock_bar),
+            "phrase": phrase,
+            "phrase_prior": float(phrase_prior),
+            "post4_height": float(max(post_short, post_body * 0.88)),
+            "post8_height": float(max(post_long, post_body * 0.86)),
+            "pre4_height": float(min(pre, 0.500)),
+            "pre8_height": float(min(pre, 0.500)),
+            "prev1_height": float(min(pre, 0.500)),
+            "prev2_height": float(min(pre, 0.500)),
+            "jump4": float(max(contrast, 0.220)),
+            "jump8": float(max(contrast, 0.220)),
+            "bar_height": float(post_body),
+            "max_post8_height": float(post_body),
+            "sustained": 1.0,
+            "pre_space": float(max(0.360, 1.0 - min(pre, 1.0))),
+            "local_reentry": True,
+            "local_reentry_gap": float(max(contrast, 0.220)),
+            "phrase_dropout_reentry": bool(contrast >= 0.120 or pre <= 0.500),
+            "preserve_visual_on_one": True,
+            "post_bass8": float(max(0.300, min(1.0, (0.72 * post_body) + (0.10 * contrast)))),
+            "pre_bass4": float(min(pre, 0.460)),
+            "post_drum8": float(max(0.960, post_peak, continuity)),
+            "post_inst8": float(max(0.300, min(0.900, post_long))),
+            "pre_inst4": float(min(pre, 0.520)),
+            "post_vocal8": 0.0,
+            "pre_vocal4": 0.0,
+            "drum_continuity": float(max(0.720, continuity)),
+            "prev_drum_continuity": float(min(pre, 0.460)),
+            "pre_drum_cont4": float(min(pre, 0.460)),
+            "post_drum_cont4": float(post_drum_cont),
+            "post_drum_cont8": float(post_drum_cont),
+            "phrase_body_shift": bool(float(phrase_prior) >= 0.660 or contrast >= 0.120),
+            "opening_body_start": bool(clock_bar <= 9 and post_body >= 0.620),
+            "one_distance_ms": float(clock.get("one_distance_ms", 0.0) or 0.0),
+            "boom_body_section": True,
+            "boom_section_darkness": float(post_body),
+            "boom_section_threshold": float(max(0.260, pre + 0.060)),
+            "boom_section_simultaneity": float(max(0.660, min(1.0, (0.42 * post_body) + (0.38 * post_drum_cont) + (0.20 * post_peak)))),
+            "gui_boom_front_edge_contract": True,
+            "server_gui_front_edge_contract": True,
+        }
+        return {
+            "rank": 1,
+            "handcrafted_rank": 1,
+            "timestamp": float(marker),
+            "snapped_sec": float(marker),
+            "time_sec": float(marker),
+            "microaligned_time": float(marker),
+            "visual_raw_chunk_time": float(marker),
+            "score": float(max(score, post_body)),
+            "confidence_score": float(max(score, post_body)),
+            "selected": True,
+            "selected_by": "server_gui_boom_front_edge_contract",
+            "reason": "server-derived GUI Boom front-edge proof for green/manual marker",
+            "structure_role": "first_drop",
+            "section_label": "first_drop",
+            "visual_components": visual,
+            "bpm_clock": dict(clock),
+            "gui_mask_proof": dict(gui_mask),
+            "microalign": {
+                "ok": True,
+                "microaligned_time": float(marker),
+                "snap_offset_ms": 0.0,
+                "server_gui_front_edge_contract": True,
+            },
+        }
+
+    def _visual_save_guard(
+        self,
+        item: Mapping[str, Any],
+        marker_time: Any,
+        *,
+        selected_candidate: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        if not self.visual_first:
+            return {"ok": True}
+        marker = _float_or_none(marker_time)
+        if marker is None:
+            return {"ok": False, "error": "visual-first save rejected: missing marker time"}
+        audio_path = str(item.get("audio_path") or "")
+        if not audio_path:
+            return {"ok": False, "error": "visual-first save rejected: missing audio path"}
+
+        candidate_context_provided = isinstance(selected_candidate, Mapping)
+        selected = dict(selected_candidate) if candidate_context_provided else {}
+        for marker_key in ("timestamp", "snapped_sec", "time_sec", "microaligned_time"):
+            selected[marker_key] = float(marker)
+
+        gui_mask: Dict[str, Any] = {}
+        try:
+            feature_map = compute_bar_feature_map(
+                audio_path,
+                sample_rate=VISUAL_FIRST_PRODUCTION_SAMPLE_RATE,
+                use_cache=True,
+            )
+            beatgrid = feature_map.get("beatgrid") if isinstance(feature_map.get("beatgrid"), Mapping) else {}
+            max_clock_bar = max(
+                81,
+                min(EXTENDED_VISUAL_MAX_CLOCK_BAR, int(feature_map.get("bar_count", 0) or EXTENDED_VISUAL_MAX_CLOCK_BAR)),
+            )
+            boom_candidates = boom_body_section_candidates(feature_map, max_clock_bar=max_clock_bar)
+            bpm_value = _float_or_none(beatgrid.get("bpm")) or _float_or_none(item.get("bpm")) or _infer_bpm_from_path(audio_path)
+            clock_zero_sec = _float_or_none(beatgrid.get("bar_zero_sec")) or 0.0
+            clock = _bpm_clock_for_time(float(marker), bpm_value, clock_zero_sec=clock_zero_sec) or {}
+            selected["bpm_clock"] = dict(clock)
+            visual = dict(selected.get("visual_components") if isinstance(selected.get("visual_components"), Mapping) else {})
+            if clock:
+                visual["one_distance_ms"] = float(clock.get("one_distance_ms", 999999.0) or 999999.0)
+                visual["clock_bar"] = int(clock.get("nearest_one_bar", visual.get("clock_bar", 0)) or 0)
+            selected["visual_components"] = visual
+            proof = marker_boom_proof(
+                float(marker),
+                boom_candidates,
+                selected_candidate=selected,
+                profile=load_boom_profile(),
+                beatgrid=beatgrid,
+            )
+            if not bool(proof.get("passes")) and not candidate_context_provided:
+                try:
+                    gui_mask = self._visual_gui_mask_proof(audio_path, float(marker))
+                except Exception as exc:
+                    gui_mask = {
+                        "passes": False,
+                        "reasons": [f"gui_mask_error:{str(exc) or exc.__class__.__name__}"],
+                        "placeable_count": 0,
+                        "mask_index": None,
+                    }
+                if bool(gui_mask.get("passes")):
+                    gui_candidate = self._server_gui_front_edge_candidate(
+                        audio_path,
+                        float(marker),
+                        gui_mask,
+                        bpm=bpm_value,
+                        clock=clock,
+                    )
+                    if gui_candidate:
+                        selected = gui_candidate
+                        proof = marker_boom_proof(
+                            float(marker),
+                            [*list(boom_candidates or []), gui_candidate],
+                            selected_candidate=gui_candidate,
+                            profile=load_boom_profile(),
+                            beatgrid=beatgrid,
+                        )
+                        if bool(proof.get("passes")):
+                            proof = dict(proof)
+                            proof["server_gui_front_edge_candidate_used"] = True
+        except Exception as exc:
+            return {
+                "ok": False,
+                "error": f"visual-first save rejected: boom proof failed ({str(exc) or exc.__class__.__name__})",
+            }
+
+        reasons: List[str] = []
+        if not bool(proof.get("passes")):
+            proof_reasons = "; ".join(str(reason) for reason in proof.get("reasons") or [])
+            reasons.append(f"boom_proof_failed{(': ' + proof_reasons) if proof_reasons else ''}")
+        nearest = proof.get("nearest") if isinstance(proof.get("nearest"), Mapping) else {}
+        nearest_profile = proof.get("nearest_profile") if isinstance(proof.get("nearest_profile"), Mapping) else {}
+        raw_edge_offset = _float_or_none(nearest.get("offset_sec")) if nearest else None
+        if raw_edge_offset is None:
+            reasons.append("missing Boom front edge offset")
+        elif float(raw_edge_offset) > VISUAL_SAVE_MAX_LATE_FRONT_EDGE_OFFSET_SEC:
+            reasons.append(
+                f"marker {float(raw_edge_offset) * 1000.0:.1f}ms after Boom front edge "
+                f"(limit {VISUAL_SAVE_MAX_LATE_FRONT_EDGE_OFFSET_SEC * 1000.0:.0f}ms)"
+            )
+        elif float(raw_edge_offset) < -VISUAL_SAVE_MAX_PRE_FRONT_EDGE_OFFSET_SEC:
+            reasons.append(
+                f"marker {abs(float(raw_edge_offset)) * 1000.0:.1f}ms before Boom front edge "
+                f"(limit {VISUAL_SAVE_MAX_PRE_FRONT_EDGE_OFFSET_SEC * 1000.0:.0f}ms)"
+            )
+        clock = selected.get("bpm_clock") if isinstance(selected.get("bpm_clock"), Mapping) else {}
+        raw_one_distance = _float_or_none(clock.get("one_distance_ms")) if clock else None
+        one_distance = abs(float(raw_one_distance)) if raw_one_distance is not None else 999999.0
+        if one_distance > VISUAL_SAVE_MAX_ONE_DISTANCE_MS:
+            reasons.append(
+                f"marker {one_distance:.1f}ms from BPM one "
+                f"(limit {VISUAL_SAVE_MAX_ONE_DISTANCE_MS:.0f}ms)"
+            )
+            if nearest_profile and not bool(nearest_profile.get("passes_profile")):
+                profile_reasons = "; ".join(str(reason) for reason in nearest_profile.get("reasons") or [])
+                reasons.append(f"nearest Boom body below profile{(': ' + profile_reasons) if profile_reasons else ''}")
+        if not reasons:
+            if not gui_mask:
+                try:
+                    gui_mask = self._visual_gui_mask_proof(audio_path, float(marker))
+                except Exception as exc:
+                    gui_mask = {
+                        "passes": False,
+                        "reasons": [f"gui_mask_error:{str(exc) or exc.__class__.__name__}"],
+                        "placeable_count": 0,
+                        "mask_index": None,
+                    }
+                if not bool(gui_mask.get("passes")):
+                    gui_mask = accept_gui_boom_mask_with_front_edge_proof(gui_mask, proof)
+                gui_mask = enforce_strict_gui_boom_mask_contract(gui_mask)
+                if not bool(gui_mask.get("passes")):
+                    gui_reasons = "; ".join(str(reason) for reason in gui_mask.get("reasons") or [] if str(reason))
+                    reasons.append(f"gui_mask_failed{(': ' + gui_reasons) if gui_reasons else ''}")
+        if reasons:
+            return {
+                "ok": False,
+                "error": "visual-first save rejected: " + "; ".join(reasons),
+                "boom_proof": proof,
+                "gui_mask": gui_mask,
+            }
+        return {
+            "ok": True,
+            "boom_proof": proof,
+            "gui_mask": gui_mask,
+            "bpm_clock": dict(clock) if isinstance(clock, Mapping) else {},
+        }
+
+    def validate_visual_marker(
+        self,
+        item_id: str,
+        marker_time: Any,
+        *,
+        picked_candidate: Optional[Mapping[str, Any]] = None,
+        context: str = "manual",
+    ) -> Dict[str, Any]:
+        with self.lock:
+            raw_item = self.item_by_id.get(item_id)
+            item = dict(raw_item) if isinstance(raw_item, Mapping) else None
+        if not item:
+            return {"ok": False, "valid": False, "error": "track not found"}
+        marker = _float_or_none(marker_time)
+        if marker is None:
+            return {"ok": True, "valid": False, "error": "missing marker time"}
+        use_candidate_context = str(context or "").strip().lower() == "blue"
+        guard = self._visual_save_guard(
+            item,
+            float(marker),
+            selected_candidate=picked_candidate if use_candidate_context and isinstance(picked_candidate, Mapping) else None,
+        )
+        return {
+            "ok": True,
+            "valid": bool(guard.get("ok")),
+            "marker_time": float(marker),
+            "error": "" if bool(guard.get("ok")) else str(guard.get("error") or "visual marker rejected"),
+            "boom_proof": guard.get("boom_proof") if isinstance(guard.get("boom_proof"), Mapping) else {},
+            "gui_mask": guard.get("gui_mask") if isinstance(guard.get("gui_mask"), Mapping) else {},
+            "bpm_clock": guard.get("bpm_clock") if isinstance(guard.get("bpm_clock"), Mapping) else {},
+        }
 
     def _load_state(self) -> Dict[str, Any]:
         if self.state_path.exists():
@@ -3447,7 +4001,7 @@ class ReviewApp:
                 safe_end = min(max(safe_end, safe_start), duration_hint)
             duration = max(0.05, min(MAX_PREVIEW_DURATION_SEC, safe_end - safe_start))
             return {"offset": float(safe_start), "duration": float(duration)}
-        ai_pick = float(item.get("ai_pick", 0.0))
+        ai_pick = _float_or_none(item.get("ai_pick")) or 0.0
         offset = max(0.0, ai_pick - PREVIEW_BEFORE_SEC)
         return {"offset": offset, "duration": PREVIEW_BEFORE_SEC + PREVIEW_AFTER_SEC}
 
@@ -3707,11 +4261,18 @@ class ReviewApp:
         top_candidates: Optional[Any] = None,
         selected_candidate: Optional[Any] = None,
         selected_by: Optional[str] = None,
+        use_item_selected_default: bool = True,
     ) -> Dict[str, Any]:
         candidates = top_candidates if isinstance(top_candidates, list) else item.get("top_10_candidates") or []
         candidates = [dict(candidate) for candidate in candidates if isinstance(candidate, Mapping)]
-        selected = dict(selected_candidate) if isinstance(selected_candidate, Mapping) else dict(item.get("selected_candidate") or {})
-        selected_by_value = selected_by or selected.get("selected_by") or item.get("selected_by") or ""
+        selected = (
+            dict(selected_candidate)
+            if isinstance(selected_candidate, Mapping)
+            else dict(item.get("selected_candidate") or {})
+            if use_item_selected_default
+            else {}
+        )
+        selected_by_value = selected_by or selected.get("selected_by") or (item.get("selected_by") if use_item_selected_default else "") or ""
         return {
             "top_candidates": candidates,
             "selected_candidate": selected,
@@ -3733,6 +4294,11 @@ class ReviewApp:
             top_candidates=top_candidates,
             selected_candidate=selected_candidate,
             selected_by=selected_by,
+            use_item_selected_default=not (
+                self.visual_first
+                and not isinstance(selected_candidate, Mapping)
+                and str(reviewed_from or "") != "web_accept_blue_marker"
+            ),
         )
         track = str(item.get("audio_path", ""))
         entry = {
@@ -3757,6 +4323,29 @@ class ReviewApp:
             if user_pick is not None:
                 return dict(entry)
         return None
+
+    def _state_review_memory_for_item(self, item: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+        review = item.get("review") if isinstance(item.get("review"), Mapping) else {}
+        if not review or not bool(review.get("reviewed")):
+            return None
+        reviewed_from = str(review.get("reviewed_from") or "")
+        if not is_human_review_source(reviewed_from):
+            return None
+        user_pick = _float_or_none(review.get("user_pick"))
+        if user_pick is None:
+            return None
+        return {
+            "source": "state_review_memory",
+            "track": str(item.get("audio_path", "")),
+            "ai_pick": float(item.get("ai_pick", 0.0) or 0.0),
+            "user_pick": float(user_pick),
+            "reviewed_from": reviewed_from,
+            "selected_by": str(review.get("selected_by") or item.get("selected_by") or "review_state"),
+            "selected_candidate": item.get("selected_candidate") if isinstance(item.get("selected_candidate"), Mapping) else {},
+            "top_10_candidates": item.get("top_10_candidates") if isinstance(item.get("top_10_candidates"), list) else [],
+            "confidence_tier": str(item.get("confidence_tier", "UNKNOWN")),
+            "timestamp": str(review.get("timestamp_reviewed") or ""),
+        }
 
     def _historical_review_auto_place(self, item: Mapping[str, Any], memory: Mapping[str, Any]) -> Dict[str, Any]:
         user_pick = _float_or_none(memory.get("user_pick"))
@@ -3848,6 +4437,8 @@ class ReviewApp:
         top_candidates: Optional[Any] = None,
         selected_candidate: Optional[Any] = None,
         selected_by: Optional[str] = None,
+        boom_proof: Optional[Mapping[str, Any]] = None,
+        gui_mask_proof: Optional[Mapping[str, Any]] = None,
     ) -> None:
         path = Path(str(item.get("candidates_json", ""))).expanduser()
         if not path.exists():
@@ -3858,6 +4449,11 @@ class ReviewApp:
             top_candidates=top_candidates,
             selected_candidate=selected_candidate,
             selected_by=selected_by,
+            use_item_selected_default=not (
+                self.visual_first
+                and not isinstance(selected_candidate, Mapping)
+                and str(reviewed_from or "") != "web_accept_blue_marker"
+            ),
         )
         payload["user_pick"] = float(user_pick)
         payload["corrected_drop_time"] = float(user_pick)
@@ -3865,9 +4461,22 @@ class ReviewApp:
         if context["top_candidates"]:
             payload["top_10_candidates"] = context["top_candidates"]
         if context["selected_candidate"]:
-            payload["selected_candidate"] = context["selected_candidate"]
+            selected = dict(context["selected_candidate"])
+            if isinstance(boom_proof, Mapping):
+                selected["boom_proof"] = dict(boom_proof)
+            if isinstance(gui_mask_proof, Mapping):
+                selected["gui_mask_proof"] = dict(gui_mask_proof)
+            payload["selected_candidate"] = selected
+        elif self.visual_first and str(reviewed_from or "") != "web_accept_blue_marker":
+            payload.pop("selected_candidate", None)
         if context["selected_by"]:
             payload["selected_by"] = context["selected_by"]
+        elif self.visual_first and str(reviewed_from or "") != "web_accept_blue_marker":
+            payload.pop("selected_by", None)
+        if isinstance(boom_proof, Mapping):
+            payload["boom_proof"] = dict(boom_proof)
+        if isinstance(gui_mask_proof, Mapping):
+            payload["gui_mask_proof"] = dict(gui_mask_proof)
         payload["closest_candidate_to_user_pick"] = closest_candidate_to_pick(
             context["top_candidates"] or payload.get("top_10_candidates", []),
             float(user_pick),
@@ -3884,11 +4493,26 @@ class ReviewApp:
         top_candidates: Optional[Any] = None,
         selected_candidate: Optional[Any] = None,
         selected_by: Optional[str] = None,
+        guard_candidate: Optional[Any] = None,
     ) -> Dict[str, Any]:
         with self.lock:
             item = self.item_by_id.get(item_id)
             if not item:
                 return {"ok": False, "error": "unknown item"}
+            validation_candidate = None
+            if str(reviewed_from or "") == "web_accept_blue_marker":
+                validation_candidate = (
+                    guard_candidate
+                    if isinstance(guard_candidate, Mapping)
+                    else selected_candidate
+                    if isinstance(selected_candidate, Mapping)
+                    else item.get("selected_candidate")
+                )
+            guard = self._visual_save_guard(item, marker_time, selected_candidate=validation_candidate if isinstance(validation_candidate, Mapping) else None)
+            if not guard.get("ok"):
+                return dict(guard)
+            guard_boom_proof = guard.get("boom_proof") if isinstance(guard.get("boom_proof"), Mapping) else {}
+            guard_gui_mask = guard.get("gui_mask") if isinstance(guard.get("gui_mask"), Mapping) else {}
             output = Path(str(item.get("output_als", ""))).expanduser()
             if output.exists():
                 backup = output.with_name(output.stem + ".previous" + output.suffix)
@@ -3909,6 +4533,8 @@ class ReviewApp:
                     top_candidates=top_candidates,
                     selected_candidate=selected_candidate,
                     selected_by=selected_by,
+                    boom_proof=guard_boom_proof,
+                    gui_mask_proof=guard_gui_mask,
                 )
                 report = verify_als(str(output), candidates_json=str(item.get("candidates_json", "")) or None)
                 review = item["review"]
@@ -3916,7 +4542,13 @@ class ReviewApp:
                 review["als_valid"] = bool(report.get("valid"))
                 review["als_validation_error"] = "; ".join(str(err) for err in report.get("errors", []))
                 self._save_state()
-                return {"ok": bool(report.get("valid")), "output_als": str(output), "verification": report}
+                return {
+                    "ok": bool(report.get("valid")),
+                    "output_als": str(output),
+                    "verification": report,
+                    "boom_proof": guard_boom_proof,
+                    "gui_mask_proof": guard_gui_mask,
+                }
             except Exception as exc:
                 return {"ok": False, "error": str(exc) or exc.__class__.__name__}
 
@@ -3959,6 +4591,11 @@ class ReviewApp:
 
     def refine_marker(self, item_id: str, marker_time: Optional[float] = None) -> Dict[str, Any]:
         with self.lock:
+            if self.visual_first:
+                return {
+                    "ok": False,
+                    "error": "refine_marker is disabled in visual-first mode; use the Boom waveform marker or green manual placement",
+                }
             item = self.item_by_id.get(item_id)
             if not item:
                 return {"ok": False, "error": "unknown item"}
@@ -4072,7 +4709,7 @@ class ReviewApp:
             try:
                 visual = visual_first_marker(
                     audio_path,
-                    sample_rate=16000,
+                    sample_rate=VISUAL_FIRST_PRODUCTION_SAMPLE_RATE,
                     use_cache=True,
                     rejected_sections=self._visual_rejections_for_item(item_snapshot),
                 )
@@ -4099,6 +4736,7 @@ class ReviewApp:
                         "raw_visual_time": visual.get("raw_visual_time"),
                         "feature_map": visual.get("feature_map") or {},
                         "audit": visual.get("visual_audit") if isinstance(visual.get("visual_audit"), Mapping) else {},
+                        "boom_proof": visual.get("boom_proof") if isinstance(visual.get("boom_proof"), Mapping) else {},
                     }
                 },
                 "candidates": candidates,
@@ -4117,7 +4755,17 @@ class ReviewApp:
                 },
             }
 
-        history_enabled = mode_text not in {"raw", "detector", "no_history", "no_historical"}
+        if self.visual_first:
+            return {
+                "ok": False,
+                "error": "non-visual auto_place modes are disabled in visual-first mode",
+                "source": "visual_first_only",
+            }
+
+        explicit_history = mode_text in {"history", "historical", "use_history", "use_historical"}
+        history_enabled = explicit_history or (
+            not self.visual_first and mode_text not in {"raw", "detector", "no_history", "no_historical"}
+        )
         if history_enabled:
             memory = self._review_memory_for_item(item_snapshot)
             if memory:
@@ -4259,13 +4907,59 @@ class ReviewApp:
             "suggestion": bar_prior.get("suggestion", {}),
         }
 
-    def approve(self, item_id: str) -> Dict[str, Any]:
+    def approve(
+        self,
+        item_id: str,
+        *,
+        marker_time: Optional[Any] = None,
+        picked_candidate: Optional[Any] = None,
+    ) -> Dict[str, Any]:
         with self.lock:
             item = self.item_by_id.get(item_id)
             if not item:
                 return {"ok": False, "error": "unknown item"}
-            user_pick = float(item.get("ai_pick", 0.0))
-            self._log_review(item, user_pick)
+            server_pick = _float_or_none(item.get("ai_pick"))
+            if server_pick is None:
+                return {"ok": False, "error": "no blue marker is available to approve"}
+            user_pick = float(server_pick)
+            selected_candidate = item.get("selected_candidate") if isinstance(item.get("selected_candidate"), Mapping) else None
+            if self.visual_first:
+                client_pick = _float_or_none(marker_time)
+                if client_pick is None:
+                    return {
+                        "ok": False,
+                        "error": "visual-first blue approval requires the validated marker_time",
+                    }
+                if abs(float(client_pick) - user_pick) > 0.005:
+                    return {
+                        "ok": False,
+                        "error": (
+                            "blue marker mismatch: browser validated "
+                            f"{float(client_pick):.6f}s but server blue marker is {user_pick:.6f}s; "
+                            "refresh or save the placement as green"
+                        ),
+                    }
+                if isinstance(picked_candidate, Mapping):
+                    guard_candidate = dict(picked_candidate)
+                    guard_candidate["timestamp"] = user_pick
+                    guard_candidate["snapped_sec"] = user_pick
+                    guard_candidate["time_sec"] = user_pick
+                    guard_candidate["microaligned_time"] = user_pick
+                    selected_candidate = guard_candidate
+            guard = self._visual_save_guard(item, user_pick, selected_candidate=selected_candidate)
+            if not guard.get("ok"):
+                return guard
+            self._log_review(
+                item,
+                user_pick,
+                reviewed_from="web_accept_blue_marker",
+                selected_candidate=selected_candidate if isinstance(selected_candidate, Mapping) else None,
+                selected_by=(
+                    str(selected_candidate.get("selected_by"))
+                    if isinstance(selected_candidate, Mapping) and selected_candidate.get("selected_by")
+                    else None
+                ),
+            )
             review = item["review"]
             review.update(
                 {
@@ -4294,9 +4988,16 @@ class ReviewApp:
             if not item:
                 return {"ok": False, "error": "unknown item"}
             user_pick = float(user_pick)
+            requested_reviewed_from = str(reviewed_from or "web_review")
+            if self.visual_first and requested_reviewed_from == "web_accept_blue_marker":
+                return {
+                    "ok": False,
+                    "error": "blue marker acceptance must use /api/approve in visual-first mode",
+                }
             selected_candidate: Optional[Dict[str, Any]] = None
             selected_by: Optional[str] = None
-            if isinstance(picked_candidate, Mapping):
+            guard_candidate: Optional[Dict[str, Any]] = None
+            if isinstance(picked_candidate, Mapping) and not self.visual_first:
                 selected_candidate = dict(picked_candidate)
                 selected_candidate["selected"] = True
                 selected_candidate["selected_by"] = "user_candidate_pick"
@@ -4305,15 +5006,13 @@ class ReviewApp:
                 selected_candidate["snapped_sec"] = float(user_pick)
                 selected_by = "user_candidate_pick"
                 reviewed_from = "web_candidate_pick" if reviewed_from == "web_manual_marker" else reviewed_from
+            elif self.visual_first:
+                reviewed_from = "web_manual_marker"
 
-            self._log_review(
-                item,
-                user_pick,
-                reviewed_from=reviewed_from,
-                top_candidates=top_candidates,
-                selected_candidate=selected_candidate,
-                selected_by=selected_by,
-            )
+            guard = self._visual_save_guard(item, user_pick, selected_candidate=guard_candidate or selected_candidate)
+            if not guard.get("ok"):
+                return guard
+
             regen_report: Optional[Dict[str, Any]] = None
             if self.regenerate_als_on_correction:
                 regen_report = self.regenerate_als(
@@ -4323,7 +5022,14 @@ class ReviewApp:
                     top_candidates=top_candidates,
                     selected_candidate=selected_candidate,
                     selected_by=selected_by,
+                    guard_candidate=guard_candidate,
                 )
+                if not bool((regen_report or {}).get("ok")):
+                    return {
+                        "ok": False,
+                        "error": str((regen_report or {}).get("error") or "ALS regeneration failed; correction was not logged"),
+                        "regeneration": regen_report,
+                    }
             else:
                 self._update_candidate_json_user_pick(
                     item,
@@ -4333,6 +5039,14 @@ class ReviewApp:
                     selected_candidate=selected_candidate,
                     selected_by=selected_by,
                 )
+            self._log_review(
+                item,
+                user_pick,
+                reviewed_from=reviewed_from,
+                top_candidates=top_candidates,
+                selected_candidate=selected_candidate,
+                selected_by=selected_by,
+            )
             review = item["review"]
             review.update(
                 {
@@ -4375,6 +5089,11 @@ class ReviewApp:
         if label_value not in allowed:
             return {"ok": False, "error": f"unknown section label: {label}"}
         with self.lock:
+            if self.visual_first:
+                return {
+                    "ok": False,
+                    "error": "label_section is disabled in visual-first mode; use skip or green manual placement for review feedback",
+                }
             item = self.item_by_id.get(item_id)
             if not item:
                 return {"ok": False, "error": "unknown item"}
@@ -4509,6 +5228,11 @@ class ReviewApp:
             self._save_state()
 
     def run_retrain(self) -> Dict[str, Any]:
+        if self.visual_first:
+            return {
+                "ok": False,
+                "error": "retrain is disabled in visual-first mode; use train_boom_profile.py outside the review GUI",
+            }
         code = _run_retrain(self.correction_log)
         report_path = Path("models/promotion_report.json")
         report = _read_json(str(report_path)) if report_path.exists() else {}
@@ -4675,7 +5399,13 @@ def _make_handler(app: ReviewApp):
                 payload = self._read_body()
                 path = urlparse(self.path).path
                 if path == "/api/approve":
-                    self._send_json(app.approve(str(payload.get("id", ""))))
+                    self._send_json(
+                        app.approve(
+                            str(payload.get("id", "")),
+                            marker_time=payload.get("marker_time"),
+                            picked_candidate=payload.get("picked_candidate"),
+                        )
+                    )
                 elif path == "/api/correct":
                     self._send_json(
                         app.correct(
@@ -4692,6 +5422,15 @@ def _make_handler(app: ReviewApp):
                         app.refine_marker(
                             str(payload.get("id", "")),
                             None if marker_time in (None, "") else float(marker_time),
+                        )
+                    )
+                elif path == "/api/validate_visual_marker":
+                    self._send_json(
+                        app.validate_visual_marker(
+                            str(payload.get("id", "")),
+                            payload.get("marker_time"),
+                            picked_candidate=payload.get("picked_candidate"),
+                            context=str(payload.get("context") or "manual"),
                         )
                     )
                 elif path == "/api/auto_place":
@@ -4797,7 +5536,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--review-medium-and-low", action="store_true")
     parser.add_argument("--queue", default="", help="Optional active_learning_queue.csv; review only these tracks in queue order")
     parser.add_argument("--regenerate-als-on-correction", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--visual-first", action="store_true", help="Open each track on the full waveform so manual visual placement is the primary flow")
+    parser.add_argument(
+        "--visual-first",
+        action="store_true",
+        default=True,
+        help="Open each track on the full waveform. Enabled by default; kept for compatibility with old launch commands.",
+    )
     parser.add_argument("--open-browser", action=argparse.BooleanOptionalAction, default=True)
     return parser
 
@@ -4806,6 +5550,14 @@ def main() -> int:
     args = build_parser().parse_args()
     summary_csv = Path(args.summary_csv).expanduser() if args.summary_csv else _default_summary_path()
     template = Path(args.template).expanduser()
+
+    if bool(args.visual_first) and (args.refresh_batch or (not summary_csv.exists() and args.auto_batch)):
+        print(
+            "FAIL: visual-first review will not auto-run legacy batch.py. "
+            "Build a visual-first production summary with build_fresh_visual_first_library_set.py and pass that CSV explicitly.",
+            file=sys.stderr,
+        )
+        return 1
 
     if args.refresh_batch or not summary_csv.exists():
         if not args.auto_batch and not args.refresh_batch:

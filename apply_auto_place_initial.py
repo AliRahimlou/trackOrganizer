@@ -12,6 +12,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from drop_aligner.als import modify_als
 from drop_aligner.exclusions import row_has_excluded_path
+from drop_aligner.legacy_write_guard import add_legacy_detector_write_arg, require_legacy_detector_write_opt_in
 from drop_aligner.microalign import choose_microaligned_candidate, microalign_candidate_dicts
 from verify_als import verify_als
 from project_config import DEFAULT_ALS_TEMPLATE, DROP_BATCH_SUMMARY
@@ -296,6 +297,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--force", action="store_true", help="Re-apply even when auto_place_initial already exists")
     parser.add_argument("--auto-accept-only", action="store_true", help="Only apply suggestions that pass the selected auto-accept gate")
     parser.add_argument("--dry-run", action="store_true", help="Analyze but do not write files")
+    add_legacy_detector_write_arg(parser)
     return parser
 
 
@@ -308,6 +310,12 @@ def main() -> int:
         raise SystemExit(f"Summary not found: {summary}")
     if bool(args.regenerate_als) and not template.exists():
         raise SystemExit(f"Template not found: {template}")
+    if not bool(args.dry_run):
+        require_legacy_detector_write_opt_in(
+            "apply_auto_place_initial.py",
+            action="rewriting legacy auto-place summary/candidate JSON/ALS output",
+            explicit=bool(args.allow_legacy_detector_write),
+        )
 
     rows, fieldnames = _read_summary(summary)
     output_fields = _summary_fieldnames(fieldnames)

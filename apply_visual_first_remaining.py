@@ -23,13 +23,16 @@ from web_review import (
 )
 
 
-REVIEWED_FROM = "visual_first_batch_auto"
+DETECTOR_PREP_SOURCE = "visual_detector_prep"
+STALE_BATCH_AUTO_SOURCE = "visual_first_batch_auto"
+STALE_DETECTOR_SOURCES = {STALE_BATCH_AUTO_SOURCE, "batch_auto", DETECTOR_PREP_SOURCE}
+REVIEWED_FROM = DETECTOR_PREP_SOURCE
 SUMMARY_EXTRA_COLUMNS = [
     "micro_confidence",
     "snap_offset_ms",
     "microaligned_time",
-    "visual_first_batch_auto_time",
-    "visual_first_batch_auto_source",
+    "visual_detector_prep_time",
+    "visual_detector_prep_source",
 ]
 
 
@@ -140,14 +143,14 @@ def _manual_preserve_reason(item: Mapping[str, Any], row: Optional[Mapping[str, 
         value = str(selected_by or "").strip().lower()
         if value == "user_candidate_pick":
             return "user_candidate_pick"
-        if value == "historical_human_marker" and str(payload.get("reviewed_from") or "").strip().lower() != REVIEWED_FROM:
+        if value == "historical_human_marker" and str(payload.get("reviewed_from") or "").strip().lower() not in STALE_DETECTOR_SOURCES:
             return "historical_human_marker"
 
-    if bool(review.get("corrected")) and not bool(review.get("visual_first_batch_auto")):
+    if bool(review.get("corrected")) and not bool(review.get("visual_first_batch_auto")) and not bool(review.get("detector_prep")):
         return "state_corrected_without_batch_auto_flag"
-    if _float_or_none(payload.get("corrected_drop_time")) is not None and not payload.get("visual_first_batch_auto"):
+    if _float_or_none(payload.get("corrected_drop_time")) is not None and not payload.get("visual_first_batch_auto") and not payload.get("visual_detector_prep"):
         source = str(payload.get("reviewed_from") or "")
-        if source.strip().lower() != REVIEWED_FROM:
+        if source.strip().lower() not in STALE_DETECTOR_SOURCES:
             return "candidate_json_corrected_marker"
     return ""
 
@@ -167,7 +170,7 @@ def _replace_item_selection(
 
 def _previous_batch_auto_candidate(item: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
     payload = _payload_for_item(item)
-    if str(payload.get("reviewed_from") or "").strip().lower() != REVIEWED_FROM:
+    if str(payload.get("reviewed_from") or "").strip().lower() not in STALE_DETECTOR_SOURCES and not payload.get("visual_first_batch_auto"):
         return None
     marker = _float_or_none(payload.get("final_ai_pick")) or _float_or_none(payload.get("drop_sec")) or _float_or_none(item.get("ai_pick"))
     if marker is None or marker <= 0.0:
@@ -193,14 +196,20 @@ def _is_previous_batch_auto_candidate(candidate: Mapping[str, Any]) -> bool:
     reviewed_from = str(candidate.get("reviewed_from") or "").strip().lower()
     reason = str(candidate.get("reason") or "").strip().lower()
     return bool(
-        selected_by in {"saved_visual_batch_auto_marker", "visual_first_batch_auto"}
-        or source in {"saved_visual_batch_auto_marker", "visual_first_batch_auto"}
-        or reviewed_from == REVIEWED_FROM
+        selected_by in {"saved_visual_batch_auto_marker", "visual_first_batch_auto", DETECTOR_PREP_SOURCE}
+        or source in {"saved_visual_batch_auto_marker", "visual_first_batch_auto", DETECTOR_PREP_SOURCE}
+        or reviewed_from in STALE_DETECTOR_SOURCES
         or "previous visual-first batch marker retained" in reason
     )
 
 
-def _rescan_marker_candidate(app: ReviewApp, item: Dict[str, Any], mode: str) -> tuple[Optional[float], Dict[str, Any], str, list[Dict[str, Any]]]:
+def _rescan_marker_candidate(
+    app: ReviewApp,
+    item: Dict[str, Any],
+    mode: str,
+    *,
+    allow_visual_audit_review: bool = False,
+) -> tuple[Optional[float], Dict[str, Any], str, list[Dict[str, Any]]]:
     mode_text = str(mode or "raw").strip().lower()
     keep_previous_batch_auto = mode_text in {"with_previous_batch_auto", "raw_with_previous_batch_auto"}
     previous_candidate = _previous_batch_auto_candidate(item) if keep_previous_batch_auto else None
@@ -225,6 +234,17 @@ def _rescan_marker_candidate(app: ReviewApp, item: Dict[str, Any], mode: str) ->
     marker = _float_or_none(suggestion.get("suggested_time"))
     if marker is None and candidate:
         marker = _candidate_marker_time(candidate)
+    source_info = result.get("source_info") if isinstance(result.get("source_info"), Mapping) else {}
+    visual_info = source_info.get("visual_first") if isinstance(source_info.get("visual_first"), Mapping) else {}
+    visual_audit = visual_info.get("audit") if isinstance(visual_info.get("audit"), Mapping) else {}
+    if visual_audit:
+        candidate["visual_audit"] = dict(visual_audit)
+        audit_status = str(visual_audit.get("status") or "unknown")
+        if audit_status != "pass" and not bool(allow_visual_audit_review):
+            return None, candidate, f"visual_audit_{audit_status}", candidates
+    visual_boom_proof = visual_info.get("boom_proof") if isinstance(visual_info.get("boom_proof"), Mapping) else {}
+    if visual_boom_proof and not isinstance(candidate.get("boom_proof"), Mapping):
+        candidate["boom_proof"] = dict(visual_boom_proof)
     selected_by = str(candidate.get("selected_by") or result.get("source") or "visual_first_rescan")
     if marker is not None and candidate:
         _replace_item_selection(item, float(marker), candidate, selected_by, candidates or [candidate])
@@ -236,18 +256,37 @@ def _update_candidate_payload(
     marker: float,
     candidate: Mapping[str, Any],
     selected_by: str,
+    regen: Optional[Mapping[str, Any]] = None,
 ) -> None:
     path = Path(str(item.get("candidates_json", ""))).expanduser()
     if not path.exists():
         return
     payload = _read_json(str(path))
     selected = dict(candidate)
+    boom_proof = (
+        regen.get("boom_proof")
+        if isinstance(regen, Mapping) and isinstance(regen.get("boom_proof"), Mapping)
+        else selected.get("boom_proof")
+        if isinstance(selected.get("boom_proof"), Mapping)
+        else {}
+    )
+    gui_mask_proof = (
+        regen.get("gui_mask_proof")
+        if isinstance(regen, Mapping) and isinstance(regen.get("gui_mask_proof"), Mapping)
+        else selected.get("gui_mask_proof")
+        if isinstance(selected.get("gui_mask_proof"), Mapping)
+        else {}
+    )
     selected["timestamp"] = float(marker)
     selected["snapped_sec"] = float(marker)
     selected["microaligned_time"] = float(marker)
     selected["selected"] = True
     selected["selected_by"] = selected_by
-    selected.setdefault("reason", f"selected by {REVIEWED_FROM}")
+    if isinstance(boom_proof, Mapping):
+        selected["boom_proof"] = dict(boom_proof)
+    if isinstance(gui_mask_proof, Mapping):
+        selected["gui_mask_proof"] = dict(gui_mask_proof)
+    selected.setdefault("reason", f"selected by {DETECTOR_PREP_SOURCE}")
     top_candidates = [dict(row) for row in item.get("top_10_candidates") or [] if isinstance(row, Mapping)]
     if top_candidates:
         selected_time = _candidate_marker_time(selected)
@@ -269,9 +308,17 @@ def _update_candidate_payload(
     payload["selected_by"] = selected_by
     payload["selected_candidate"] = selected
     payload["top_10_candidates"] = top_candidates[:10]
-    payload["reviewed_from"] = REVIEWED_FROM
-    payload["reviewed_at"] = _now_iso()
-    payload["visual_first_batch_auto"] = {
+    payload["reviewed_from"] = DETECTOR_PREP_SOURCE
+    if isinstance(selected.get("visual_audit"), Mapping):
+        payload["visual_audit"] = dict(selected.get("visual_audit") or {})
+    if isinstance(boom_proof, Mapping):
+        payload["boom_proof"] = dict(boom_proof)
+    if isinstance(gui_mask_proof, Mapping):
+        payload["gui_mask_proof"] = dict(gui_mask_proof)
+    payload.pop("reviewed_at", None)
+    payload.pop("visual_first_batch_auto", None)
+    payload["detector_prepared_at"] = _now_iso()
+    payload["visual_detector_prep"] = {
         "applied_at": _now_iso(),
         "suggested_time": float(marker),
         "selected_by": selected_by,
@@ -301,8 +348,12 @@ def _update_summary_row(row: dict[str, str], item: Mapping[str, Any], marker: fl
     row["microaligned_time"] = _format_float(marker)
     row["micro_confidence"] = _format_float(micro.get("micro_confidence"), digits=6)
     row["snap_offset_ms"] = _format_float(micro.get("snap_offset_ms"), digits=6)
-    row["visual_first_batch_auto_time"] = _format_float(marker)
-    row["visual_first_batch_auto_source"] = selected_by
+    row["visual_detector_prep_time"] = _format_float(marker)
+    row["visual_detector_prep_source"] = selected_by
+    if "visual_first_batch_auto_time" in row:
+        row["visual_first_batch_auto_time"] = ""
+    if "visual_first_batch_auto_source" in row:
+        row["visual_first_batch_auto_source"] = ""
     if verification:
         row["als_valid"] = "true" if verification.get("valid") else "false"
         row["als_validation_error"] = "" if verification.get("valid") else "; ".join(str(err) for err in verification.get("errors", []))
@@ -368,6 +419,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--review-low-only", action="store_true")
     parser.add_argument("--review-medium-and-low", action="store_true")
+    parser.add_argument(
+        "--allow-visual-audit-review",
+        action="store_true",
+        help="Allow --rescan visual-first writes even when the detector audit recommends review or replacement.",
+    )
     return parser
 
 
@@ -420,11 +476,19 @@ def main() -> int:
                 status_counts["skipped_manual_preserve"] += 1
                 continue
             if args.rescan:
-                marker, candidate, selected_by, _ = _rescan_marker_candidate(app, item, str(args.mode or "raw"))
+                marker, candidate, selected_by, _ = _rescan_marker_candidate(
+                    app,
+                    item,
+                    str(args.mode or "raw"),
+                    allow_visual_audit_review=bool(args.allow_visual_audit_review),
+                )
             else:
                 marker, candidate, selected_by = _marker_candidate(item)
             if marker is None:
-                status_counts["missing_marker"] += 1
+                if selected_by.startswith("visual_audit_"):
+                    status_counts[selected_by] += 1
+                else:
+                    status_counts["missing_marker"] += 1
                 continue
             current = _float_or_none(row.get("detected_drop_time") if row else item.get("ai_pick"))
             if float(args.min_change_ms or 0.0) > 0 and current is not None:
@@ -465,6 +529,7 @@ def main() -> int:
                         "rescan": bool(args.rescan),
                         "overwrite_manual": bool(args.overwrite_manual),
                         "no_shared_writes": bool(args.no_shared_writes),
+                        "allow_visual_audit_review": bool(args.allow_visual_audit_review),
                         "min_change_ms": float(args.min_change_ms or 0.0),
                         "max_change_ms": float(args.max_change_ms or 0.0),
                         "source_counts": dict(source_counts),
@@ -478,8 +543,8 @@ def main() -> int:
         return 0
 
     stamp = _stamp()
-    backup_dir = summary.parent / ".visual_first_batch_backups" / stamp
-    report_dir = summary.parent / ".visual_first_batch_reports"
+    backup_dir = summary.parent / ".visual_detector_prep_backups" / stamp
+    report_dir = summary.parent / ".visual_detector_prep_reports"
     backup_dir.mkdir(parents=True, exist_ok=True)
     report_dir.mkdir(parents=True, exist_ok=True)
     manifest: list[dict[str, str]] = []
@@ -499,13 +564,30 @@ def main() -> int:
             print(f"[{index}/{progress_total}] skip manual preserve ({preserve_reason}): {item.get('audio_path')}", flush=True)
             continue
         if args.rescan:
-            marker, candidate, selected_by, candidates = _rescan_marker_candidate(app, item, str(args.mode or "raw"))
+            marker, candidate, selected_by, candidates = _rescan_marker_candidate(
+                app,
+                item,
+                str(args.mode or "raw"),
+                allow_visual_audit_review=bool(args.allow_visual_audit_review),
+            )
         else:
             marker, candidate, selected_by = _marker_candidate(item)
             candidates = [dict(row) for row in item.get("top_10_candidates") or [] if isinstance(row, Mapping)]
         if marker is None:
-            status_counts["missing_marker"] += 1
-            failures.append({"id": item.get("id"), "track": item.get("audio_path"), "error": "missing_marker"})
+            if selected_by.startswith("visual_audit_"):
+                status_counts[selected_by] += 1
+                failures.append(
+                    {
+                        "id": item.get("id"),
+                        "track": item.get("audio_path"),
+                        "error": selected_by,
+                        "visual_audit": candidate.get("visual_audit") if isinstance(candidate.get("visual_audit"), Mapping) else {},
+                    }
+                )
+                print(f"[{index}/{progress_total}] HOLD {selected_by}: {item.get('audio_path')}", flush=True)
+            else:
+                status_counts["missing_marker"] += 1
+                failures.append({"id": item.get("id"), "track": item.get("audio_path"), "error": "missing_marker"})
             continue
         current = _float_or_none(row.get("detected_drop_time") if row else item.get("ai_pick"))
         if float(args.min_change_ms or 0.0) > 0 and current is not None:
@@ -543,29 +625,33 @@ def main() -> int:
             print(f"[{index}/{progress_total}] FAIL {marker:.6f}: {item.get('audio_path')} :: {regen.get('error') or regen}", flush=True)
             continue
 
-        _update_candidate_payload(item, float(marker), candidate, selected_by)
+        _update_candidate_payload(item, float(marker), candidate, selected_by, regen=regen)
         if row is not None:
             _update_summary_row(row, item, float(marker), selected_by, regen)
         original = _float_or_none(item.get("ai_pick")) or float(marker)
         review = item["review"]
         review.update(
             {
-                "reviewed": True,
+                "reviewed": False,
                 "skipped": False,
-                "approved": abs(float(marker) - float(original)) <= 0.001,
-                "corrected": abs(float(marker) - float(original)) > 0.001,
-                "user_pick": float(marker),
-                "timestamp_reviewed": _now_iso(),
-                "reviewed_from": REVIEWED_FROM,
+                "approved": False,
+                "corrected": False,
+                "user_pick": None,
+                "timestamp_reviewed": "",
+                "reviewed_from": "",
                 "selected_by": selected_by,
                 "selected_candidate_rank": _candidate_rank(candidate),
-                "visual_first_batch_auto": True,
+                "detector_prep": True,
+                "detector_prep_source": DETECTOR_PREP_SOURCE,
+                "detector_prep_marker": float(marker),
+                "detector_prep_at": _now_iso(),
                 "visual_first_rescan": bool(args.rescan),
                 "regenerated_als_path": str(regen.get("output_als") or ""),
                 "als_valid": bool((regen.get("verification") or {}).get("valid")),
                 "als_validation_error": "; ".join(str(err) for err in (regen.get("verification") or {}).get("errors", [])),
             }
         )
+        review.pop("visual_first_batch_auto", None)
         status_counts["updated"] += 1
         processed.append(
             {
@@ -585,16 +671,18 @@ def main() -> int:
         status_counts["skipped_shared_writes"] += 1
     else:
         app.state["current_index"] = app._first_active_index(int(app.state.get("current_index", 0)))
-        app.state["visual_first_batch_auto"] = {
+        app.state.pop("visual_first_batch_auto", None)
+        app.state["visual_detector_prep"] = {
             "applied_at": _now_iso(),
             "targets": len(targets),
             "updated": int(status_counts.get("updated", 0)),
             "failures": len(failures),
             "backup_dir": str(backup_dir),
-            "reviewed_from": REVIEWED_FROM,
+            "source": DETECTOR_PREP_SOURCE,
             "all": bool(args.all),
             "rescan": bool(args.rescan),
             "overwrite_manual": bool(args.overwrite_manual),
+            "allow_visual_audit_review": bool(args.allow_visual_audit_review),
             "min_change_ms": float(args.min_change_ms or 0.0),
             "max_change_ms": float(args.max_change_ms or 0.0),
         }
@@ -602,7 +690,7 @@ def main() -> int:
         _write_summary(summary, rows, fieldnames)
     manifest_path = backup_dir / "manifest.json"
     _write_json(manifest_path, {"created_at": _now_iso(), "files": manifest})
-    report_path = report_dir / f"visual_first_batch_auto_{stamp}.json"
+    report_path = report_dir / f"visual_detector_prep_{stamp}.json"
     report = {
         "summary": str(summary),
         "template": str(template),
@@ -618,6 +706,7 @@ def main() -> int:
         "rescan": bool(args.rescan),
         "overwrite_manual": bool(args.overwrite_manual),
         "no_shared_writes": bool(args.no_shared_writes),
+        "allow_visual_audit_review": bool(args.allow_visual_audit_review),
         "min_change_ms": float(args.min_change_ms or 0.0),
         "max_change_ms": float(args.max_change_ms or 0.0),
         "backup_dir": str(backup_dir),

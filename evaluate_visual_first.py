@@ -114,13 +114,39 @@ def _load_truth_rows(paths: Sequence[str], *, track_contains: str = "", all_obse
     return list(latest.values())
 
 
-def _clock_label(time_sec: Optional[float], bpm: Optional[float]) -> str:
-    clock = bpm_clock_for_time(time_sec, bpm) if time_sec is not None else None
+def _clock_label(time_sec: Optional[float], bpm: Optional[float], *, clock_zero_sec: float = 0.0) -> str:
+    clock = bpm_clock_for_time(time_sec, bpm, clock_zero_sec=float(clock_zero_sec)) if time_sec is not None else None
     if not clock:
         return "--"
     distance = _float_or_none(clock.get("one_distance_ms"))
     distance_text = "--" if distance is None else f"{distance:.1f}ms"
     return f"b{clock.get('nearest_one_bar')} beat{clock.get('beat_in_bar')} {distance_text}"
+
+
+def _failure_family(error_ms: Optional[float], audit: Mapping[str, Any], reason: str) -> str:
+    if error_ms is None:
+        return "detector_error"
+    flags = {str(flag) for flag in audit.get("flag_codes") or []}
+    reason_text = str(reason or "").lower()
+    if "selected_matches_rejected_section" in flags:
+        return "rejected_section_selected"
+    if "late_body_after_section_entry" in flags:
+        return "late_inside_drop_body"
+    if "intro_before_stronger_drop" in flags:
+        return "intro_or_buildup_before_stronger_drop"
+    if "blank" in reason_text:
+        return "blank_waveform_guard"
+    if "grid" in reason_text or "track-zero" in reason_text or "half-bar" in reason_text or "one-beat" in reason_text:
+        return "grid_phase_or_off_one"
+    if float(error_ms) >= 8000.0:
+        return "wrong_section"
+    if float(error_ms) >= 1000.0:
+        return "bar_or_phrase_offset"
+    if float(error_ms) > 250.0:
+        return "front_edge_or_grid_offset"
+    if float(error_ms) > 50.0:
+        return "micro_timing_offset"
+    return "pass"
 
 
 def _evaluate_one(payload: Mapping[str, Any]) -> Dict[str, Any]:
@@ -140,11 +166,24 @@ def _evaluate_one(payload: Mapping[str, Any]) -> Dict[str, Any]:
             "elapsed_sec": time.time() - started,
         }
     selected = result.get("selected_candidate") if isinstance(result.get("selected_candidate"), Mapping) else {}
+    audit = result.get("visual_audit") if isinstance(result.get("visual_audit"), Mapping) else {}
     predicted = _float_or_none(result.get("marker"))
     delta = None if predicted is None else float(predicted) - expected
     error_ms = None if delta is None else abs(float(delta) * 1000.0)
     visual = selected.get("visual_components") if isinstance(selected.get("visual_components"), Mapping) else {}
-    bpm = infer_bpm_from_path(track)
+    feature_map = result.get("feature_map") if isinstance(result.get("feature_map"), Mapping) else {}
+    beatgrid = feature_map.get("beatgrid") if isinstance(feature_map.get("beatgrid"), Mapping) else {}
+    bpm = _float_or_none(beatgrid.get("bpm")) or infer_bpm_from_path(track)
+    clock_zero_sec = _float_or_none(beatgrid.get("bar_zero_sec")) or 0.0
+    selected_clock = selected.get("bpm_clock") if isinstance(selected.get("bpm_clock"), Mapping) else {}
+    clock = (
+        dict(selected_clock)
+        if selected_clock and ("on_one" in selected_clock or "one_distance_ms" in selected_clock)
+        else bpm_clock_for_time(predicted, bpm, clock_zero_sec=float(clock_zero_sec))
+        if predicted is not None and bpm
+        else None
+    )
+    one_distance_ms = _float_or_none(clock.get("one_distance_ms")) if isinstance(clock, Mapping) else None
     top_candidates = []
     for candidate in result.get("candidates") or []:
         if not isinstance(candidate, Mapping):
@@ -172,7 +211,14 @@ def _evaluate_one(payload: Mapping[str, Any]) -> Dict[str, Any]:
         "source": str(selected.get("selected_by") or ""),
         "reason": str(selected.get("reason") or ""),
         "clock_bar": visual.get("clock_bar"),
-        "clock": _clock_label(predicted, bpm),
+        "on_one": bool(clock.get("on_one")) if isinstance(clock, Mapping) else False,
+        "one_distance_ms": one_distance_ms,
+        "clock": _clock_label(predicted, bpm, clock_zero_sec=float(clock_zero_sec)),
+        "clock_zero_sec": float(clock_zero_sec),
+        "visual_audit_status": str(audit.get("status") or ""),
+        "visual_audit_action": str(audit.get("recommended_action") or ""),
+        "visual_audit_flags": list(audit.get("flag_codes") or []),
+        "failure_family": _failure_family(error_ms, audit, str(selected.get("reason") or "")),
         "elapsed_sec": time.time() - started,
         "top_candidates": top_candidates,
     }
@@ -192,7 +238,14 @@ def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
         "track",
         "source",
         "clock_bar",
+        "on_one",
+        "one_distance_ms",
         "clock",
+        "clock_zero_sec",
+        "visual_audit_status",
+        "visual_audit_action",
+        "visual_audit_flags",
+        "failure_family",
         "reviewed_from",
         "selected_by",
         "reason",

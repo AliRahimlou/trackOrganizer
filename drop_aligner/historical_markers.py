@@ -17,6 +17,7 @@ HUMAN_REVIEW_SOURCES = {
     "web_review",
     "web_manual_marker",
     "web_candidate_pick",
+    "web_accept_blue_marker",
     "web_accept_grid_marker",
     "web_accept_knee_marker",
     "web_accept_attack_marker",

@@ -13,6 +13,7 @@ from drop_aligner.als import modify_als
 from drop_aligner.debug import default_candidate_json, default_debug_plot, write_candidate_debug_json
 from drop_aligner.detector import DropDetectorConfig, detect_drop, extract_features
 from drop_aligner.exclusions import EXCLUDED_DIR_NAMES, is_excluded_path
+from drop_aligner.legacy_write_guard import add_legacy_detector_write_arg, require_legacy_detector_write_opt_in
 from verify_als import verify_als
 
 
@@ -343,6 +344,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--cue", action="append", help="Optional cue time(s) in seconds. Repeat or comma-separate. Used as search regions only.")
     parser.add_argument("--min-drop-sec", type=float, default=4.0, help="Reject candidates before this time")
+    add_legacy_detector_write_arg(parser)
     return parser
 
 
@@ -354,6 +356,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         raise SystemExit(f"Folder not found: {folder}")
     if not template.exists() or not template.is_file():
         raise SystemExit(f"Template not found: {template}")
+    require_legacy_detector_write_opt_in(
+        "batch.py",
+        action="writing legacy detector summary/candidate JSON/ALS output",
+        explicit=bool(args.allow_legacy_detector_write),
+    )
 
     audio_files = _discover_audio(
         folder,

@@ -7,6 +7,7 @@ from io import BytesIO
 from pathlib import Path
 from typing import List, Dict, Any, Set, Optional, Tuple
 
+from drop_aligner.legacy_write_guard import require_legacy_detector_write_opt_in
 from project_config import ALS_TEMPLATES_DIR, GENERATED_SET_DIR, STEMS_ROOT_DIR, env_path
 
 # =========================
@@ -678,6 +679,10 @@ def preferred_source_als(src_path: Path) -> Path:
     ]
     if not candidates:
         return src_path
+    require_legacy_detector_write_opt_in(
+        "buildSetAndGenerateAls.py",
+        action="using local *_DROP_ALIGNED.als as combined-set source",
+    )
     candidates.sort(key=lambda p: (p.stat().st_mtime, p.name), reverse=True)
     return candidates[0]
 

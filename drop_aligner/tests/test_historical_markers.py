@@ -79,6 +79,22 @@ def test_historical_markers_ignore_batch_auto_corrections(tmp_path):
     assert marker.source == "drop_marker_db"
 
 
+def test_historical_markers_load_blue_accept_source(tmp_path):
+    correction_log = tmp_path / "drop_corrections.jsonl"
+    track = "/music/STEMS/148/12A/Artist - Blue/drums_148_12A_5-Artist - Blue.flac"
+    correction_log.write_text(
+        json.dumps({"track": track, "user_pick": 26.284, "reviewed_from": "web_accept_blue_marker"}) + "\n",
+        encoding="utf-8",
+    )
+
+    index = load_historical_markers(correction_logs=[correction_log])
+    marker = index.find(track, bpm=148)
+
+    assert marker is not None
+    assert marker.user_pick == 26.284
+    assert marker.reviewed_from == "web_accept_blue_marker"
+
+
 def test_historical_markers_ignore_zero_marker_db_entries(tmp_path):
     marker_db = tmp_path / "drop_marker_db.json"
     track = "/music/STEMS/100/2A/Artist - Track/drums_100_2A_7-Artist - Track.flac"
