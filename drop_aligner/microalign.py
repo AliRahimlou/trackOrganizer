@@ -10,8 +10,6 @@ import librosa
 import numpy as np
 from scipy import signal
 
-from numeric_backend import array_backend_status, forward_mean, moving_average, percentile_normalize, trailing_mean
-
 from .auto_verifier import (
     DEFAULT_AUTO_VERIFIER_PATH,
     load_auto_verifier_payload,
@@ -68,20 +66,49 @@ def _finite_float(value: Any, default: float = 0.0) -> float:
 
 
 def _normalize(values: np.ndarray, percentile: float = 95.0) -> np.ndarray:
-    return percentile_normalize(values, lo_percentile=5.0, hi_percentile=float(percentile), dtype=np.float64)
+    x = np.asarray(values, dtype=np.float64)
+    if x.size == 0:
+        return x
+    lo = float(np.percentile(x, 5.0))
+    hi = float(np.percentile(x, percentile))
+    if not math.isfinite(lo) or not math.isfinite(hi) or hi <= lo + 1e-12:
+        return np.zeros_like(x, dtype=np.float64)
+    return np.clip((x - lo) / (hi - lo), 0.0, 1.0)
 
 
 def _smooth(values: np.ndarray, samples: int) -> np.ndarray:
     samples = max(1, int(samples))
-    return moving_average(values, samples, dtype=np.float64)
+    x = np.asarray(values, dtype=np.float64)
+    if x.size == 0 or samples <= 1:
+        return x
+    kernel = np.ones(samples, dtype=np.float64) / float(samples)
+    return np.convolve(x, kernel, mode="same")
 
 
 def _trailing_mean(values: np.ndarray, samples: int) -> np.ndarray:
-    return trailing_mean(values, samples, dtype=np.float64)
+    x = np.asarray(values, dtype=np.float64)
+    n = int(x.size)
+    if n == 0:
+        return x
+    window = max(1, int(samples))
+    indices = np.arange(n, dtype=np.int64)
+    starts = np.maximum(0, indices - window)
+    counts = np.maximum(1, indices - starts)
+    csum = np.concatenate([np.asarray([0.0], dtype=np.float64), np.cumsum(x)])
+    return (csum[indices] - csum[starts]) / counts
 
 
 def _forward_mean(values: np.ndarray, samples: int) -> np.ndarray:
-    return forward_mean(values, samples, dtype=np.float64)
+    x = np.asarray(values, dtype=np.float64)
+    n = int(x.size)
+    if n == 0:
+        return x
+    window = max(1, int(samples))
+    indices = np.arange(n, dtype=np.int64)
+    ends = np.minimum(n, indices + window)
+    counts = np.maximum(1, ends - indices)
+    csum = np.concatenate([np.asarray([0.0], dtype=np.float64), np.cumsum(x)])
+    return (csum[ends] - csum[indices]) / counts
 
 
 def _local_contrast(values: np.ndarray, sr: int, *, pre_sec: float = 0.060, post_sec: float = 0.024) -> np.ndarray:
@@ -1119,7 +1146,6 @@ def microalign_marker(
     knee_time = None if knee_idx is None else window_start + (float(knee_idx) / float(sr))
     impact_body_time = None if impact_body_idx is None else window_start + (float(impact_body_idx) / float(sr))
     offset_ms = (aligned_time - candidate) * 1000.0
-    backend = array_backend_status(int(len(y)))
 
     offset_quality = 1.0 - _clip01(abs(offset_ms) / 180.0)
     impact_score_curve = curves.get("impact_score", curves["score"])
@@ -1220,8 +1246,6 @@ def microalign_marker(
 
     return {
         "input_candidate_time": float(candidate),
-        "array_backend": str(backend.get("active", "numpy")),
-        "array_backend_reason": str(backend.get("reason", "")),
         "microaligned_time": float(aligned_time),
         "attack_start_time": float(attack_time),
         "peak_time": float(peak_time),

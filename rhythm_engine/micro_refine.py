@@ -4,14 +4,15 @@ from typing import Iterable, Tuple
 
 import numpy as np
 
-from numeric_backend import array_backend_status, moving_average
-
 from .types import RhythmEngineConfig, RhythmEstimate
 
 
 def _moving_average(x: np.ndarray, frames: int) -> np.ndarray:
     frames = max(1, int(frames))
-    return moving_average(x, frames, dtype=np.float64)
+    if frames <= 1 or x.size == 0:
+        return x.astype(np.float64, copy=False)
+    kernel = np.ones(frames, dtype=np.float64) / float(frames)
+    return np.convolve(x.astype(np.float64, copy=False), kernel, mode="same")
 
 
 def _refine_one_time(y: np.ndarray, sr: int, time_sec: float, *, radius_sec: float) -> float:
@@ -99,14 +100,11 @@ def refine_estimate_to_attacks(audio_path: str, estimate: RhythmEstimate, config
         refined_downbeats = _refine_times(y, int(sr), estimate.downbeats, radius_sec=radius_sec)
         offsets = [float(new - old) for new, old in zip(refined_beats, estimate.beats)]
         metadata = dict(estimate.metadata)
-        backend = array_backend_status(int(y.size))
         metadata["micro_refine_status"] = "ok"
         metadata["micro_refine_audio_path"] = str(refine_path)
         metadata["micro_refine_source"] = str(refine_source)
         metadata["micro_refine_window_ms"] = float(cfg.micro_refine_window_ms)
         metadata["micro_refine_sample_rate"] = int(sr)
-        metadata["micro_refine_array_backend"] = str(backend.get("active", "numpy"))
-        metadata["micro_refine_array_backend_reason"] = str(backend.get("reason", ""))
         metadata["micro_refine_median_abs_offset_ms"] = float(np.median(np.abs(offsets)) * 1000.0) if offsets else 0.0
         return RhythmEstimate(
             provider=f"{estimate.provider}+micro_refine",

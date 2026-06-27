@@ -12,18 +12,6 @@ Visual-first `1.1.1` automation:
 python3 run_visual_111_automation.py --force
 ```
 
-Optional CuPy acceleration for compatible pure-array kernels:
-
-```bash
-pip install -r requirements-gpu-cuda12.txt
-TRACKORGANIZER_ARRAY_BACKEND=auto python3 run_visual_111_automation.py --force
-```
-
-The GPU backend is intentionally optional. The detector still keeps NumPy arrays
-at `librosa`, SciPy, scikit-learn, and PyTorch boundaries, and falls back to
-NumPy when CuPy or a CUDA device is unavailable. Set
-`TRACKORGANIZER_ARRAY_BACKEND=numpy` to force CPU behavior.
-
 This runs the same full-drums-waveform path used in manual review: locate the
 drop body visually, refine to the first launch edge, require the BPM-grid one,
 then validate the generated ALS/report with fail-closed production checks. Holds
