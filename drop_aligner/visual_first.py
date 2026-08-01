@@ -27952,6 +27952,60 @@ def _track_zero_grid_phase_guard_candidate(
     return guarded
 
 
+FIRST_TOP_BOOST_ALIGN_NEUTRAL = 0.5
+FIRST_TOP_BOOST_ALIGN_SPAN_BARS = 8.0
+_FIRST_TOP_BOOST_TIME_KEYS = ("timestamp", "snapped_sec", "time_sec", "visual_raw_chunk_time")
+
+
+def stamp_first_top_boost_alignment(
+    candidates: Sequence[Dict[str, Any]],
+    audio_path: str,
+    feature_map: Mapping[str, Any],
+) -> Optional[float]:
+    """Stamp every candidate with its alignment to the first-biggest-boost time.
+
+    Ali's manual rule: the drop is the first occurrence of the biggest class of
+    energy boost on the drums stem. This computes that whole-track prior once
+    and writes ``visual_components["first_top_boost_align"]`` per candidate
+    (1.0 at the prior, falling to 0.0 at >=8 bars away, 0.5 when the prior has
+    no answer) so the learned selector can weigh global section evidence.
+    Returns the prior time in seconds, or None.
+    """
+    if not candidates:
+        return None
+    try:
+        from .energy_sections import analyze_energy_sections
+
+        sections = analyze_energy_sections(audio_path)
+        boost_time = sections.chosen_time_sec if sections.ok else None
+    except Exception:
+        boost_time = None
+    beatgrid = feature_map.get("beatgrid") if isinstance(feature_map.get("beatgrid"), Mapping) else {}
+    bpm = _finite_float(beatgrid.get("bpm")) or infer_bpm_from_path(audio_path)
+    bar_sec = (4.0 * 60.0 / float(bpm)) if bpm else None
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        components = candidate.get("visual_components")
+        if not isinstance(components, dict):
+            components = {}
+            candidate["visual_components"] = components
+        align = FIRST_TOP_BOOST_ALIGN_NEUTRAL
+        if boost_time is not None and bar_sec:
+            micro = candidate.get("microalign") if isinstance(candidate.get("microalign"), Mapping) else {}
+            time_sec = _finite_float(micro.get("microaligned_time"))
+            if time_sec is None:
+                for key in _FIRST_TOP_BOOST_TIME_KEYS:
+                    time_sec = _finite_float(candidate.get(key))
+                    if time_sec is not None:
+                        break
+            if time_sec is not None:
+                distance_bars = abs(float(time_sec) - float(boost_time)) / float(bar_sec)
+                align = max(0.0, 1.0 - min(distance_bars, FIRST_TOP_BOOST_ALIGN_SPAN_BARS) / FIRST_TOP_BOOST_ALIGN_SPAN_BARS)
+        components["first_top_boost_align"] = float(align)
+    return boost_time
+
+
 def visual_first_marker(
     audio_path: str,
     *,
@@ -27997,6 +28051,7 @@ def visual_first_marker(
         ],
         rejected_sections,
     )
+    stamp_first_top_boost_alignment(selector_candidates_for_selection, audio_path, feature_map)
     extended_candidates_for_later_guard: List[Dict[str, Any]] = []
     opening_drop = _opening_drop_start_candidate(audio_path, feature_map)
     selected = None

@@ -66,6 +66,7 @@ VISUAL_SELECTOR_FEATURES = (
     "source_body_peak",
     "source_body_edge",
     "drop_strength_proxy",
+    "visual_first_top_boost_align",
 )
 
 
@@ -262,6 +263,7 @@ def feature_dict(candidate: Mapping[str, Any], *, time_sec: float, context: Mapp
         "source_body_peak": _source_is(candidate, "visual_body_peak"),
         "source_body_edge": _source_is(candidate, "visual_body_edge"),
         "drop_strength_proxy": _drop_strength_proxy(candidate),
+        "visual_first_top_boost_align": _finite_float(visual.get("first_top_boost_align"), 0.5),
     }
 
 

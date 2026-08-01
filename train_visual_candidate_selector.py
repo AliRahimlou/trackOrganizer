@@ -174,6 +174,7 @@ def _feature_rows(rows: Sequence[Mapping[str, Any]], feature_names: Sequence[str
                 "source_body_peak": _source_is(row, "visual_body_peak"),
                 "source_body_edge": _source_is(row, "visual_body_edge"),
                 "drop_strength_proxy": _drop_strength_proxy(row),
+                "visual_first_top_boost_align": _float(row.get("visual_first_top_boost_align"), 0.5),
             }
             out.append(
                 {

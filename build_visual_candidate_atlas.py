@@ -32,6 +32,7 @@ from drop_aligner.musical_clock import bpm_clock_for_time  # noqa: E402
 from drop_aligner.structure_features import compute_bar_feature_map  # noqa: E402
 from drop_aligner.visual_first import (  # noqa: E402
     EXTENDED_VISUAL_MAX_CLOCK_BAR,
+    stamp_first_top_boost_alignment,
     summarize_visual_candidate,
     visual_body_peak_candidates,
     visual_chunk_candidates,
@@ -66,6 +67,9 @@ VISUAL_KEYS = (
     "frame_attack_peak",
     "frame_low_peak",
     "frame_score",
+    "opening_body_start",
+    "phrase_dropout_reentry",
+    "first_top_boost_align",
 )
 
 
@@ -228,6 +232,7 @@ def _build_one(payload: Mapping[str, Any]) -> Dict[str, Any]:
         }
 
     rows = _dedupe_candidates([selected, *candidates])
+    stamp_first_top_boost_alignment(rows, track, feature_map)
     detector_time = _float_or_none(detector.get("marker")) or _candidate_time(selected)
     feature_beatgrid = feature_map.get("beatgrid") if isinstance(feature_map.get("beatgrid"), Mapping) else {}
     bpm = _float_or_none(feature_beatgrid.get("bpm")) or infer_bpm_from_path(track)

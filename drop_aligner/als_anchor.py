@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 from typing import Any, Callable, Dict, Mapping, Optional
 
 from .downbeat_impact import refine_approved_downbeat_attack
@@ -13,6 +14,13 @@ from .waveform import gui_boom_mask_strict_contract_issue
 
 
 MAX_BPM_MISMATCH_RATIO = 0.0075
+LOCAL_PHASE_RECOVERY_ENABLED = str(os.environ.get("VISUAL_ALS_LOCAL_PHASE_RECOVERY", "1")).strip().lower() not in {"0", "false", "no", "off"}
+LOCAL_PHASE_RECOVERY_SAMPLE_RATE = 16000
+# The re-phased grid must explain the WHOLE track's drum pattern better than
+# the rejected phase by this confidence margin, plus clear an absolute floor.
+LOCAL_PHASE_RECOVERY_MIN_MARGIN = 0.04
+LOCAL_PHASE_RECOVERY_MIN_CONFIDENCE = 0.35
+LOCAL_PHASE_RECOVERY_MICRO_MIN_LOCAL_CONFIDENCE = 0.60
 SELF_CALIBRATED_CLOCK_SOURCES = {
     "gui_boom_front_edge_calibrated_grid",
     "visual_reclaimed_body_phase_calibrated",
@@ -40,6 +48,110 @@ def _reject(reason: str, **details: Any) -> Dict[str, Any]:
 
 def _mapping(value: Any) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
+
+
+def _attempt_local_grid_phase_recovery(
+    audio_path: str,
+    *,
+    marker: float,
+    bpm_value: float,
+    grid_zero: float,
+    beat_sec: float,
+    bar_sec: float,
+    max_after_sec: float,
+    sample_tolerance_sec: float,
+) -> Optional[Dict[str, Any]]:
+    """Bounded recovery when the marker misses the global grid's one.
+
+    The global bar_zero phase is derived from the first ~minute of audio and
+    extrapolated to the drop; on long intros it can drift tens of ms and hard
+    -fail the -8 ms window even though the marker sits on the real downbeat.
+    Recovery derives the local musical one from drum onsets around the marker
+    and accepts it ONLY when the re-phased grid explains the whole track's
+    drum pattern better than the rejected phase by a clear margin — global,
+    candidate-independent evidence, so this is not visual self-calibration.
+    """
+    if not LOCAL_PHASE_RECOVERY_ENABLED:
+        return None
+    try:
+        from .beatgrid import _pattern_arrays, _score_drum_pattern_bar_zero, find_visual_drop_drum_downbeat
+        from .detector import DropDetectorConfig, extract_features
+
+        features = extract_features(
+            str(audio_path),
+            DropDetectorConfig(
+                sample_rate=LOCAL_PHASE_RECOVERY_SAMPLE_RATE,
+                hpss=False,
+                use_drumprint=False,
+            ),
+        )
+        local = find_visual_drop_drum_downbeat(
+            features,
+            visual_time_sec=float(marker),
+            bpm=float(bpm_value),
+        )
+        if not isinstance(local, Mapping):
+            return None
+        local_one = _finite_float(local.get("time_sec"))
+        if local_one is None or local_one < 0.0:
+            return None
+        # Pairing gate: the marker and the locally derived one must describe
+        # the same musical event. The strict [-8ms, +90ms] anchor window is
+        # re-imposed later on the PCM attack found from the recovered one; the
+        # visual eye-mark itself may sit up to half a beat off it.
+        pairing_tolerance_sec = min(0.5 * float(beat_sec), 0.250)
+        if abs(float(marker) - float(local_one)) > pairing_tolerance_sec:
+            return None
+        arrays = _pattern_arrays(features)
+        if arrays is None:
+            return None
+        old_phase = math.fmod(float(grid_zero), float(bar_sec))
+        new_phase = math.fmod(float(local_one), float(bar_sec))
+        old_pattern = _score_drum_pattern_bar_zero(features, bpm=float(bpm_value), bar_zero=old_phase, arrays=arrays)
+        new_pattern = _score_drum_pattern_bar_zero(features, bpm=float(bpm_value), bar_zero=new_phase, arrays=arrays)
+        old_conf = float(old_pattern.get("confidence") or 0.0)
+        new_conf = float(new_pattern.get("confidence") or 0.0)
+        local_conf = float(local.get("confidence") or 0.0)
+
+        mode = None
+        if new_conf >= LOCAL_PHASE_RECOVERY_MIN_CONFIDENCE and new_conf >= old_conf + LOCAL_PHASE_RECOVERY_MIN_MARGIN:
+            # The rejected phase was simply wrong: the re-phased grid explains
+            # the whole track's drum pattern materially better.
+            mode = "phase_error"
+        else:
+            # Micro-drift: global and local agree at BEAT level, but the
+            # physical drum impact sits a few tens of ms off the extrapolated
+            # grid line (drift over a long intro, or a pushed kick). The
+            # manual convention is "Set 1.1.1 Here" ON the impact, so anchor
+            # the impact — but only when both phases still explain the track
+            # and the local one was found with high confidence.
+            nearest_global_one = float(grid_zero) + round((float(local_one) - float(grid_zero)) / float(bar_sec)) * float(bar_sec)
+            micro_drift = abs(float(local_one) - nearest_global_one)
+            micro_limit = min(max(0.035, 0.12 * float(beat_sec)), 0.100)
+            if (
+                micro_drift <= micro_limit
+                and local_conf >= LOCAL_PHASE_RECOVERY_MICRO_MIN_LOCAL_CONFIDENCE
+                and new_conf >= max(0.50, old_conf - 0.05)
+            ):
+                mode = "micro_drift"
+        if mode is None:
+            return None
+        return {
+            "grid_downbeat_sec": float(local_one),
+            "bar_zero_sec": float(new_phase),
+            "evidence": {
+                "mode": mode,
+                "local_downbeat_confidence": local_conf,
+                "local_downbeat_score": float(local.get("score") or 0.0),
+                "old_phase_sec": float(old_phase),
+                "new_phase_sec": float(new_phase),
+                "old_pattern_confidence": old_conf,
+                "new_pattern_confidence": new_conf,
+                "pattern_margin": float(new_conf - old_conf),
+            },
+        }
+    except Exception:
+        return None
 
 
 def build_visual_first_als_anchor(
@@ -158,16 +270,32 @@ def build_visual_first_als_anchor(
     visual_delta_sec = float(marker) - float(grid_downbeat_sec)
     max_after_sec = min(0.090, 0.25 * float(beat_sec))
     visual_sample_tolerance_sec = 1.0 / float(max(1, int(sample_rate)))
+    grid_phase_recovery: Optional[Dict[str, Any]] = None
     if (
         visual_delta_sec < -0.008 - visual_sample_tolerance_sec
         or visual_delta_sec > max_after_sec + visual_sample_tolerance_sec
     ):
-        return _reject(
-            "visual_marker_not_on_independent_one",
-            marker_sec=float(marker),
-            grid_downbeat_sec=float(grid_downbeat_sec),
-            delta_ms=float(visual_delta_sec) * 1000.0,
+        grid_phase_recovery = _attempt_local_grid_phase_recovery(
+            str(audio_path),
+            marker=float(marker),
+            bpm_value=float(bpm_value),
+            grid_zero=float(grid_zero),
+            beat_sec=float(beat_sec),
+            bar_sec=float(bar_sec),
+            max_after_sec=float(max_after_sec),
+            sample_tolerance_sec=float(visual_sample_tolerance_sec),
         )
+        if grid_phase_recovery is None:
+            return _reject(
+                "visual_marker_not_on_independent_one",
+                marker_sec=float(marker),
+                grid_downbeat_sec=float(grid_downbeat_sec),
+                delta_ms=float(visual_delta_sec) * 1000.0,
+            )
+        grid_downbeat_sec = float(grid_phase_recovery["grid_downbeat_sec"])
+        grid_zero = float(grid_phase_recovery["bar_zero_sec"])
+        nearest_bar_index = int(round((float(grid_downbeat_sec) - float(grid_zero)) / float(bar_sec)))
+        visual_delta_sec = float(marker) - float(grid_downbeat_sec)
 
     try:
         attack = dict(
@@ -210,6 +338,9 @@ def build_visual_first_als_anchor(
 
     attack_confidence = _finite_float(attack.get("attack_confidence")) or 0.0
     confidence = min(0.99, max(0.65, 0.60 + (0.35 * attack_confidence)))
+    if grid_phase_recovery is not None:
+        # Recovered phase carries strong but second-hand grid evidence.
+        confidence = min(confidence, 0.80)
     phase_translation_samples = None
     try:
         phase_translation_samples = int(impact_sample) - int(grid_sample)
@@ -252,6 +383,7 @@ def build_visual_first_als_anchor(
         "phase_translation_samples": phase_translation_samples,
         "sample_rate": int(attack_rate) if attack_rate is not None else None,
         "beat_position": 1,
+        "grid_phase_recovery": dict(grid_phase_recovery) if grid_phase_recovery is not None else None,
         "boom_body_crest": boom_body_crest,
         "visual_marker_sec": float(marker),
         "visual_to_grid_delta_ms": float(visual_delta_sec) * 1000.0,
