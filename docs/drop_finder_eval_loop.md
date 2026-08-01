@@ -6,6 +6,16 @@ Ableton workflow — warp marker sample-accurate on the drop's first bass/kick i
 negative bars. `verify_als` now enforces the all-stems anchor contract
 (`all_clips_have_drop_anchor` / `all_clips_share_drop_anchor`).
 
+Ali's narrated rules (screen recording 2026-07-31, transcript in
+`artifacts/screen_recordings/screen_recording_2026-07-31_224439_audio_transcript.txt`):
+read intro/build-up/drop sections from the whole waveform; take the *beginning of
+the first drop*; base it off the drums stem; zoom in until you see the waveform
+"change from one type to the next" — that boundary is the drop; place 1.1.1 "as
+close to the zero line as possible" (zero-crossing at the texture change); with all
+3 stems selected so drums/inst/vocals share the exact same 1.1.1. Open experiment:
+Stage B computes a zero-crossing diagnostic but does not move the marker — measure
+whether snapping (≤1.5 ms) increases agreement with human picks in the ≤2 ms cohort.
+
 ## The instrument
 
 ```bash
