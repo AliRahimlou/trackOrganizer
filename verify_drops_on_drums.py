@@ -109,11 +109,23 @@ def verify_row(drums_path: str, anchor_sec: float) -> Dict[str, Any]:
     local_peak = float(np.max(np.abs(mono[max(0, center - int(0.05 * sr)) : center + int(0.05 * sr)])) or 0.0)
     out["zero_line_ratio"] = round(abs(float(mono[center])) / max(local_peak, 1e-9), 4)
 
-    if out["low_jump"] < MIN_LOW_JUMP and out["broad_jump"] < MIN_LOW_JUMP:
+    weak = out["low_jump"] < MIN_LOW_JUMP and out["broad_jump"] < MIN_LOW_JUMP
+    far = out["onset_distance_ms"] is not None and out["onset_distance_ms"] > MAX_ONSET_DISTANCE_MS
+    if weak:
         out["flags"].append(f"weak_energy_jump:{out['low_jump']}/{out['broad_jump']}")
-    if out["onset_distance_ms"] is not None and out["onset_distance_ms"] > MAX_ONSET_DISTANCE_MS:
+    if far:
         out["flags"].append(f"onset_far:{out['onset_distance_ms']:.1f}ms")
-    out["ok"] = not out["flags"]
+    # Tiering: an anchor on a tight drums transient is fine even when the
+    # buildup keeps drums loud (weak jump alone is a note, not a suspect).
+    if weak and far:
+        out["tier"] = "HIGH"
+    elif far:
+        out["tier"] = "MEDIUM"
+    elif weak:
+        out["tier"] = "NOTE"
+    else:
+        out["tier"] = "OK"
+    out["ok"] = out["tier"] in ("OK", "NOTE")
     return out
 
 
@@ -150,16 +162,19 @@ def main() -> int:
     with out_csv.open("w", encoding="utf-8", newline="") as fh:
         writer = csv.DictWriter(
             fh,
-            fieldnames=["track", "drums_path", "anchor_sec", "ok", "low_jump", "broad_jump",
+            fieldnames=["track", "drums_path", "anchor_sec", "tier", "ok", "low_jump", "broad_jump",
                         "onset_distance_ms", "zero_line_ratio", "flags"],
         )
         writer.writeheader()
-        for r in sorted(results, key=lambda r: (r["ok"], r["track"])):
+        tier_order = {"HIGH": 0, "MEDIUM": 1, "NOTE": 2, "OK": 3}
+        for r in sorted(results, key=lambda r: (tier_order.get(r.get("tier"), 9), r["track"])):
             writer.writerow({**{k: r.get(k) for k in writer.fieldnames}, "flags": ";".join(r["flags"])})
 
-    print(f"[drums-verify] ok={len(results) - len(flagged)} flagged={len(flagged)} -> {out_csv}")
-    for r in flagged[:20]:
-        print(f"  FLAG {r['track'][:60]:60s} {';'.join(r['flags'])}")
+    from collections import Counter
+    tiers = Counter(r.get("tier") for r in results)
+    print(f"[drums-verify] tiers={dict(tiers)} -> {out_csv}")
+    for r in [r for r in results if r.get("tier") == "HIGH"][:20]:
+        print(f"  HIGH {r['track'][:60]:60s} {';'.join(r['flags'])}")
     return 0
 
 
