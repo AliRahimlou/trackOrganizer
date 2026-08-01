@@ -148,11 +148,19 @@ def main() -> int:
 
     results: List[Dict[str, Any]] = []
     for index, row in enumerate(rows, 1):
-        anchor = row.get("als_anchor", {}).get("drop_sec") if isinstance(row.get("als_anchor"), Mapping) else None
+        als_anchor = row.get("als_anchor") if isinstance(row.get("als_anchor"), Mapping) else {}
+        anchor = als_anchor.get("drop_sec")
         if anchor is None:
             anchor = row.get("marker")
         result = verify_row(str(row["drums_path"]), float(anchor))
         result["track"] = str((row.get("track") or {}).get("folder") or "")
+        # Grid-phase-recovered anchors carry second-hand grid evidence; they
+        # always deserve at least a MEDIUM look even when the PCM checks pass.
+        if als_anchor.get("grid_phase_recovery"):
+            result["flags"].append("grid_phase_recovered")
+            if result.get("tier") == "OK":
+                result["tier"] = "MEDIUM"
+            result["ok"] = False
         results.append(result)
         if index % 100 == 0:
             print(f"  {index}/{len(rows)}")

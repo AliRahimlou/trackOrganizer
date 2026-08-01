@@ -7,14 +7,22 @@ import pytest
 import drop_aligner.als_anchor as als_anchor
 import drop_aligner.beatgrid as beatgrid
 import drop_aligner.detector as detector
+import drop_aligner.energy_sections as energy_sections
 
 
 class _FakeFeatures:
     duration_sec = 180.0
 
 
-def _patch_stack(monkeypatch, *, local_one, old_conf, new_conf, local_conf=0.5, local_score=0.4):
+class _FakeSections:
+    def __init__(self, chosen):
+        self.ok = chosen is not None
+        self.chosen_time_sec = chosen
+
+
+def _patch_stack(monkeypatch, *, local_one, old_conf, new_conf, local_conf=0.5, local_score=0.4, boost_time=56.4):
     monkeypatch.setattr(detector, "extract_features", lambda *_a, **_k: _FakeFeatures())
+    monkeypatch.setattr(energy_sections, "analyze_energy_sections", lambda *_a, **_k: _FakeSections(boost_time))
     monkeypatch.setattr(
         beatgrid,
         "find_visual_drop_drum_downbeat",
@@ -100,4 +108,16 @@ def test_recovery_allows_early_eye_mark_within_half_beat(monkeypatch) -> None:
 def test_recovery_disabled_by_env_flag(monkeypatch) -> None:
     _patch_stack(monkeypatch, local_one=56.40, old_conf=0.20, new_conf=0.55)
     monkeypatch.setattr(als_anchor, "LOCAL_PHASE_RECOVERY_ENABLED", False)
+    assert _attempt() is None
+
+
+def test_recovery_refuses_marker_far_from_first_top_boost(monkeypatch) -> None:
+    # Strong phase evidence, but the marker sits 6 bars from the energy prior:
+    # a wrong-section Stage-A pick must stay held, not get re-phased.
+    _patch_stack(monkeypatch, local_one=56.40, old_conf=0.20, new_conf=0.55, boost_time=44.4)
+    assert _attempt() is None
+
+
+def test_recovery_refuses_when_energy_prior_has_no_answer(monkeypatch) -> None:
+    _patch_stack(monkeypatch, local_one=56.40, old_conf=0.20, new_conf=0.55, boost_time=None)
     assert _attempt() is None

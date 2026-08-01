@@ -21,6 +21,7 @@ LOCAL_PHASE_RECOVERY_SAMPLE_RATE = 16000
 LOCAL_PHASE_RECOVERY_MIN_MARGIN = 0.04
 LOCAL_PHASE_RECOVERY_MIN_CONFIDENCE = 0.35
 LOCAL_PHASE_RECOVERY_MICRO_MIN_LOCAL_CONFIDENCE = 0.60
+LOCAL_PHASE_RECOVERY_MAX_BOOST_DISTANCE_BARS = 2.0
 SELF_CALIBRATED_CLOCK_SOURCES = {
     "gui_boom_front_edge_calibrated_grid",
     "visual_reclaimed_body_phase_calibrated",
@@ -76,6 +77,17 @@ def _attempt_local_grid_phase_recovery(
     try:
         from .beatgrid import _pattern_arrays, _score_drum_pattern_bar_zero, find_visual_drop_drum_downbeat
         from .detector import DropDetectorConfig, extract_features
+        from .energy_sections import analyze_energy_sections
+
+        # Section gate: only recover markers that agree with the whole-track
+        # first-biggest-boost prior. The strict grid gate was accidentally
+        # holding wrong-section Stage-A picks; without this check, recovery
+        # would write those wrong sections into the set.
+        sections = analyze_energy_sections(str(audio_path))
+        if not sections.ok or sections.chosen_time_sec is None:
+            return None
+        if abs(float(marker) - float(sections.chosen_time_sec)) > LOCAL_PHASE_RECOVERY_MAX_BOOST_DISTANCE_BARS * float(bar_sec):
+            return None
 
         features = extract_features(
             str(audio_path),
