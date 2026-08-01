@@ -64,6 +64,21 @@ The production gain is much smaller than the offline gain because the learned
 selector only locks at score ≥ 0.500 and ~40 guard/repair passes can still override
 it. That gap is the roadmap.
 
+## Round 2 (2026-08-01, second pass)
+
+- `drop_aligner/energy_sections.py`: Ali's first-biggest-boost rule as a
+  whole-track prior (66% within 1 bar of human picks standalone; opposite
+  miss-bias to the cascade). Wired as selector feature
+  `visual_first_top_boost_align` (kept inert — no holdout lift) and as the
+  section gate for grid-phase recovery.
+- Stage-B grid-phase recovery (`als_anchor._attempt_local_grid_phase_recovery`)
+  with phase_error + micro_drift branches, gated on the energy prior.
+  Truth-set: holds 84 -> 67 with zero regressions to good passes.
+- FULLV2 set: 1000/1298 tracks placed (932 in V1), 295 holds, structural
+  verification 1000/1000 identical 3-stem anchors, 803 anchors on a drums
+  transient within 3 ms. 68 recovered tracks are tiered MEDIUM+ in the drums
+  verification CSV for spot-checking.
+
 ## Next-round roadmap (highest leverage first)
 
 1. **Trust the selector more**: when the model's top score is high and the pick
