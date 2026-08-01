@@ -62,6 +62,7 @@ class EnergySections:
     chosen_time_sec: Optional[float] = None
     chosen_event_index: Optional[int] = None
     max_post_energy: float = 0.0
+    lead_stem: str = "drums"
 
 
 def _mono_low_envelope(path: str) -> tuple[np.ndarray, float]:
@@ -86,7 +87,7 @@ def _mono_low_envelope(path: str) -> tuple[np.ndarray, float]:
     return env, float(mono.size) / sr
 
 
-def analyze_energy_sections(drums_path: str) -> EnergySections:
+def analyze_energy_sections(drums_path: str, *, bpm: Optional[float] = None) -> EnergySections:
     path = Path(drums_path)
     if not path.is_file():
         return EnergySections(ok=False, reason="drums_missing")
@@ -99,6 +100,12 @@ def analyze_energy_sections(drums_path: str) -> EnergySections:
 
     pre_n = max(1, int(PRE_WINDOW_SEC / FRAME_SEC))
     post_n = max(1, int(POST_WINDOW_SEC / FRAME_SEC))
+    # Sustained-body window: a real drop holds its energy for bars, not
+    # seconds. With a known BPM, judge each boost by its median energy over
+    # 8 bars so short spikes drop out of the top class.
+    sustain_n = post_n
+    if bpm and bpm > 0:
+        sustain_n = max(post_n, min(int(8 * 4 * 60.0 / bpm / FRAME_SEC), env.size // 4))
     floor = max(1e-6, float(np.percentile(env, 90)) * 0.02)
 
     events: List[BoostEvent] = []
@@ -123,6 +130,12 @@ def analyze_energy_sections(drums_path: str) -> EnergySections:
 
     if not events:
         return EnergySections(ok=False, reason="no_boost_events", duration_sec=duration)
+
+    if sustain_n != post_n:
+        for event in events:
+            i = min(env.size - 1, int(event.time_sec / FRAME_SEC))
+            hi = min(env.size, i + sustain_n)
+            event.post_energy = float(np.median(env[i:hi]))
 
     max_post = max(event.post_energy for event in events)
     chosen_index: Optional[int] = None
@@ -149,6 +162,82 @@ def choose_first_top_boost(events: Sequence[BoostEvent], max_post: float, fracti
         if event.post_energy >= fraction * max_post:
             return event
     return None
+
+
+def analyze_energy_sections_multi(drums_path: str, inst_path: Optional[str] = None) -> EnergySections:
+    """Cross-stem variant: the drop is where drums AND bass hit all at once.
+
+    Boost events are detected on a drums-weighted combination of the drums and
+    inst stem envelopes (the bassline lives in inst), and an event only counts
+    when the drums stem itself jumps too. Falls back to the drums-only
+    analysis when the inst stem is missing or unreadable.
+    """
+    if not inst_path or not Path(inst_path).is_file():
+        return analyze_energy_sections(drums_path)
+    if not Path(drums_path).is_file():
+        return EnergySections(ok=False, reason="drums_missing")
+    try:
+        drums_env, duration = _mono_low_envelope(str(drums_path))
+        inst_env, _ = _mono_low_envelope(str(inst_path))
+    except Exception as exc:
+        return EnergySections(ok=False, reason=f"read_error:{exc.__class__.__name__}")
+    size = min(drums_env.size, inst_env.size)
+    if size < 20:
+        return EnergySections(ok=False, reason="too_short", duration_sec=duration)
+    drums_env = drums_env[:size] / max(float(np.percentile(drums_env[:size], 95)), 1e-9)
+    inst_env = inst_env[:size] / max(float(np.percentile(inst_env[:size], 95)), 1e-9)
+    # The boom belongs to whichever stem carries it: a bass-led drop is as
+    # real as a drums-led one, so combine by taking the louder stem per frame.
+    combined = np.maximum(drums_env, inst_env)
+
+    pre_n = max(1, int(PRE_WINDOW_SEC / FRAME_SEC))
+    post_n = max(1, int(POST_WINDOW_SEC / FRAME_SEC))
+    floor = max(1e-6, float(np.percentile(combined, 90)) * 0.02)
+
+    events: List[BoostEvent] = []
+    last_time = -1e9
+    for i in range(pre_n, size - post_n):
+        pre = float(np.median(combined[i - pre_n : i]))
+        post = float(np.median(combined[i : i + post_n]))
+        ratio = post / max(pre, floor)
+        if ratio < MIN_BOOST_RATIO or post < floor * 4:
+            continue
+        t = i * FRAME_SEC
+        if t < MIN_EVENT_TIME_SEC:
+            continue
+        if t - last_time < MIN_EVENT_GAP_SEC:
+            if events and post > events[-1].post_energy:
+                events[-1] = BoostEvent(t, ratio, post, pre)
+                last_time = t
+            continue
+        events.append(BoostEvent(t, ratio, post, pre))
+        last_time = t
+
+    if not events:
+        return EnergySections(ok=False, reason="no_boost_events", duration_sec=duration)
+
+    max_post = max(event.post_energy for event in events)
+    chosen_index: Optional[int] = None
+    for index, event in enumerate(events):
+        event.refined_time_sec = _refine_entry_edge(combined, event.time_sec)
+        event.top_class = event.post_energy >= TOP_CLASS_FRACTION * max_post
+        if event.top_class and chosen_index is None:
+            chosen_index = index
+
+    chosen = events[chosen_index] if chosen_index is not None else None
+    result = EnergySections(
+        ok=True,
+        duration_sec=duration,
+        events=events,
+        chosen_time_sec=chosen.refined_time_sec if chosen else None,
+        chosen_event_index=chosen_index,
+        max_post_energy=max_post,
+    )
+    if chosen is not None:
+        frame_index = min(size - 1, max(0, int((chosen.refined_time_sec or chosen.time_sec) / FRAME_SEC)))
+        window = slice(frame_index, min(size, frame_index + int(POST_WINDOW_SEC / FRAME_SEC)))
+        result.lead_stem = "inst" if float(np.mean(inst_env[window])) > float(np.mean(drums_env[window])) else "drums"
+    return result
 
 
 def _refine_entry_edge(env: np.ndarray, coarse_time_sec: float) -> float:

@@ -31,7 +31,7 @@ import soundfile as sf
 import buildSetAndGenerateAls as builder
 from build_fresh_visual_first_library_set import _build_combined_set, _find_role_audio
 from drop_aligner.als import modify_als
-from drop_aligner.energy_sections import analyze_energy_sections
+from drop_aligner.energy_sections import analyze_energy_sections, analyze_energy_sections_multi
 from project_config import BASE_ALS_TEMPLATE, DEFAULT_ALS_TEMPLATE, GENERATED_SET_DIR, STEMS_ROOT_DIR
 
 SNAP_WINDOW_SEC = 0.75
@@ -95,11 +95,28 @@ def snap_to_impact(drums_path: str, approx_sec: float) -> Optional[Dict[str, flo
     }
 
 
-def find_fast_drop(drums_path: str) -> Dict[str, Any]:
-    sections = analyze_energy_sections(str(drums_path))
+def _sibling_inst_path(drums_path: str) -> Optional[str]:
+    folder = Path(drums_path).parent
+    try:
+        for child in sorted(folder.iterdir()):
+            if child.is_file() and child.name.lower().startswith("inst_"):
+                return str(child)
+    except OSError:
+        pass
+    return None
+
+
+def find_fast_drop(drums_path: str, *, multi: bool = False, bpm: Optional[float] = None) -> Dict[str, Any]:
+    inst_path = _sibling_inst_path(str(drums_path)) if multi else None
+    if multi:
+        sections = analyze_energy_sections_multi(str(drums_path), inst_path)
+    else:
+        sections = analyze_energy_sections(str(drums_path), bpm=bpm)
     if not sections.ok or sections.chosen_time_sec is None:
         return {"ok": False, "reason": sections.reason or "no_section"}
-    snap = snap_to_impact(str(drums_path), float(sections.chosen_time_sec))
+    # Zoom on the stem that carries the boom: bass-led drops snap on inst.
+    snap_source = inst_path if (multi and getattr(sections, "lead_stem", "drums") == "inst" and inst_path) else str(drums_path)
+    snap = snap_to_impact(snap_source, float(sections.chosen_time_sec))
     if snap is None:
         # Section is known; fall back to its refined entry edge.
         return {
@@ -124,11 +141,12 @@ def _process_one(task: Mapping[str, Any]) -> Dict[str, Any]:
     template = str(task["template"])
     run_stamp = str(task["run_stamp"])
     write_als = bool(task["write_als"])
+    multi = bool(task.get("multi"))
     folder = Path(str(track["src"])).parent
     drums = _find_role_audio(folder, "drums", track)
     if drums is None:
         return {"status": "error", "track": track, "error": "missing_drums", "drums_path": ""}
-    result = find_fast_drop(str(drums))
+    result = find_fast_drop(str(drums), multi=multi, bpm=float(track["bpm"]))
     if not result.get("ok"):
         return {
             "status": "hold",
@@ -167,6 +185,12 @@ def _process_one(task: Mapping[str, Any]) -> Dict[str, Any]:
     return row
 
 
+def _validate_one(path: str, multi: bool) -> Dict[str, Any]:
+    from visual_first_scorecard import _bpm_from_path
+
+    return find_fast_drop(path, multi=multi, bpm=_bpm_from_path(path))
+
+
 def _validate_truth(args: argparse.Namespace) -> int:
     from visual_first_scorecard import DEFAULT_TRUTH_LOGS, _bpm_from_path, _load_truth
 
@@ -177,7 +201,7 @@ def _validate_truth(args: argparse.Namespace) -> int:
     print(f"[fast-validate] {len(tasks)} truth tracks")
     rows = []
     with ProcessPoolExecutor(max_workers=args.workers) as pool:
-        futures = {pool.submit(find_fast_drop, path): (path, pick) for path, pick in tasks}
+        futures = {pool.submit(_validate_one, path, args.multi): (path, pick) for path, pick in tasks}
         for i, fut in enumerate(as_completed(futures), 1):
             path, pick = futures[fut]
             result = fut.result()
@@ -204,7 +228,7 @@ def _validate_truth(args: argparse.Namespace) -> int:
         "median_abs_ms": round(sorted(r["abs_ms"] for r in scored)[n // 2], 1) if n else None,
     }
     print(json.dumps(summary, indent=2))
-    out = Path("models/fast_drop_validation.json")
+    out = Path("models/fast_drop_validation_multi.json" if args.multi else "models/fast_drop_validation.json")
     out.write_text(json.dumps({"summary": summary, "rows": rows}, indent=1), encoding="utf-8")
     print(f"[fast-validate] wrote {out}")
     return 0
@@ -220,6 +244,7 @@ def main() -> int:
     parser.add_argument("--workers", type=int, default=6)
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--validate-truth", action="store_true", help="Score vs human picks; write nothing")
+    parser.add_argument("--multi", action="store_true", help="Cross-stem mode: drums AND bass must hit together")
     args = parser.parse_args()
 
     if args.validate_truth:
@@ -241,7 +266,7 @@ def main() -> int:
     processed: List[Dict[str, Any]] = []
     failures: List[Dict[str, Any]] = []
     tasks = [
-        {"track": t, "template": args.template, "run_stamp": args.run_stamp, "write_als": True}
+        {"track": t, "template": args.template, "run_stamp": args.run_stamp, "write_als": True, "multi": args.multi}
         for t in tracks
     ]
     with ProcessPoolExecutor(max_workers=args.workers) as pool:
