@@ -26,6 +26,7 @@ from audit_visual_first_human_review_memory import (
 )
 from audit_visual_first_library_coverage import compare_rows_to_eligible
 from drop_aligner.als import modify_als
+from drop_aligner.als_anchor import build_visual_first_als_anchor
 from drop_aligner.boom_profile import boom_proof_front_edge_freshness
 from drop_aligner.exclusions import drums_stem_signal_stats, is_near_empty_drums_stem, row_is_acapella
 from drop_aligner.visual_first import (
@@ -309,11 +310,26 @@ def _write_visual_candidate_json(
     result: Mapping[str, Any],
     track: Mapping[str, Any],
     output_als: Path,
+    als_anchor: Optional[Mapping[str, Any]] = None,
 ) -> None:
     selected = dict(result.get("selected_candidate") if isinstance(result.get("selected_candidate"), Mapping) else {})
+    visual_selected = dict(selected)
+    visual_marker = _float_or_none(result.get("marker"))
+    if visual_marker is None:
+        visual_marker = _candidate_time(visual_selected)
+    if visual_marker is None:
+        visual_marker = float(marker)
+    anchor = dict(
+        als_anchor
+        if isinstance(als_anchor, Mapping)
+        else result.get("als_anchor")
+        if isinstance(result.get("als_anchor"), Mapping)
+        else {}
+    )
     selected["timestamp"] = float(marker)
     selected["snapped_sec"] = float(marker)
     selected["microaligned_time"] = float(marker)
+    selected["visual_marker_sec"] = float(visual_marker)
     selected["selected"] = True
     selected.setdefault("selected_by", _selected_by(result))
     gui_mask_proof = result.get("gui_mask_proof") if isinstance(result.get("gui_mask_proof"), Mapping) else {}
@@ -329,6 +345,14 @@ def _write_visual_candidate_json(
         "energy": track.get("energy"),
         "final_ai_pick": float(marker),
         "drop_sec": float(marker),
+        "visual_marker_sec": float(visual_marker),
+        "visual_selected_candidate": visual_selected,
+        "als_anchor": anchor,
+        "marker_contract": {
+            "als_marker": "first_bounded_drum_body_attack",
+            "visual_marker": "approved_drop_section_on_independent_one",
+            "boom_body_crest": "post_attack_diagnostic_only",
+        },
         "selected_by": str(selected.get("selected_by") or _selected_by(result)),
         "selected_candidate": selected,
         "top_10_candidates": [dict(row) for row in result.get("candidates") or [] if isinstance(row, Mapping)][:10],
@@ -371,8 +395,16 @@ def _load_existing_fresh_row(output_als: Path, candidates_json: Path, track: Map
             break
     if marker is None:
         return None
-    audit_status, audit_flags = _audit_status_flags(payload)
+    als_anchor = payload.get("als_anchor") if isinstance(payload.get("als_anchor"), Mapping) else {}
     selected_by = str(payload.get("selected_by") or "visual_first_existing_fresh")
+    if selected_by != VALIDATED_HUMAN_OVERRIDE_SELECTED_BY:
+        anchor_marker = _float_or_none(als_anchor.get("drop_sec"))
+        if not bool(als_anchor.get("accepted")) or anchor_marker is None:
+            return None
+        anchor_rate = _float_or_none(als_anchor.get("sample_rate")) or 44100.0
+        if abs(float(anchor_marker) - float(marker)) > max(1.0 / float(anchor_rate), 1e-6):
+            return None
+    audit_status, audit_flags = _audit_status_flags(payload)
     boom_proof = _boom_proof(payload)
     gui_mask_proof = _gui_mask_proof(payload)
     if _production_gate_reasons(
@@ -393,6 +425,8 @@ def _load_existing_fresh_row(output_als: Path, candidates_json: Path, track: Map
         "output_als": str(output_als),
         "candidates_json": str(candidates_json),
         "marker": float(marker),
+        "visual_marker": _float_or_none(payload.get("visual_marker_sec")),
+        "als_anchor": dict(als_anchor),
         "raw_visual_time": payload.get("raw_visual_time"),
         "selected_by": selected_by,
         "audit_status": audit_status,
@@ -496,6 +530,7 @@ def _process_track(task: Mapping[str, Any]) -> Dict[str, Any]:
                 "result": result,
             }
         marker = float(marker)
+        visual_marker = float(marker)
         result = dict(result)
         selected_for_gui = dict(result.get("selected_candidate") if isinstance(result.get("selected_candidate"), Mapping) else {})
         boom_proof = _boom_proof(result)
@@ -553,23 +588,83 @@ def _process_track(task: Mapping[str, Any]) -> Dict[str, Any]:
         audit_status, audit_flags = _audit_status_flags(result)
         gui_mask_proof = _gui_mask_proof(result)
         gate_reasons = _result_production_gate_reasons(result)
+        try:
+            als_anchor = dict(
+                build_visual_first_als_anchor(
+                    str(drums_path),
+                    float(track["bpm"]),
+                    sample_rate=sample_rate,
+                    use_cache=use_cache,
+                    visual_result=result,
+                )
+            )
+        except Exception as exc:
+            als_anchor = {
+                "ok": False,
+                "accepted": False,
+                "reason": "als_anchor_exception",
+                "error": str(exc) or exc.__class__.__name__,
+            }
         if gate_reasons:
+            als_anchor["production_gate_reasons"] = [str(reason) for reason in gate_reasons]
+            if bool(als_anchor.get("accepted")):
+                als_anchor["stage_b_attack_accepted"] = True
+                als_anchor["stage_b_reason"] = str(als_anchor.get("reason") or "")
+                als_anchor["ok"] = False
+                als_anchor["accepted"] = False
+                als_anchor["reason"] = "visual_production_gate_hold"
+        result["als_anchor"] = dict(als_anchor)
+        anchor_reasons: List[str] = []
+        if not bool(als_anchor.get("accepted")):
+            anchor_reasons.append(f"als_anchor=hold:{str(als_anchor.get('reason') or 'not_accepted')}")
+        if gate_reasons or anchor_reasons:
+            # A held detector result is still valuable review/training evidence.
+            # Persist its visual point and failed anchor proof, but never write an
+            # ALS from it.
+            _write_visual_candidate_json(
+                candidates_json,
+                audio_path=drums_path,
+                marker=visual_marker,
+                result=result,
+                track=track,
+                output_als=output_als,
+                als_anchor=als_anchor,
+            )
+            hold_reasons = list(gate_reasons) + list(anchor_reasons)
             return {
                 "status": "hold",
                 "track": track,
                 "drums_path": str(drums_path),
                 "output_als": str(output_als),
                 "candidates_json": str(candidates_json),
-                "marker": marker,
+                "marker": visual_marker,
+                "visual_marker": visual_marker,
+                "als_anchor": dict(als_anchor),
                 "raw_visual_time": result.get("raw_visual_time"),
                 "selected_by": _selected_by(result),
                 "audit_status": audit_status,
                 "audit_flags": audit_flags,
                 "boom_proof": dict(boom_proof),
                 "gui_mask_proof": dict(gui_mask_proof),
-                "error": "visual_production_gate_hold:" + "|".join(gate_reasons),
+                "error": "visual_production_gate_hold:" + "|".join(hold_reasons),
                 "result": result,
             }
+        anchor_marker = _float_or_none(als_anchor.get("drop_sec"))
+        if anchor_marker is None:
+            return {
+                "status": "error",
+                "track": track,
+                "drums_path": str(drums_path),
+                "output_als": str(output_als),
+                "candidates_json": str(candidates_json),
+                "marker": visual_marker,
+                "visual_marker": visual_marker,
+                "als_anchor": dict(als_anchor),
+                "selected_by": _selected_by(result),
+                "error": "accepted_als_anchor_missing_drop_sec",
+                "result": result,
+            }
+        marker = float(anchor_marker)
         _write_visual_candidate_json(
             candidates_json,
             audio_path=drums_path,
@@ -577,6 +672,7 @@ def _process_track(task: Mapping[str, Any]) -> Dict[str, Any]:
             result=result,
             track=track,
             output_als=output_als,
+            als_anchor=als_anchor,
         )
         modify_als(
             template_path=str(template),
@@ -595,6 +691,8 @@ def _process_track(task: Mapping[str, Any]) -> Dict[str, Any]:
                 "output_als": str(output_als),
                 "candidates_json": str(candidates_json),
                 "marker": marker,
+                "visual_marker": visual_marker,
+                "als_anchor": dict(als_anchor),
                 "selected_by": _selected_by(result),
                 "error": "als_verification_failed",
                 "verification": verification,
@@ -606,6 +704,8 @@ def _process_track(task: Mapping[str, Any]) -> Dict[str, Any]:
             "output_als": str(output_als),
             "candidates_json": str(candidates_json),
             "marker": marker,
+            "visual_marker": visual_marker,
+            "als_anchor": dict(als_anchor),
             "raw_visual_time": result.get("raw_visual_time"),
             "selected_by": _selected_by(result),
             "audit_status": audit_status,

@@ -111,6 +111,18 @@ not as one-off track fixes:
 
 Current implementation hooks:
 
+- `drop_aligner.beatgrid.resolve_beatgrid(...)` calibrates the song grid from
+  the drums/bass stem before visual candidates are clocked. It treats
+  low-end/kick-like pulses as the primary downbeat evidence, snare/clap-like
+  attack on beats 2 and 4 as backbeat confirmation, and the BPM from the
+  filename or inferred features as the metronome source. The stems stay
+  phase-aligned: this repairs the shared grid phase, not individual stem timing.
+- `drop_aligner.beatgrid.find_visual_drop_drum_downbeat(...)` runs after the
+  visual detector has already chosen the drop section. It searches only the
+  local visible body-entry window, then picks the first credible kick/low-end
+  downbeat with snare/clap backbeat support. It must not scan the whole track,
+  skip to a later loud snare/body hit, or accept a BPM-grid point on blank
+  waveform.
 - `visual_chunk_candidates(...)` builds the full-waveform visual candidate list.
 - `select_first_visual_chunk(...)` chooses the first real visual drop section.
 - `_track_zero_grid_phase_guard_candidate(...)` repairs bad BPM grid phase when
@@ -373,11 +385,23 @@ Current implementation hooks:
   repair only when the earlier body also passes the same production contract.
   Preferred bodies that fail the GUI placeable-mask proof are evidence to
   investigate, not a license to keep a stale marker.
-- BPM phase calibration for GUI/front-edge repairs is metadata repair, not
-  section selection. Real selected detector candidates may calibrate small
-  visual front-edge offsets so `one_distance_ms` reflects the repaired marker;
-  anonymous track-grid checks should remain on the raw BPM grid unless the
-  offset is outside the normal one tolerance.
+- GUI/front-edge evidence must never calibrate its own BPM phase. A visual body
+  may move the marker only inside the bounded refinement window around an
+  independently approved downbeat; it must not translate `clock_zero_sec`.
+  Recompute `one_distance_ms` against the unchanged title/feature-map grid and
+  fail closed when the visual marker is not on that grid's returning one.
+- The ALS marker uses the DJ-mode two-stage contract. Stage A proves the drop
+  section and returning one. Stage B searches from 8 ms before that downbeat to
+  the earlier of 90 ms after it or one quarter beat, then chooses the first
+  strong drums-body attack. Write the attack sample to Ableton, not the nearby
+  click-safe zero crossing. If Stage B cannot prove an attack, skip the ALS
+  write and leave the track for manual review.
+- The node/antinode analogy is useful only at the amplitude-envelope level.
+  After Stage B fixes the first body edge, measure the strongest short-RMS body
+  crest inside the next 60 ms and before the quarter-beat guard. Persist and
+  display that crest as post-edge evidence, but never move `1.1.1` to it. A raw
+  maximum PCM sample is phase-dependent and may be a click or later oscillation;
+  it is diagnostic metadata, not the drop marker.
 - The WebGUI server must enforce the same rule on review writes. In
   visual-first mode, `/api/approve` and `/api/correct` must reject a marker
   before logging or regenerating ALS unless the marker passes Boom proof, sits

@@ -15,7 +15,7 @@ from .detector import DropDetectorConfig, FeatureBundle, extract_features
 from .multistem import find_stem_group, infer_bpm_from_path
 
 
-STRUCTURE_FEATURE_VERSION = 5
+STRUCTURE_FEATURE_VERSION = 7
 
 
 def _clip01(value: Any) -> float:

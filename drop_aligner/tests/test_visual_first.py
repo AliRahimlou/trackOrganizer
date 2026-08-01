@@ -65,6 +65,71 @@ def _assert_visual_first_production_contract(result: dict) -> dict:
     return selected
 
 
+def _assert_fresh_builder_gate_accepts(audio_path: str, result: dict) -> dict:
+    import build_fresh_visual_first_library_set as fresh_build
+    from drop_aligner.waveform import accept_gui_boom_mask_with_front_edge_proof
+
+    selected_for_gui = dict(result["selected_candidate"])
+    marker = float(result["marker"])
+    boom_proof = fresh_build._boom_proof(result)
+    detector_gui_proof = dict(fresh_build._gui_mask_proof(result))
+    builder_gui = fresh_build.visual_gui_mask_proof(
+        audio_path,
+        marker,
+        cache_dir=fresh_build.DEFAULT_WAVEFORM_CACHE_DIR,
+    )
+    selected_source = str(selected_for_gui.get("selected_by") or fresh_build._selected_by(result))
+    repair_gui_lag_sec = 0.300 if selected_source.startswith("visual_final_contract_") else 0.040
+    repair_gui_profile = 0.620 if selected_source.startswith("visual_final_contract_") else 0.560
+    builder_gui = accept_gui_boom_mask_with_front_edge_proof(
+        builder_gui,
+        boom_proof,
+        near_offset_sec=repair_gui_lag_sec,
+        near_profile_score=repair_gui_profile,
+    )
+    builder_gui = fresh_build._accept_gui_contract_by_staccato_front_body_proof(
+        builder_gui,
+        boom_proof,
+        selected_for_gui,
+    )
+    builder_gui = fresh_build._accept_gui_contract_by_sparse_groove_front_edge_proof(
+        builder_gui,
+        boom_proof,
+        selected_for_gui,
+    )
+    builder_gui = fresh_build._accept_gui_contract_by_sustained_body_section(
+        builder_gui,
+        boom_proof,
+        selected_for_gui,
+    )
+    builder_gui = fresh_build._accept_gui_contract_by_actual_body_proof(
+        builder_gui,
+        boom_proof,
+        selected_for_gui,
+    )
+    builder_gui = fresh_build._accept_gui_contract_by_opening_body_start_proof(
+        builder_gui,
+        boom_proof,
+        selected_for_gui,
+    )
+    if fresh_build._gui_proof_has_exact_sparse_front_edge(builder_gui, boom_proof, selected_for_gui):
+        builder_gui = {**dict(builder_gui), "passes": True, "reasons": []}
+    if (
+        (not bool(builder_gui.get("passes")) or gui_boom_mask_strict_contract_issue(builder_gui))
+        and bool(detector_gui_proof.get("passes"))
+        and not gui_boom_mask_strict_contract_issue(detector_gui_proof)
+        and detector_gui_proof.get("marker_signal_present") is True
+    ):
+        builder_gui = {**dict(detector_gui_proof), "builder_preserved_detector_gui_mask_proof": True}
+    result_for_gate = dict(result)
+    selected_for_gui["gui_mask_proof"] = dict(builder_gui)
+    result_for_gate["selected_candidate"] = selected_for_gui
+    result_for_gate["gui_mask_proof"] = dict(builder_gui)
+
+    assert fresh_build._result_production_gate_reasons(result_for_gate) == []
+    return builder_gui
+
+
 def _feature_map(heights: list[float], *, bpm: float = 60.0) -> dict:
     bar_sec = 240.0 / float(bpm)
     bars = []
@@ -475,7 +540,7 @@ def test_boom_global_replacement_promotes_proven_front_edge_after_bad_marker() -
     assert replacement["boom_proof"]["passes"]
 
 
-def test_boom_global_replacement_promotes_fast_tempo_full_body_after_intro() -> None:
+def test_boom_global_replacement_rejects_fast_tempo_body_off_authoritative_one() -> None:
     selected = _candidate(
         4.0,
         2,
@@ -535,10 +600,7 @@ def test_boom_global_replacement_promotes_fast_tempo_full_body_after_intro() -> 
         beatgrid={"bpm": 134.0, "bar_sec": 240.0 / 134.0, "bar_zero_sec": 0.0},
     )
 
-    assert replacement is not None
-    assert replacement["selected_by"] == "visual_boom_global_front_edge"
-    assert replacement["timestamp"] == pytest.approx(89.107)
-    assert replacement["boom_proof"]["passes"]
+    assert replacement is None
 
 
 def test_visual_first_shifts_opening_edge_to_stronger_phrase_body() -> None:
@@ -1737,7 +1799,7 @@ def test_proven_boom_grid_snap_only_repairs_small_one_miss() -> None:
     assert _proven_boom_grid_snap_time(133.907592, clock, {"passes": False}, profile, 240.0 / 86.0) is None
 
 
-def test_proven_boom_phase_calibration_keeps_visual_body_marker_on_one() -> None:
+def test_proven_boom_body_cannot_rephase_its_own_grid() -> None:
     selected = _candidate(
         77.48352380952382,
         41,
@@ -1787,11 +1849,7 @@ def test_proven_boom_phase_calibration_keeps_visual_body_marker_on_one() -> None
         240.0 / 124.0,
     )
 
-    assert calibrated is not None
-    assert calibrated["source"] == "visual_boom_phase_calibrated"
-    assert calibrated["on_one"]
-    assert calibrated["one_distance_ms"] == pytest.approx(0.0)
-    assert calibrated["nearest_one_time"] == pytest.approx(77.48352380952382)
+    assert calibrated is None
 
     too_far = dict(proof)
     too_far["nearest"] = {"offset_sec": 0.95}
@@ -1820,8 +1878,7 @@ def test_proven_boom_phase_calibration_keeps_visual_body_marker_on_one() -> None
         240.0 / 124.0,
     )
 
-    assert half_bar_calibrated is not None
-    assert half_bar_calibrated["on_one"]
+    assert half_bar_calibrated is None
 
 
 def test_proven_boom_phase_calibration_rejects_weak_visual_body() -> None:
@@ -1857,7 +1914,7 @@ def test_proven_boom_phase_calibration_rejects_weak_visual_body() -> None:
     )
 
 
-def test_grid_phase_neutralized_proof_repairs_grid_only_boom_hold() -> None:
+def test_grid_phase_failure_remains_failed_despite_visual_boom_body() -> None:
     selected = _candidate(
         56.783472,
         30,
@@ -1906,9 +1963,7 @@ def test_grid_phase_neutralized_proof_repairs_grid_only_boom_hold() -> None:
         {"bpm": 128.0, "bar_sec": 240.0 / 128.0, "bar_zero_sec": 0.0},
     )
 
-    assert proof is not None
-    assert proof["passes"]
-    assert proof["grid_phase_neutralized_for_clock_calibration"]
+    assert proof is None
 
     late_body_proof = _boom_proof_with_grid_phase_neutralized(
         58.200,
@@ -2849,6 +2904,60 @@ def test_visual_first_keeps_first_sustained_fat_block() -> None:
 
     assert selected is not None
     assert selected["visual_components"]["clock_bar"] == 17
+
+
+def test_visual_first_keeps_strong_phrase_reentry_before_denser_bass_repeat() -> None:
+    first_drop = _candidate(
+        36.57142857142857,
+        17,
+        score=0.6692887525825705,
+        phrase_prior=0.94,
+        post4=0.669433114445183,
+        post8=0.7099251896609506,
+        bass=0.6013641085172138,
+        drum=1.0,
+        pre_drum=0.41751269035533,
+        local_gap=0.3194941460029845,
+        bpm=105.0,
+    )
+    first_drop["visual_components"].update(
+        {
+            "drum_continuity": 0.883248730964467,
+            "post_drum_cont4": 0.6091370558375635,
+            "post_drum_cont8": 0.6909898477157361,
+            "jump4": 0.10780561957851675,
+            "jump8": 0.13919982549929721,
+        }
+    )
+    first_drop["bpm_clock"].update({"on_one": True, "one_distance_ms": 0.0})
+    later_repeat = _candidate(
+        45.71428571428571,
+        21,
+        score=0.6973723910612749,
+        phrase_prior=0.66,
+        post4=0.7504172648767181,
+        post8=0.7682450523679232,
+        bass=0.7199118677504258,
+        drum=1.0,
+        pre_drum=0.6091370558375635,
+        local_gap=0.1944286025388846,
+        bpm=105.0,
+    )
+    later_repeat["visual_components"].update(
+        {
+            "drum_continuity": 0.766497461928934,
+            "post_drum_cont4": 0.7728426395939086,
+            "post_drum_cont8": 0.815989847715736,
+            "jump4": 0.08098415043153506,
+            "jump8": 0.15271474771199856,
+        }
+    )
+    later_repeat["bpm_clock"].update({"on_one": True, "one_distance_ms": 0.0})
+
+    selected = select_first_visual_chunk([first_drop, later_repeat])
+
+    assert selected is not None
+    assert selected["timestamp"] == pytest.approx(first_drop["timestamp"])
 
 
 def test_visual_first_skips_buildup_to_later_bass_body_drop() -> None:
@@ -6467,6 +6576,13 @@ def test_gui_front_edge_clock_uses_repaired_time_not_previous_marker_phase() -> 
     assert clock["beat_in_bar"] == 1
     assert clock["on_one"] is True
 
+    off_grid = _clock_for_visual_edge(15.144, 128.0, 0.0, selected)
+
+    assert off_grid["source"] == "gui_boom_front_edge_track_grid"
+    assert off_grid["clock_zero_sec"] == pytest.approx(0.0)
+    assert off_grid["one_distance_ms"] == pytest.approx(144.0)
+    assert off_grid["on_one"] is False
+
 
 def test_visual_first_ignores_file_start_intro_boom_for_later_definitive_body() -> None:
     audio_path = (
@@ -6583,7 +6699,7 @@ def test_visual_v2_reclaim_prefers_earliest_adequate_body_candidate() -> None:
     assert reclaimed["selected_by"] == "visual_drop_v2_candidate"
 
 
-def test_visual_first_reclaims_v2_candidate_to_earliest_body_peak_with_phase_calibration() -> None:
+def test_visual_first_rejects_off_grid_early_body_for_later_proven_drop() -> None:
     audio_path = (
         "/Users/alirahimlou/Desktop/MUSIC/STEMS/105/9A/DECAP - Baboom/"
         "drums_105_9A_5-DECAP - Baboom.flac"
@@ -6594,14 +6710,38 @@ def test_visual_first_reclaims_v2_candidate_to_earliest_body_peak_with_phase_cal
     result = visual_first_marker(audio_path, sample_rate=16000, use_cache=True)
     selected = result["selected_candidate"]
 
-    assert result["marker"] == pytest.approx(19.456, abs=0.050)
-    assert selected["selected_by"] == "visual_body_peak_candidate"
-    assert selected["bpm_clock"]["source"] == "visual_reclaimed_body_phase_calibrated"
+    assert result["marker"] == pytest.approx(36.57142857142857, abs=0.050)
+    assert selected["selected_by"] == "visual_final_contract_actual_body_boom_repair"
+    assert selected["bpm_clock"]["source"] == "gui_boom_front_edge_track_grid"
+    assert selected["bpm_clock"]["clock_zero_sec"] == pytest.approx(0.0)
     assert selected["bpm_clock"]["on_one"] is True
+    assert abs(float(selected["bpm_clock"]["one_distance_ms"])) <= 1.0
     assert result["visual_audit"]["status"] == "pass"
     assert result["visual_audit"]["flag_codes"] == []
     assert result["boom_proof"]["passes"] is True
     assert _gui_mask_proof(audio_path, result["marker"])["passes"] is True
+
+
+def test_visual_first_baboom_keeps_same_first_drop_at_production_rate() -> None:
+    audio_path = (
+        "/Users/alirahimlou/Desktop/MUSIC/STEMS/105/9A/DECAP - Baboom/"
+        "drums_105_9A_5-DECAP - Baboom.flac"
+    )
+    if not Path(audio_path).exists():
+        pytest.skip(f"local audio fixture not available: {audio_path}")
+
+    result = visual_first_marker(audio_path, sample_rate=44100, use_cache=True)
+    selected = result["selected_candidate"]
+
+    assert result["marker"] == pytest.approx(36.57142857142857, abs=0.050)
+    assert result["marker"] != pytest.approx(45.71428571428571, abs=0.050)
+    assert selected["bpm_clock"]["clock_zero_sec"] == pytest.approx(0.0)
+    assert selected["bpm_clock"]["on_one"] is True
+    assert abs(float(selected["bpm_clock"]["one_distance_ms"])) <= 1.0
+    assert result["visual_audit"]["status"] == "pass"
+    assert result["visual_audit"]["flag_codes"] == []
+    assert result["boom_proof"]["passes"] is True
+    assert result["gui_mask_proof"]["passes"] is True
 
 
 @pytest.mark.parametrize(
@@ -7184,7 +7324,7 @@ def test_visual_first_lets_try_it_prefers_earlier_same_section_reset_front() -> 
     visual = selected["visual_components"]
     body = visual_first_module._candidate_visual_body_summary(selected)
 
-    assert result["marker"] == pytest.approx(32.639841, abs=0.010)
+    assert result["marker"] == pytest.approx(32.670476, abs=0.010)
     assert result["marker"] != pytest.approx(36.480, abs=0.050)
     assert selected["selected_by"] == "visual_earlier_same_section_reset_front_edge"
     assert visual.get("earlier_same_section_reset_front_edge_repair") is True
@@ -7194,7 +7334,257 @@ def test_visual_first_lets_try_it_prefers_earlier_same_section_reset_front() -> 
     assert body["pre_drum"] <= 0.080
     assert selected["bpm_clock"]["source"] == "title_bpm_track_zero"
     assert selected["bpm_clock"]["on_one"] is True
+    assert abs(float(selected["bpm_clock"]["one_distance_ms"])) <= 40.0
+
+
+def test_visual_first_alibi_rejects_wide_same_section_reset_front_edge() -> None:
+    audio_path = (
+        "/Users/alirahimlou/Desktop/MUSIC/STEMS/130/5A/"
+        "Ella Henderson, Rudimental - Alibi (feat. Rudimental)/"
+        "drums_130_5A_7-Ella Henderson, Rudimental - Alibi (feat. Rudimental).flac"
+    )
+    if not Path(audio_path).exists():
+        pytest.skip(f"local audio fixture not available: {audio_path}")
+
+    result = visual_first_marker(audio_path, sample_rate=44100, use_cache=True)
+    selected = _assert_visual_first_production_contract(result)
+    gui = result["gui_mask_proof"]
+
+    assert result["marker"] == pytest.approx(33.190769, abs=0.010)
+    assert result["marker"] != pytest.approx(33.230769, abs=0.010)
+    assert selected["selected_by"] != "visual_earlier_same_section_reset_front_edge"
+    assert gui_boom_mask_strict_contract_issue(gui) in ("", None)
+    assert (
+        visual_first_module._gui_mask_proof_needs_front_edge_repair(
+            gui,
+            trust_reasonless_relief_offset=True,
+        )
+        is False
+    )
+    assert selected["bpm_clock"]["on_one"] is True
     assert abs(float(selected["bpm_clock"]["one_distance_ms"])) <= 1.0
+
+    _assert_fresh_builder_gate_accepts(audio_path, result)
+
+
+def test_visual_first_move_too_slow_repairs_wide_final_gui_front_edge() -> None:
+    audio_path = (
+        "/Users/alirahimlou/Desktop/MUSIC/STEMS/133/11A/"
+        "Move Too Slow - Cesco/drums_133_11A_6-Move Too Slow - Cesco.wav"
+    )
+    if not Path(audio_path).exists():
+        pytest.skip(f"local audio fixture not available: {audio_path}")
+
+    result = visual_first_marker(audio_path, sample_rate=44100, use_cache=True)
+    selected = _assert_visual_first_production_contract(result)
+    gui = result["gui_mask_proof"]
+    visual = selected["visual_components"]
+
+    assert result["marker"] == pytest.approx(58.492204, abs=0.010)
+    assert result["marker"] != pytest.approx(58.927204, abs=0.050)
+    assert selected["selected_by"] == "visual_final_contract_gui_mask_nearest_repair"
+    assert visual.get("final_gui_mask_nearest_front_edge_repair") is True
+    assert visual.get("final_gui_mask_nearest_previous_marker") == pytest.approx(58.927204, abs=0.010)
+    assert gui_boom_mask_strict_contract_issue(gui) in ("", None)
+    assert (
+        visual_first_module._gui_mask_proof_needs_front_edge_repair(
+            gui,
+            trust_reasonless_relief_offset=True,
+        )
+        is False
+    )
+    assert gui["nearest_placeable_offset_sec"] == pytest.approx(0.0, abs=0.006)
+    assert selected["bpm_clock"]["on_one"] is True
+    assert abs(float(selected["bpm_clock"]["one_distance_ms"])) <= 1.0
+
+    _assert_fresh_builder_gate_accepts(audio_path, result)
+
+
+def test_visual_first_acyan_repairs_wide_final_gui_front_edge() -> None:
+    audio_path = (
+        "/Users/alirahimlou/Desktop/MUSIC/STEMS/140/2A/"
+        "LEADPOISON - Acyan/drums_140_2A_6-LEADPOISON - Acyan.flac"
+    )
+    if not Path(audio_path).exists():
+        pytest.skip(f"local audio fixture not available: {audio_path}")
+
+    result = visual_first_marker(audio_path, sample_rate=44100, use_cache=True)
+    selected = _assert_visual_first_production_contract(result)
+    gui = result["gui_mask_proof"]
+    visual = selected["visual_components"]
+
+    assert result["marker"] == pytest.approx(41.134558, abs=0.010)
+    assert result["marker"] != pytest.approx(41.819138, abs=0.050)
+    assert selected["selected_by"] == "visual_final_contract_gui_mask_nearest_repair"
+    assert visual.get("final_gui_mask_nearest_front_edge_repair") is True
+    assert visual.get("final_gui_mask_nearest_previous_marker") == pytest.approx(42.074558, abs=0.010)
+    assert gui_boom_mask_strict_contract_issue(gui) in ("", None)
+    assert (
+        visual_first_module._gui_mask_proof_needs_front_edge_repair(
+            gui,
+            trust_reasonless_relief_offset=True,
+        )
+        is False
+    )
+    assert gui["nearest_placeable_offset_sec"] == pytest.approx(0.0, abs=0.006)
+    assert selected["bpm_clock"]["on_one"] is True
+    assert abs(float(selected["bpm_clock"]["one_distance_ms"])) <= 1.0
+
+    _assert_fresh_builder_gate_accepts(audio_path, result)
+
+
+def test_visual_first_psychosis_repairs_wide_final_gui_front_edge() -> None:
+    audio_path = (
+        "/Users/alirahimlou/Desktop/MUSIC/STEMS/140/7A/"
+        "Alix Perez - Psychosis/drums_140_7A_6-Alix Perez - Psychosis.flac"
+    )
+    if not Path(audio_path).exists():
+        pytest.skip(f"local audio fixture not available: {audio_path}")
+
+    result = visual_first_marker(audio_path, sample_rate=44100, use_cache=True)
+    selected = _assert_visual_first_production_contract(result)
+    gui = result["gui_mask_proof"]
+    visual = selected["visual_components"]
+
+    assert result["marker"] == pytest.approx(54.911179, abs=0.010)
+    assert result["marker"] != pytest.approx(55.801179, abs=0.050)
+    assert selected["selected_by"] == "visual_final_contract_gui_mask_nearest_repair"
+    assert visual.get("final_gui_mask_nearest_front_edge_repair") is True
+    assert visual.get("final_gui_mask_nearest_previous_marker") == pytest.approx(55.801179, abs=0.010)
+    assert gui_boom_mask_strict_contract_issue(gui) in ("", None)
+    assert (
+        visual_first_module._gui_mask_proof_needs_front_edge_repair(
+            gui,
+            trust_reasonless_relief_offset=True,
+        )
+        is False
+    )
+    assert gui["nearest_placeable_offset_sec"] == pytest.approx(0.0, abs=0.006)
+    assert selected["bpm_clock"]["on_one"] is True
+    assert abs(float(selected["bpm_clock"]["one_distance_ms"])) <= 1.0
+
+    _assert_fresh_builder_gate_accepts(audio_path, result)
+
+
+def test_visual_first_kula_kula_repairs_wide_final_gui_front_edge() -> None:
+    audio_path = (
+        "/Users/alirahimlou/Desktop/MUSIC/STEMS/140/9A/"
+        "Pushloop, The Widdler - Kula Kula - The Widdler Remix/"
+        "drums_140_9A_6-Pushloop, The Widdler - Kula Kula - The Widdler Remix.flac"
+    )
+    if not Path(audio_path).exists():
+        pytest.skip(f"local audio fixture not available: {audio_path}")
+
+    result = visual_first_marker(audio_path, sample_rate=44100, use_cache=True)
+    selected = _assert_visual_first_production_contract(result)
+    gui = result["gui_mask_proof"]
+
+    assert result["marker"] == pytest.approx(55.239333, abs=0.010)
+    assert result["marker"] != pytest.approx(56.118277, abs=0.050)
+    assert selected["selected_by"] == "visual_candidate_selector"
+    assert gui_boom_mask_strict_contract_issue(gui) in ("", None)
+    assert (
+        visual_first_module._gui_mask_proof_needs_front_edge_repair(
+            gui,
+            trust_reasonless_relief_offset=True,
+        )
+        is False
+    )
+    assert gui.get("marker_immediate_body_present") is True
+    assert gui.get("accepted_by_coarse_gui_front_edge_after_fine_probe") is not True
+    assert gui["nearest_placeable_offset_sec"] == pytest.approx(0.0, abs=0.006)
+    assert selected["bpm_clock"]["on_one"] is True
+    assert abs(float(selected["bpm_clock"]["one_distance_ms"])) <= 1.0
+
+    _assert_fresh_builder_gate_accepts(audio_path, result)
+
+
+def test_visual_first_overkill_requires_fine_gui_front_edge_over_unproven_earlier_boom() -> None:
+    audio_path = (
+        "/Users/alirahimlou/Desktop/MUSIC/STEMS/140/7A/"
+        "BLVZE - OVERKILL (Original Mix)/"
+        "drums_140_7A_8-BLVZE - OVERKILL (Original Mix).flac"
+    )
+    if not Path(audio_path).exists():
+        pytest.skip(f"local audio fixture not available: {audio_path}")
+
+    result = visual_first_marker(audio_path, sample_rate=44100, use_cache=True)
+    selected = _assert_visual_first_production_contract(result)
+    gui = result["gui_mask_proof"]
+    boom = result["boom_proof"]
+    audit = result["visual_audit"]
+
+    assert result["marker"] == pytest.approx(69.850714, abs=0.010)
+    assert result["marker"] != pytest.approx(12.000000, abs=0.050)
+    assert result["marker"] != pytest.approx(27.428571, abs=0.050)
+    assert selected["selected_by"] == "visual_final_contract_gui_mask_nearest_repair"
+    assert boom.get("accepted_by_gui_front_edge_over_unproven_earlier_boom") is True
+    assert boom.get("ignored_unproven_earlier_boom_times") == pytest.approx([13.714], abs=0.001)
+    assert audit.get("gui_front_edge_over_unproven_earlier_boom_audit_relief") is True
+    assert gui_boom_mask_strict_contract_issue(gui) in ("", None)
+    assert (
+        visual_first_module._gui_mask_proof_needs_front_edge_repair(
+            gui,
+            trust_reasonless_relief_offset=True,
+        )
+        is False
+    )
+    assert gui.get("marker_signal_present") is True
+    assert gui.get("marker_relevant_mask") is True
+    assert gui.get("marker_immediate_body_present") is True
+    assert gui.get("accepted_by_coarse_gui_front_edge_after_fine_probe") is not True
+    assert gui["nearest_placeable_offset_sec"] == pytest.approx(0.0, abs=0.006)
+    assert selected["bpm_clock"]["on_one"] is True
+    assert abs(float(selected["bpm_clock"]["one_distance_ms"])) <= 1.0
+
+    _assert_fresh_builder_gate_accepts(audio_path, result)
+
+
+@pytest.mark.parametrize(
+    "audio_path",
+    [
+        (
+            "/Users/alirahimlou/Desktop/MUSIC/STEMS/140/2A/"
+            "Fred again.. - Victory Lap Four/"
+            "drums_140_2A_8-Fred again.. - Victory Lap Four.flac"
+        ),
+        (
+            "/Users/alirahimlou/Desktop/MUSIC/STEMS/140/2A/"
+            "Fred again.., Skepta, PlaqueBoyMax, Denzel Curry, Hanumankind, That Mexican OT - Victory Lap Four/"
+            "drums_140_2A_8-Fred again.., Skepta, PlaqueBoyMax, Denzel Curry, Hanumankind, That Mexican OT - Victory Lap Four.flac"
+        ),
+    ],
+)
+def test_visual_first_victory_lap_four_rejects_no_immediate_body_recovery(
+    audio_path: str,
+) -> None:
+    if not Path(audio_path).exists():
+        pytest.skip(f"local audio fixture not available: {audio_path}")
+
+    result = visual_first_marker(audio_path, sample_rate=44100, use_cache=True)
+    selected = _assert_visual_first_production_contract(result)
+    gui = result["gui_mask_proof"]
+    visual = selected["visual_components"]
+
+    assert result["marker"] == pytest.approx(166.784000, abs=0.010)
+    assert result["marker"] != pytest.approx(15.428571, abs=0.050)
+    assert selected["selected_by"] == "visual_final_contract_gui_sparse_pulse_repair"
+    assert visual.get("analysis_rate_last_mile_strict_gui_recovery") is True
+    assert gui_boom_mask_strict_contract_issue(gui) in ("", None)
+    assert (
+        visual_first_module._gui_mask_proof_needs_front_edge_repair(
+            gui,
+            trust_reasonless_relief_offset=True,
+        )
+        is False
+    )
+    assert gui.get("marker_signal_present") is True
+    assert gui.get("marker_relevant_mask") is True
+    assert gui.get("marker_immediate_body_present") is True
+    assert selected["bpm_clock"]["on_one"] is True
+    assert abs(float(selected["bpm_clock"]["one_distance_ms"])) <= 1.0
+
+    _assert_fresh_builder_gate_accepts(audio_path, result)
 
 
 @pytest.mark.parametrize(

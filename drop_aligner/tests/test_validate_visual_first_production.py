@@ -78,6 +78,29 @@ def _fresh_boom_proof(marker: float = 32.0) -> dict:
     }
 
 
+def _fresh_gui_proof(marker: float = 32.0) -> dict:
+    return {
+        "passes": True,
+        "reasons": [],
+        "marker": marker,
+        "placeable_count": 2,
+        "nearest_placeable_offset_sec": 0.0,
+        "marker_relevant_mask": True,
+        "marker_signal_present": True,
+        "marker_immediate_body_present": True,
+    }
+
+
+def _visual_body_components() -> dict:
+    return {
+        "post8_height": 0.72,
+        "post4_height": 0.69,
+        "post_bass8": 0.58,
+        "post_drum8": 0.94,
+        "post_drum_cont8": 0.91,
+    }
+
+
 def test_latest_report_prefers_current_all_tracks_and_ignores_derived(tmp_path: Path) -> None:
     legacy_newer = _touch_json(tmp_path / "VISUAL_FIRST_FRESH_ALL_DRUMS_99999999_report.json", 400)
     current_valid = _touch_json(tmp_path / "VISUAL_FIRST_FRESH_ALL_TRACKS_20260619_report.json", 100)
@@ -538,6 +561,175 @@ def test_validate_one_accepts_persisted_proofs_from_candidate_json(monkeypatch, 
     assert result["persisted_boom_proof"]["passes"] is True
     assert result["persisted_gui_mask_proof"]["passes"] is True
     assert result["actual_visual_body_contract_pass"] is True
+
+
+def test_validate_one_accepts_current_rerun_strict_proofs_when_raw_recompute_misses_relief(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    import drop_aligner.visual_first as visual_first
+
+    audio = tmp_path / "drums_128_1A_7-Test.flac"
+    audio.write_text("", encoding="utf-8")
+    marker = 32.0
+    selected = {
+        "timestamp": marker,
+        "selected_by": "visual_final_contract_gui_front_edge_repair",
+        "visual_components": _visual_body_components(),
+    }
+    detector_payload = {
+        "ok": True,
+        "audio_path": str(audio),
+        "drop_sec": marker,
+        "final_ai_pick": marker,
+        "selected_by": "visual_final_contract_gui_front_edge_repair",
+        "selected_candidate": selected,
+        "visual_audit": {"status": "pass", "flag_codes": []},
+        "boom_proof": _fresh_boom_proof(marker),
+        "gui_mask_proof": _fresh_gui_proof(marker),
+    }
+    candidates = tmp_path / "candidate.json"
+    candidates.write_text(json.dumps(detector_payload), encoding="utf-8")
+
+    monkeypatch.setattr(visual_first, "visual_first_marker", lambda *args, **kwargs: detector_payload)
+    monkeypatch.setattr(validator, "compute_bar_feature_map", lambda *args, **kwargs: {"bar_count": 64, "beatgrid": {}})
+    monkeypatch.setattr(validator, "boom_body_section_candidates", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        validator,
+        "marker_boom_proof",
+        lambda *args, **kwargs: {
+            "passes": False,
+            "reasons": ["earlier_dominant_boom_available at 16.000s b8"],
+        },
+    )
+    monkeypatch.setattr(
+        validator,
+        "_gui_mask_proof",
+        lambda *args, **kwargs: {
+            "passes": False,
+            "reasons": ["marker_has_no_immediate_drop_body"],
+            "marker": marker,
+            "marker_relevant_mask": True,
+            "marker_signal_present": True,
+        },
+    )
+
+    result = validator._validate_one(
+        {
+            "row": {
+                "drums_path": str(audio),
+                "marker": marker,
+                "selected_by": "visual_final_contract_gui_front_edge_repair",
+                "audit_status": "pass",
+                "audit_flags": [],
+                "candidates_json": str(candidates),
+            },
+            "sample_rate": 16000,
+            "rerun_detector": True,
+            "require_rerun_matches_report": True,
+            "rerun_report_tolerance_sec": 0.002,
+            "skip_gui_mask": False,
+            "waveform_cache_dir": str(tmp_path),
+        }
+    )
+
+    assert result["passes"] is True
+    assert result["rerun_report_delta_sec"] == 0.0
+    assert result["boom_proof"]["accepted_by_trusted_persisted_strict_proof"] is True
+    assert result["boom_proof"]["trusted_persisted_proof_source"] == "current_detector_rerun"
+    assert result["boom_proof"]["raw_validation_recomputed_reasons"] == [
+        "earlier_dominant_boom_available at 16.000s b8"
+    ]
+    assert result["gui_mask"]["accepted_by_trusted_persisted_strict_gui_mask_proof"] is True
+    assert result["gui_mask"]["trusted_persisted_proof_source"] == "current_detector_rerun"
+    assert result["gui_mask"]["raw_validation_recomputed_reasons"] == ["marker_has_no_immediate_drop_body"]
+
+
+def test_validate_one_accepts_trusted_sparse_groove_gui_proof_as_actual_body_contract(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    audio = tmp_path / "drums_122_7A_6-Test.wav"
+    audio.write_text("", encoding="utf-8")
+    marker = 11.602409
+    boom = _fresh_boom_proof(marker)
+    gui = {
+        **_fresh_gui_proof(marker),
+        "marker_immediate_body_present": False,
+        "raw_reasons": ["marker_has_no_immediate_drop_body"],
+        "accepted_by_gui_sparse_pulse_proof": True,
+        "accepted_by_sparse_groove_front_edge_proof": True,
+        "placeable_count": 93,
+        "nearest_placeable_offset_sec": 0.0,
+        "marker_post_relevant_occupancy_250ms": 0.80,
+        "marker_post_rms_max_250ms": 0.53,
+        "sparse_groove_front_sparse_score": 0.567,
+        "sparse_groove_front_actual_body": 0.540,
+        "sparse_groove_front_profile_score": 0.582,
+        "sparse_groove_front_body_score": 0.635,
+        "sparse_groove_front_darkness": 0.721,
+        "sparse_groove_front_post8": 0.540,
+        "sparse_groove_front_drum_cont": 0.700,
+        "sparse_groove_front_bass": 0.280,
+        "sparse_groove_front_simultaneity": 0.604,
+        "sparse_groove_front_post_relevant": 0.800,
+        "sparse_groove_front_post_rms_peak": 0.688,
+    }
+    candidates = tmp_path / "candidate.json"
+    candidates.write_text(
+        json.dumps(
+            {
+                "audio_path": str(audio),
+                "drop_sec": marker,
+                "selected_by": "visual_absolute_final_context_fine_front_edge_repair",
+                "selected_candidate": {
+                    "timestamp": marker,
+                    "selected_by": "visual_absolute_final_context_fine_front_edge_repair",
+                    "visual_components": {
+                        "boom_section_darkness": 0.106,
+                        "bar_height": 0.106,
+                        "max_post8_height": 0.106,
+                        "post4_height": 0.540,
+                        "post8_height": 0.540,
+                        "post_bass8": 0.280,
+                        "post_drum8": 0.900,
+                        "post_drum_cont8": 0.700,
+                        "jump4": 0.160,
+                        "jump8": 0.160,
+                        "phrase_prior": 0.480,
+                    },
+                },
+                "visual_audit": {"status": "pass", "flag_codes": []},
+                "boom_proof": boom,
+                "gui_mask_proof": gui,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(validator, "compute_bar_feature_map", lambda *args, **kwargs: {"bar_count": 64, "beatgrid": {}})
+    monkeypatch.setattr(validator, "boom_body_section_candidates", lambda *args, **kwargs: [])
+    monkeypatch.setattr(validator, "marker_boom_proof", lambda *args, **kwargs: boom)
+
+    result = validator._validate_one(
+        {
+            "row": {
+                "drums_path": str(audio),
+                "marker": marker,
+                "selected_by": "visual_absolute_final_context_fine_front_edge_repair",
+                "audit_status": "pass",
+                "audit_flags": [],
+                "candidates_json": str(candidates),
+            },
+            "sample_rate": 16000,
+            "rerun_detector": False,
+            "require_rerun_matches_report": False,
+            "skip_gui_mask": True,
+        }
+    )
+
+    assert result["passes"] is True
+    assert result["actual_visual_body_contract_pass"] is True
+    assert result["actual_visual_body_contract"]["source"] == "trusted_sparse_groove_gui_proof"
 
 
 def test_validate_one_rejects_selected_candidate_without_visual_body_metrics(monkeypatch, tmp_path: Path) -> None:

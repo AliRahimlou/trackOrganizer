@@ -32,10 +32,17 @@ and held to the existing detector path instead of blindly rewriting 1.1.1.
 Recommended production flow:
 
 ```bash
-python3 build_fresh_visual_first_library_set.py --workers 4 --force
+python3 build_fresh_visual_first_library_set.py --workers 4 --run-stamp NEW_UNIQUE_STAMP
 python3 validate_visual_first_production.py /path/to/visual_first_report.json --out-dir /path/to/output-dir --workers 4
-python3 web_review.py /path/to/visual_first_summary.csv --template "alsFiles/128.als" --visual-first --no-open-browser
+python3 build_visual_first_production_queue.py /path/to/visual_first_report.json --out-dir /path/to/review-dir --prefix NEW_UNIQUE_STAMP
+python3 web_review.py /path/to/review-dir/NEW_UNIQUE_STAMP_full_library_review_summary.csv \
+  --queue /path/to/review-dir/NEW_UNIQUE_STAMP_full_library_review_queue.csv \
+  --template "alsFiles/128.als" --visual-first --no-open-browser
 ```
+
+Use the full-library review summary for GUI review: it includes fail-closed
+anchor holds with their visual/grid evidence even though no unsafe ALS was
+written. The detector-pass-only summary remains the production-safe subset.
 
 `validate_visual_first_production.py` reruns the current visual-first detector by
 default and requires those fresh markers to match the saved production report.

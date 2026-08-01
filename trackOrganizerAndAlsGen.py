@@ -59,6 +59,11 @@ except Exception:
     build_drop_fusion_audit = None
     drop_fusion_json_default = None
 
+try:
+    from drop_aligner.als_anchor import build_visual_first_als_anchor
+except Exception:
+    build_visual_first_als_anchor = None
+
 # ========= USER SETTINGS =========
 mp3_source_folder        = str(PLAYLISTS_BY_DATE_DIR)
 htdemucs_source_folder   = str(STEMS_INBOX_DIR)
@@ -83,11 +88,16 @@ USE_DROP_FUSION_AUTOMATION = str(os.environ.get("USE_DROP_FUSION_AUTOMATION", "1
 DROP_FUSION_REQUIRE_SAFE = str(os.environ.get("DROP_FUSION_REQUIRE_SAFE", "1")).strip().lower() not in {"0", "false", "no", "off"}
 DROP_FUSION_OVERRIDE_DB_ANCHOR = str(os.environ.get("DROP_FUSION_OVERRIDE_DB_ANCHOR", "1")).strip().lower() not in {"0", "false", "no", "off"}
 DROP_FUSION_OVERRIDE_MANUAL_ANCHOR = str(os.environ.get("DROP_FUSION_OVERRIDE_MANUAL_ANCHOR", "0")).strip().lower() not in {"0", "false", "no", "off"}
+DROP_FUSION_OVERRIDE_VISUAL_FIRST_ANCHOR = str(os.environ.get("DROP_FUSION_OVERRIDE_VISUAL_FIRST_ANCHOR", "0")).strip().lower() not in {"0", "false", "no", "off"}
 DROP_FUSION_MIN_CONFIDENCE = float(os.environ.get("DROP_FUSION_MIN_CONFIDENCE", "0.64"))
 DROP_FUSION_MIN_SCORE = float(os.environ.get("DROP_FUSION_MIN_SCORE", "0.58"))
 DROP_FUSION_SAMPLE_RATE = int(str(os.environ.get("DROP_FUSION_SAMPLE_RATE", "22050")).strip() or "22050")
 DROP_FUSION_PER_ROLE_LIMIT = int(str(os.environ.get("DROP_FUSION_PER_ROLE_LIMIT", "28")).strip() or "28")
 DROP_FUSION_CANDIDATE_LIMIT = int(str(os.environ.get("DROP_FUSION_CANDIDATE_LIMIT", "40")).strip() or "40")
+USE_VISUAL_FIRST_ALS_ANCHOR = str(os.environ.get("USE_VISUAL_FIRST_ALS_ANCHOR", "1")).strip().lower() not in {"0", "false", "no", "off"}
+VISUAL_FIRST_ALS_SAMPLE_RATE = int(str(os.environ.get("VISUAL_FIRST_ALS_SAMPLE_RATE", "44100")).strip() or "44100")
+VISUAL_FIRST_ALS_USE_CACHE = str(os.environ.get("VISUAL_FIRST_ALS_USE_CACHE", "1")).strip().lower() not in {"0", "false", "no", "off"}
+VISUAL_FIRST_ALS_AUDIT_BASENAME = "visual_first_als_anchor.json"
 ALS_BACKUP_BEFORE_WRITE = str(os.environ.get("ALS_BACKUP_BEFORE_WRITE", "1")).strip().lower() not in {"0", "false", "no", "off"}
 TRACK_ORGANIZER_PARALLEL = str(os.environ.get("TRACK_ORGANIZER_PARALLEL", "1")).strip().lower() not in {"0", "false", "no", "off"}
 try:
@@ -2861,6 +2871,23 @@ def _shift_anchor_map(anchor_map: Dict[str, float], delta_sec: float) -> Dict[st
         out[str(role)] = max(0.0, float(sec) + float(delta_sec))
     return out
 
+
+def _retarget_anchor_map(anchor_map: Dict[str, float],
+                         track_names: Dict[str, Optional[str]],
+                         drums_target_sec: float) -> Dict[str, float]:
+    """Move an existing role map from its current drums anchor exactly once."""
+    target = max(0.0, float(drums_target_sec))
+    current = _as_float(anchor_map.get("drums")) if anchor_map else None
+    if current is None and anchor_map:
+        for value in anchor_map.values():
+            current = _as_float(value)
+            if current is not None:
+                break
+    if current is not None:
+        return _shift_anchor_map(anchor_map, target - float(current))
+    return _uniform_anchor_map(track_names, target)
+
+
 def _phi_map_from_anchor_map(anchor_map: Dict[str, float], bpm: Optional[int]) -> Dict[str, float]:
     out: Dict[str, float] = {}
     if not bpm or bpm <= 0:
@@ -2991,6 +3018,67 @@ def _drop_fusion_json_default(value):
     except Exception:
         pass
     return str(value)
+
+
+def _detect_visual_first_als_anchor(drums_path: str, bpm: int) -> Dict[str, object]:
+    if not bool(USE_VISUAL_FIRST_ALS_ANCHOR):
+        return {"ok": False, "accepted": False, "reason": "visual_first_disabled"}
+    if build_visual_first_als_anchor is None:
+        return {"ok": False, "accepted": False, "reason": "visual_first_unavailable"}
+    if not drums_path or not os.path.exists(drums_path):
+        return {"ok": False, "accepted": False, "reason": "missing_drums_stem"}
+    try:
+        result = build_visual_first_als_anchor(
+            str(drums_path),
+            float(bpm),
+            sample_rate=int(VISUAL_FIRST_ALS_SAMPLE_RATE),
+            use_cache=bool(VISUAL_FIRST_ALS_USE_CACHE),
+        )
+    except Exception as exc:
+        return {
+            "ok": False,
+            "accepted": False,
+            "reason": "visual_first_anchor_failed",
+            "error": str(exc) or exc.__class__.__name__,
+        }
+    return dict(result) if isinstance(result, dict) else {
+        "ok": False,
+        "accepted": False,
+        "reason": "invalid_visual_first_result",
+    }
+
+
+def _write_visual_first_als_audit(target_folder: str,
+                                  anchor: Dict[str, object],
+                                  *,
+                                  output_als: str,
+                                  final_drop_sec: Optional[float],
+                                  role_anchor_map: Dict[str, float],
+                                  applied_to_als: bool) -> None:
+    if not anchor:
+        return
+    audit_path = os.path.join(target_folder, VISUAL_FIRST_ALS_AUDIT_BASENAME)
+    tmp_path = audit_path + ".tmp"
+    payload = dict(anchor)
+    payload.update(
+        {
+            "applied_to_als": bool(applied_to_als),
+            "output_als": str(output_als),
+            "final_drop_sec": float(final_drop_sec) if final_drop_sec is not None else None,
+            "role_anchor_map": {str(role): float(sec) for role, sec in role_anchor_map.items()},
+        }
+    )
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2, sort_keys=True, default=_drop_fusion_json_default)
+        os.replace(tmp_path, audit_path)
+    except Exception as exc:
+        try:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+        except Exception:
+            pass
+        print(f"[WARN] Could not write visual-first ALS audit {audit_path}: {exc}")
 
 
 def _detect_drop_with_fusion(target_folder: str,
@@ -3228,9 +3316,11 @@ def modify_als_file(input_path: Optional[str], target_folder: str, track_names: 
             except Exception as e:
                 print(f"[WARN] Could not create ALS backup for {output_als}: {e}")
 
-    # If a template is provided and it's not the same file, copy it; otherwise edit in place
+    # Resolve the template now, but do not overwrite/create CH1.als until a
+    # marker has passed the required evidence gates below.
+    pending_template_copy = None
     if input_path and os.path.abspath(input_path) != os.path.abspath(output_als):
-        shutil.copy(input_path, output_als)
+        pending_template_copy = input_path
     elif not os.path.exists(output_als):
         print(f"[WARN] No template for BPM {bpm_value} and no existing CH1.als at {target_folder}; skipping.")
         return
@@ -3260,6 +3350,10 @@ def modify_als_file(input_path: Optional[str], target_folder: str, track_names: 
     used_manual_anchor = False
     used_first_downbeat = False
     used_fusion_anchor = False
+    used_visual_first_anchor = False
+    visual_first_anchor_attempted = False
+    visual_first_rejection_reason = ""
+    visual_anchor: Dict[str, object] = {}
     role_anchor_map: Dict[str, float] = {}
     first_downbeat_drums_sec = None
     first_downbeat_conf = 0.0
@@ -3350,6 +3444,52 @@ def modify_als_file(input_path: Optional[str], target_folder: str, track_names: 
         drums_source_path = flac_path if os.path.exists(flac_path) else None
         new_loop_end = get_duration_in_beats(flac_path, bpm_value)
 
+    # The normal ALS path now uses the same visual-first contract as review:
+    # first prove the drop section and musical one independently, then bind it
+    # to the first bounded sample-level drums/body attack.  Legacy detectors
+    # remain evidence providers, but cannot silently become the saved anchor.
+    if (not use_rekordbox_cue_test) and bpm_value and bool(USE_VISUAL_FIRST_ALS_ANCHOR):
+        visual_first_anchor_attempted = True
+        visual_anchor = _detect_visual_first_als_anchor(str(drums_source_path or ""), int(bpm_value))
+        if bool(visual_anchor.get("ok")) and bool(visual_anchor.get("accepted")):
+            visual_sec = _as_float(visual_anchor.get("drop_sec"))
+            visual_conf = _as_float(visual_anchor.get("confidence"))
+            if visual_sec is not None:
+                drop_sec = float(visual_sec)
+                drop_conf = float(visual_conf or 0.0)
+                role_anchor_map = _retarget_anchor_map(role_anchor_map, track_names, float(drop_sec))
+                used_visual_first_anchor = True
+                drop_meta = dict(drop_meta or {})
+                drop_meta.update(
+                    {
+                        "visual_first_source": 1.0,
+                        "visual_first_grid_downbeat_sec": float(
+                            _as_float(visual_anchor.get("grid_downbeat_sec")) or float(drop_sec)
+                        ),
+                        "visual_first_impact_sample": int(visual_anchor.get("impact_sample") or 0),
+                        "visual_first_phase_translation_samples": int(
+                            visual_anchor.get("phase_translation_samples") or 0
+                        ),
+                    }
+                )
+                print(
+                    f"[VISUAL] Approved independent one/body anchor: {float(drop_sec):.6f}s "
+                    f"conf={float(drop_conf):.2f} "
+                    f"grid={float(_as_float(visual_anchor.get('grid_downbeat_sec')) or drop_sec):.6f}s"
+                )
+        if not used_visual_first_anchor:
+            visual_first_rejection_reason = str(visual_anchor.get("reason") or "visual_first_not_accepted")
+            detail = str(visual_anchor.get("attack_reason") or visual_anchor.get("strict_gui_issue") or "")
+            detail_txt = f" ({detail})" if detail else ""
+            print(
+                f"[VISUAL] No safe ALS anchor: {visual_first_rejection_reason}{detail_txt}; "
+                "leaving the track for manual review."
+            )
+            drop_sec = None
+            drop_conf = 0.0
+            role_anchor_map = {}
+            used_first_downbeat = False
+
     # Ground-truth lookup DB (built from manually-cued ALS projects).
     if (not use_rekordbox_cue_test) and bpm_value and drums_source_path:
         db_sec, db_conf, db_reason = _lookup_drop_from_db(drums_source_path, bpm_value)
@@ -3357,10 +3497,7 @@ def modify_als_file(input_path: Optional[str], target_folder: str, track_names: 
             drop_sec = float(db_sec)
             drop_conf = max(float(drop_conf), float(db_conf))
             used_db_anchor = True
-            if used_first_downbeat and first_downbeat_drums_sec is not None and role_anchor_map:
-                role_anchor_map = _shift_anchor_map(role_anchor_map, float(db_sec) - float(first_downbeat_drums_sec))
-            else:
-                role_anchor_map = _uniform_anchor_map(track_names, drop_sec)
+            role_anchor_map = _retarget_anchor_map(role_anchor_map, track_names, float(drop_sec))
             print(f"[WARP] Using drop DB anchor: {drop_sec:.3f}s ({db_reason})")
 
     # Manual override from Ableton project (if user set the correct 1.1.1 on the drums clip).
@@ -3370,16 +3507,22 @@ def modify_als_file(input_path: Optional[str], target_folder: str, track_names: 
             drop_sec = float(manual_sec)
             drop_conf = max(float(drop_conf), 0.99)
             used_manual_anchor = True
-            if used_first_downbeat and first_downbeat_drums_sec is not None and role_anchor_map:
-                role_anchor_map = _shift_anchor_map(role_anchor_map, float(manual_sec) - float(first_downbeat_drums_sec))
-            else:
-                role_anchor_map = _uniform_anchor_map(track_names, drop_sec)
+            role_anchor_map = _retarget_anchor_map(role_anchor_map, track_names, float(drop_sec))
             if drums_source_path:
                 if _upsert_drop_db_label(drums_source_path, float(manual_sec), bpm_value, source="manual_ch1_project"):
                     print("[WARP] Learned manual marker into drop DB.")
             print(f"[WARP] Using manual 1.1.1 from CH1 Project: {drop_sec:.3f}s")
 
-    if (not use_rekordbox_cue_test) and bpm_value:
+    if (
+        (not use_rekordbox_cue_test)
+        and bpm_value
+        and not (
+            visual_first_anchor_attempted
+            and not used_visual_first_anchor
+            and not used_db_anchor
+            and not used_manual_anchor
+        )
+    ):
         fusion_sec, fusion_conf, fusion_meta = _detect_drop_with_fusion(
             target_folder,
             track_names,
@@ -3392,6 +3535,8 @@ def modify_als_file(input_path: Optional[str], target_folder: str, track_names: 
                 print("[FUSION] Manual CH1 marker kept; fusion override of manual anchors is disabled.")
             elif used_db_anchor and not bool(DROP_FUSION_OVERRIDE_DB_ANCHOR):
                 print("[FUSION] Drop DB marker kept; fusion override of DB anchors is disabled.")
+            elif used_visual_first_anchor and not bool(DROP_FUSION_OVERRIDE_VISUAL_FIRST_ANCHOR):
+                print("[FUSION] Visual-first one/body anchor kept; fusion override is disabled.")
             else:
                 previous_drop_sec = _as_float(drop_sec)
                 drop_sec = float(fusion_sec)
@@ -3412,7 +3557,7 @@ def modify_als_file(input_path: Optional[str], target_folder: str, track_names: 
 
     # Self-learning model on unseen tracks:
     # 1) waveform signature shift (preferred), 2) detector-feature kNN fallback.
-    if (not use_rekordbox_cue_test) and bpm_value and drop_sec is not None and (not used_db_anchor) and (not used_manual_anchor) and (not used_first_downbeat) and (not used_fusion_anchor):
+    if (not use_rekordbox_cue_test) and bpm_value and drop_sec is not None and (not used_db_anchor) and (not used_manual_anchor) and (not used_first_downbeat) and (not used_fusion_anchor) and (not used_visual_first_anchor):
         if float(_as_float(drop_meta.get("alsdrop_source")) or 0.0) >= 0.5:
             pass
         else:
@@ -3445,7 +3590,7 @@ def modify_als_file(input_path: Optional[str], target_folder: str, track_names: 
                             drop_conf = max(float(drop_conf), min(0.95, 0.55 + (0.35 * float(ml_conf))))
 
     if (not use_rekordbox_cue_test) and bpm_value and drop_sec is not None:
-        if bool(DROP_STAGE2_ENABLE) and (not used_first_downbeat) and (not used_fusion_anchor):
+        if bool(DROP_STAGE2_ENABLE) and (not used_first_downbeat) and (not used_fusion_anchor) and (not used_visual_first_anchor):
             allow_db = bool(DROP_STAGE2_APPLY_ON_DB_ANCHOR)
             allow_manual = bool(DROP_STAGE2_APPLY_ON_MANUAL_ANCHOR)
             blocked = (used_db_anchor and (not allow_db)) or (used_manual_anchor and (not allow_manual))
@@ -3476,6 +3621,28 @@ def modify_als_file(input_path: Optional[str], target_folder: str, track_names: 
 
     if (not role_anchor_map) and drop_sec is not None:
         role_anchor_map = _uniform_anchor_map(track_names, drop_sec)
+
+    if (
+        visual_first_anchor_attempted
+        and not used_visual_first_anchor
+        and not used_db_anchor
+        and not used_manual_anchor
+    ):
+        _write_visual_first_als_audit(
+            target_folder,
+            visual_anchor,
+            output_als=output_als,
+            final_drop_sec=None,
+            role_anchor_map={},
+            applied_to_als=False,
+        )
+        print(
+            f"[VISUAL] ALS write skipped: {visual_first_rejection_reason or 'visual contract not passed'}."
+        )
+        return
+
+    if pending_template_copy:
+        shutil.copy(pending_template_copy, output_als)
 
     # Read + parse
     with gzip.open(output_als, "rb") as f:
@@ -3569,6 +3736,20 @@ def modify_als_file(input_path: Optional[str], target_folder: str, track_names: 
 
     with gzip.open(output_als, "wb") as f_out:
         f_out.write(als_str.encode("utf-8"))
+    if visual_anchor:
+        _write_visual_first_als_audit(
+            target_folder,
+            visual_anchor,
+            output_als=output_als,
+            final_drop_sec=_as_float(drop_sec),
+            role_anchor_map=role_anchor_map,
+            applied_to_als=bool(
+                used_visual_first_anchor
+                and not used_db_anchor
+                and not used_manual_anchor
+                and not used_fusion_anchor
+            ),
+        )
     print(f"✅ ALS saved: {output_als}")
 
 # ========= MOVES =========

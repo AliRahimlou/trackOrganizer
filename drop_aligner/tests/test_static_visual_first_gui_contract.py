@@ -10,7 +10,7 @@ def test_visual_first_gui_uses_server_boom_masks_for_clicks_and_drawing() -> Non
     source = APP_JS.read_text(encoding="utf-8")
 
     assert "function serverBoomSeries" in source
-    assert "boom-bars-v17-mask-segment-render" in source
+    assert "boom-bars-v18-vector-export" in source
     assert "const BOOM_PLACE_EDGE_GRACE_SECONDS = 0.080;" in source
     assert "function boomFrontEdgeWindowOk" in source
     assert "server_boom_mask_not_placeable" in source
@@ -35,6 +35,30 @@ def test_visual_first_gui_uses_server_boom_masks_for_clicks_and_drawing() -> Non
     assert "return \"no_boom_front_edge\"" in source
     assert "NO BOOM EDGE" in source
     assert "Waiting for the current Boom mask before placing 1.1.1." in source
+
+
+def test_visual_first_gui_exposes_vector_waveform_export() -> None:
+    source = APP_JS.read_text(encoding="utf-8")
+    index = (APP_JS.parents[1] / "static" / "index.html").read_text(encoding="utf-8")
+
+    assert "function exportSvg()" in source
+    assert "/media/waveform_svg" in source
+    assert "exportSvgBtn" in source
+    assert "Export SVG" in index
+
+
+def test_visual_first_gui_beat_clock_uses_authoritative_feature_grid_phase() -> None:
+    source = APP_JS.read_text(encoding="utf-8")
+    clock_source = source[
+        source.index("function drawBpmClock") : source.index("function stemStroke")
+    ]
+
+    assert "currentItem?.feature_map?.beatgrid || currentItem?.beatgrid" in source
+    assert "const barZero = barZeroSeconds();" in clock_source
+    assert "Math.floor((viewportStart - barZero) / beatSeconds)" in clock_source
+    assert "Math.ceil((viewportEnd - barZero) / beatSeconds)" in clock_source
+    assert "const time = barZero + beat * beatSeconds;" in clock_source
+    assert "const time = beat * beatSeconds;" not in clock_source
 
 
 def test_visual_first_gui_masks_deep_sample_inspection_to_boom_regions() -> None:

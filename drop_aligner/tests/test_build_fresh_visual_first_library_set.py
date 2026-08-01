@@ -219,6 +219,13 @@ def test_existing_fresh_row_reuses_only_production_gated_payload(tmp_path, monke
             {
                 "final_ai_pick": 32.0,
                 "drop_sec": 32.0,
+                "visual_marker_sec": 31.995,
+                "als_anchor": {
+                    "ok": True,
+                    "accepted": True,
+                    "drop_sec": 32.0,
+                    "sample_rate": 44100,
+                },
                 "selected_by": "visual_boom_grid_one_snap",
                 "visual_audit": {"status": "pass", "flag_codes": []},
                 "boom_proof": _fresh_boom_proof(32.0),
@@ -244,6 +251,8 @@ def test_existing_fresh_row_reuses_only_production_gated_payload(tmp_path, monke
 
     assert row is not None
     assert row["marker"] == 32.0
+    assert row["visual_marker"] == 31.995
+    assert row["als_anchor"]["accepted"] is True
     assert row["selected_by"] == "visual_boom_grid_one_snap"
     assert row["boom_proof"]["passes"] is True
     assert row["gui_mask_proof"]["passes"] is True
@@ -343,6 +352,17 @@ def test_process_track_holds_unproven_marker_before_writing_als(tmp_path, monkey
     )
     monkeypatch.setattr(fresh_build, "_write_visual_candidate_json", lambda *args, **kwargs: calls.append("json"))
     monkeypatch.setattr(fresh_build, "modify_als", lambda *args, **kwargs: calls.append("als"))
+    monkeypatch.setattr(
+        fresh_build,
+        "build_visual_first_als_anchor",
+        lambda *args, **kwargs: {
+            "ok": True,
+            "accepted": True,
+            "reason": "visual_grid_one_with_bounded_drum_attack",
+            "drop_sec": 32.01,
+            "impact_sec": 32.01,
+        },
+    )
 
     row = fresh_build._process_track(
         {
@@ -361,7 +381,10 @@ def test_process_track_holds_unproven_marker_before_writing_als(tmp_path, monkey
     assert "boom_proof=hold" in row["error"]
     assert row["selected_by"] == "visual_boom_grid_one_snap"
     assert row["marker"] == 32.0
-    assert calls == []
+    assert row["als_anchor"]["accepted"] is False
+    assert row["als_anchor"]["reason"] == "visual_production_gate_hold"
+    assert row["als_anchor"]["stage_b_attack_accepted"] is True
+    assert calls == ["json"]
 
 
 def test_process_track_holds_non_placeable_gui_mask_before_writing_als(tmp_path, monkeypatch) -> None:
@@ -420,7 +443,7 @@ def test_process_track_holds_non_placeable_gui_mask_before_writing_als(tmp_path,
     assert row["status"] == "hold"
     assert "gui_mask=hold" in row["error"]
     assert row["gui_mask_proof"]["passes"] is False
-    assert calls == []
+    assert calls == ["json"]
 
 
 def test_validated_human_override_rewrites_processed_row(tmp_path, monkeypatch) -> None:
@@ -576,11 +599,109 @@ def test_write_visual_candidate_json_persists_gui_mask_proof(tmp_path: Path) -> 
         },
         track=track,
         output_als=output,
+        als_anchor={
+            "ok": True,
+            "accepted": True,
+            "drop_sec": 32.012,
+            "impact_sec": 32.012,
+            "visual_marker_sec": 32.0,
+            "sample_rate": 44100,
+        },
     )
 
     payload = json.loads(candidates.read_text(encoding="utf-8"))
     assert payload["gui_mask_proof"]["passes"] is True
     assert payload["selected_candidate"]["gui_mask_proof"]["passes"] is True
+    assert payload["visual_marker_sec"] == 32.0
+    assert payload["als_anchor"]["impact_sec"] == 32.012
+    assert payload["marker_contract"]["boom_body_crest"] == "post_attack_diagnostic_only"
+
+
+def test_process_track_writes_bounded_anchor_impact_not_visual_stage_a(tmp_path, monkeypatch) -> None:
+    track = _track(tmp_path)
+    drums = Path(track["src"]).with_name("drums_128_1A_7-Artist - Track.flac")
+    drums.write_text("audio placeholder", encoding="utf-8")
+    anchor_calls = []
+    als_calls = []
+
+    monkeypatch.setattr(fresh_build, "_find_role_audio", lambda folder, role, track_arg: drums if role == "drums" else None)
+    monkeypatch.setattr(
+        fresh_build,
+        "drums_stem_signal_stats",
+        lambda *_args, **_kwargs: {"peak_abs": 0.5, "window_rms_p99": 0.25},
+    )
+    monkeypatch.setattr(fresh_build, "is_near_empty_drums_stem", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(
+        fresh_build,
+        "visual_first_marker",
+        lambda *args, **kwargs: {
+            "ok": True,
+            "marker": 32.0,
+            "selected_candidate": {
+                "timestamp": 32.0,
+                "selected_by": "visual_boom_grid_one_snap",
+            },
+            "visual_audit": {"status": "pass", "flag_codes": []},
+            "boom_proof": _fresh_boom_proof(32.0),
+            "gui_mask_proof": _fresh_gui_mask_proof(),
+            "feature_map": {"beatgrid": {"bpm": 128.0, "bar_zero_sec": 0.0}},
+        },
+    )
+    monkeypatch.setattr(fresh_build, "visual_gui_mask_proof", lambda *args, **kwargs: _fresh_gui_mask_proof())
+
+    def fake_anchor(audio_path, bpm, **kwargs):
+        anchor_calls.append((audio_path, bpm, kwargs))
+        return {
+            "ok": True,
+            "accepted": True,
+            "drop_sec": 32.012,
+            "impact_sec": 32.012,
+            "impact_sample": 1411729,
+            "visual_marker_sec": 32.0,
+            "grid_downbeat_sec": 32.0,
+            "sample_rate": 44100,
+            "attack": {"zero_crossing_time_sec": 32.0121, "alternate_candidates": []},
+        }
+
+    monkeypatch.setattr(fresh_build, "build_visual_first_als_anchor", fake_anchor)
+    monkeypatch.setattr(fresh_build, "modify_als", lambda **kwargs: als_calls.append(kwargs))
+    monkeypatch.setattr(
+        fresh_build,
+        "_verify_anchor",
+        lambda *args, **kwargs: {
+            "valid": True,
+            "drop_marker_time": 32.012,
+            "drop_marker_count": 1,
+            "errors": [],
+        },
+    )
+
+    row = fresh_build._process_track(
+        {
+            "track": track,
+            "template": str(tmp_path / "template.als"),
+            "run_stamp": "impact_test",
+            "sample_rate": 44100,
+            "use_cache": True,
+            "strict_stems": False,
+            "force": True,
+            "dry_run": False,
+            "waveform_cache_dir": str(tmp_path / "cache"),
+        }
+    )
+
+    payload = json.loads(Path(row["candidates_json"]).read_text(encoding="utf-8"))
+    assert row["status"] == "processed"
+    assert row["visual_marker"] == 32.0
+    assert row["marker"] == 32.012
+    assert row["als_anchor"]["impact_sample"] == 1411729
+    assert anchor_calls[0][2]["visual_result"]["marker"] == 32.0
+    assert als_calls[0]["drop_sec"] == 32.012
+    assert payload["final_ai_pick"] == 32.012
+    assert payload["visual_marker_sec"] == 32.0
+    assert payload["visual_selected_candidate"]["timestamp"] == 32.0
+    assert payload["selected_candidate"]["timestamp"] == 32.012
+    assert payload["als_anchor"]["impact_sample"] == 1411729
 
 
 def test_run_holds_reused_report_with_incomplete_library_coverage(tmp_path, monkeypatch) -> None:

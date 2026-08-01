@@ -267,6 +267,22 @@ def test_marker_boom_proof_accepts_front_edge_marker() -> None:
     assert proof["passes"]
 
 
+def test_marker_boom_proof_cannot_erase_authoritative_grid_failure() -> None:
+    candidate = _boom_candidate(32.144)
+    candidate["bpm_clock"].update({"clock_zero_sec": 0.144, "on_one": True})
+    candidate["visual_components"]["one_distance_ms"] = 0.0
+
+    proof = marker_boom_proof(
+        32.144,
+        [candidate],
+        selected_candidate=candidate,
+        beatgrid={"bpm": 150.0, "bar_sec": 1.6, "bar_zero_sec": 0.0},
+    )
+
+    assert proof["passes"] is False
+    assert any("authoritative beatgrid" in reason for reason in proof["reasons"])
+
+
 def test_boom_proof_front_edge_freshness_rejects_stale_pass_payload() -> None:
     freshness = boom_proof_front_edge_freshness(
         {
@@ -309,7 +325,7 @@ def test_marker_boom_proof_rejects_marker_before_body_front_edge() -> None:
     assert any("before boom front edge" in reason for reason in proof["reasons"])
 
 
-def test_boom_front_edge_correction_moves_off_one_marker_before_body_edge() -> None:
+def test_boom_front_edge_correction_rejects_body_edge_off_authoritative_one() -> None:
     candidate = _boom_candidate(time_sec=27.47367832167832, clock_bar=17)
     selected = _boom_candidate(time_sec=26.85278911564626, score=0.70, clock_bar=17)
     selected["bpm_clock"] = {
@@ -342,9 +358,7 @@ def test_boom_front_edge_correction_moves_off_one_marker_before_body_edge() -> N
         beatgrid={"bpm": 143.0, "bar_sec": 240.0 / 143.0, "bar_zero_sec": 0.0},
     )
 
-    assert correction is not None
-    assert correction["marker"] == candidate["timestamp"]
-    assert correction["direction"] == "before_body_front_edge"
+    assert correction is None
 
 
 def test_boom_front_edge_correction_moves_small_pre_edge_blank_marker() -> None:
@@ -451,7 +465,7 @@ def test_marker_boom_proof_does_not_let_prephrase_intro_disqualify_phrase_drop()
     assert not any("earlier_dominant_boom_available" in reason for reason in proof["reasons"])
 
 
-def test_earliest_dominant_replacement_allows_fast_off_one_repeated_body() -> None:
+def test_earliest_dominant_replacement_rejects_fast_off_one_repeated_body() -> None:
     early = _boom_candidate(time_sec=29.340, score=0.64, clock_bar=16)
     later = _boom_candidate(time_sec=104.931, score=0.68, clock_bar=56)
     selected = _boom_candidate(time_sec=105.949, score=0.68, clock_bar=57)
@@ -515,9 +529,7 @@ def test_earliest_dominant_replacement_allows_fast_off_one_repeated_body() -> No
         beatgrid={"bpm": 127.0, "bar_sec": 240.0 / 127.0, "bar_zero_sec": 0.0},
     )
 
-    assert replacement is not None
-    assert replacement["marker"] == early["timestamp"]
-    assert replacement["direction"] == "earlier_dominant_boom"
+    assert replacement is None
 
 
 def test_marker_boom_proof_does_not_treat_file_start_as_earlier_dominant_drop() -> None:

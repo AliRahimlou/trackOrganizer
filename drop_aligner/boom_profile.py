@@ -229,23 +229,12 @@ def candidate_has_gui_proven_boom_body(candidate: Mapping[str, Any]) -> bool:
 
 
 def _grid_phase_neutralized_candidate(candidate: Mapping[str, Any], marker: float) -> Dict[str, Any]:
+    """Compatibility seam that preserves the independent grid unchanged."""
     out = dict(candidate)
     visual = dict(visual_components(out))
-    visual["one_distance_ms"] = 0.0
-    visual["gui_front_edge_grid_phase_neutralized"] = True
+    visual["visual_body_proof_only"] = True
+    visual["grid_phase_neutralization_rejected"] = True
     out["visual_components"] = visual
-    clock = out.get("bpm_clock") if isinstance(out.get("bpm_clock"), Mapping) else {}
-    if clock:
-        out["bpm_clock"] = {
-            **dict(clock),
-            "nearest_one_time": float(marker),
-            "one_distance_sec": 0.0,
-            "one_distance_ms": 0.0,
-            "distance_sec": 0.0,
-            "distance_ms": 0.0,
-            "on_one": True,
-            "on_one_score": 1.0,
-        }
     return out
 
 
@@ -608,6 +597,16 @@ def marker_boom_proof(
                 999999.0,
             )
         )
+        authoritative_zero = (
+            finite_float(beatgrid.get("bar_zero_sec"), float("nan"))
+            if isinstance(beatgrid, Mapping)
+            else float("nan")
+        )
+        if math.isfinite(authoritative_zero):
+            selected_one_distance = max(
+                float(selected_one_distance),
+                _one_distance_ms_from_marker(float(marker), selected_candidate, beatgrid),
+            )
         max_selected_one_distance = finite_float(
             thresholds.get("max_one_distance_ms"),
             finite_float(DEFAULT_PROFILE["thresholds"]["max_one_distance_ms"]),
@@ -621,7 +620,7 @@ def marker_boom_proof(
         if (
             selected_time is not None
             and abs(float(selected_time) - float(marker)) <= 0.250
-            and (selected_one_distance <= max_selected_one_distance or selected_gui_body)
+            and selected_one_distance <= max_selected_one_distance
             and selected_visual
             and (
                 selected_gui_body
@@ -633,11 +632,7 @@ def marker_boom_proof(
                 )
             )
         ):
-            selected_copy = (
-                _grid_phase_neutralized_candidate(selected_candidate, float(marker))
-                if selected_gui_body and selected_one_distance > max_selected_one_distance
-                else dict(selected_candidate)
-            )
+            selected_copy = dict(selected_candidate)
             selected_copy["__selected_marker_candidate"] = True
             candidates.append(selected_copy)
     if not candidates and isinstance(selected_candidate, Mapping):
@@ -730,6 +725,30 @@ def marker_boom_proof(
         reasons.append(f"marker {abs(nearest['offset_sec']):.3f}s before boom front edge")
     if not bool(nearest["profile"].get("passes_profile")):
         reasons.extend(str(reason) for reason in nearest["profile"].get("reasons") or [])
+    if isinstance(beatgrid, Mapping):
+        authoritative_zero = finite_float(beatgrid.get("bar_zero_sec"), default=float("nan"))
+        if math.isfinite(authoritative_zero):
+            distance_candidate = (
+                selected_candidate
+                if isinstance(selected_candidate, Mapping)
+                else nearest.get("candidate")
+                if isinstance(nearest.get("candidate"), Mapping)
+                else {}
+            )
+            independent_one_distance = _one_distance_ms_from_marker(
+                float(marker),
+                distance_candidate,
+                beatgrid,
+            )
+            independent_max_one = finite_float(
+                thresholds.get("max_one_distance_ms"),
+                finite_float(DEFAULT_PROFILE["thresholds"]["max_one_distance_ms"]),
+            )
+            if independent_one_distance > independent_max_one:
+                reasons.append(
+                    f"one_distance_ms {independent_one_distance:.1f} above {independent_max_one:.1f} "
+                    "on authoritative beatgrid"
+                )
 
     def earlier_row_is_same_coarse_section(row: Mapping[str, Any]) -> bool:
         return bool(

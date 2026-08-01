@@ -32,3 +32,12 @@ def test_oracles_video_manual_launch_point_regression() -> None:
     assert selected["gui_mask_proof"]["passes"] is True
     assert selected["bpm_clock"]["on_one"] is True
     assert abs(float(selected["bpm_clock"]["one_distance_ms"])) <= 1.0
+    assert selected["bpm_clock"]["clock_zero_sec"] == pytest.approx(
+        result["feature_map"]["beatgrid"]["bar_zero_sec"],
+        abs=1e-9,
+    )
+    assert selected["bpm_clock"].get("source") not in {
+        "gui_boom_front_edge_calibrated_grid",
+        "visual_boom_grid_phase_calibration",
+        "visual_boom_phase_calibrated",
+    }

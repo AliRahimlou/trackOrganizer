@@ -326,6 +326,28 @@ def test_export_png_uses_boom_masks_so_quiet_regions_do_not_render_dark(tmp_path
     assert _dark_pixel_count(drop_png) > 100
 
 
+def test_export_svg_is_vector_and_uses_boom_masks(tmp_path: Path) -> None:
+    sr = 16000
+    t = np.arange(sr, dtype=np.float32) / sr
+    quiet_intro_hit = 0.08 * np.sin(2 * np.pi * 80 * t).astype(np.float32)
+    hard_drop = 0.75 * np.sin(2 * np.pi * 80 * t).astype(np.float32)
+    audio = np.zeros(sr * 10, dtype=np.float32)
+    audio[sr : sr * 2] = quiet_intro_hit
+    audio[sr * 6 : sr * 7] = hard_drop
+    path = tmp_path / "quiet_then_drop_svg.wav"
+    _write_wav(path, audio, sr=sr)
+    cache = WaveformCache(tmp_path / "cache")
+
+    quiet_svg = cache.render_svg(str(path), start_sec=0.0, end_sec=2.5, width=1200, height=260).decode("utf-8")
+    drop_svg = cache.render_svg(str(path), start_sec=5.5, end_sec=7.5, width=1200, height=260).decode("utf-8")
+
+    assert quiet_svg.startswith("<?xml")
+    assert "<svg " in drop_svg
+    assert 'vector-effect="non-scaling-stroke"' in drop_svg
+    assert 'class="waveform-bar' not in quiet_svg
+    assert 'class="waveform-bar' in drop_svg
+
+
 def test_export_png_treats_all_false_server_boom_masks_as_authoritative(tmp_path: Path) -> None:
     cache = WaveformCache(tmp_path / "cache")
     rms = [0.9] * 360
@@ -353,6 +375,68 @@ def test_export_png_treats_all_false_server_boom_masks_as_authoritative(tmp_path
     png = cache.render_png("fake.wav", start_sec=0.0, end_sec=3.0, width=420, height=220)
 
     assert _dark_pixel_count(png) == 0
+
+
+def test_export_svg_treats_all_false_server_boom_masks_as_authoritative(tmp_path: Path) -> None:
+    cache = WaveformCache(tmp_path / "cache")
+    rms = [0.9] * 360
+    tile = {
+        "ok": True,
+        "mode": "peaks",
+        "start_sec": 0.0,
+        "end_sec": 3.0,
+        "width": len(rms),
+        "sample_rate": 16000,
+        "duration": 3.0,
+        "amplitude_peak": 1.0,
+        "rms": rms,
+        "boom_body_density": [1.0] * len(rms),
+        "boom_body_mask": [False] * len(rms),
+        "boom_relevant_mask": [False] * len(rms),
+        "boom_placeable_mask": [False] * len(rms),
+        "boom_placeable_count": 0,
+    }
+
+    def fake_tile(*_args, **_kwargs):
+        return tile
+
+    cache.tile = fake_tile  # type: ignore[method-assign]
+    svg = cache.render_svg("fake.wav", start_sec=0.0, end_sec=3.0, width=1200, height=260).decode("utf-8")
+
+    assert 'class="waveform-bar' not in svg
+
+
+def test_export_svg_draws_masked_raw_samples_when_deep_zoomed(tmp_path: Path) -> None:
+    cache = WaveformCache(tmp_path / "cache")
+    samples = [0.0, 0.6, -0.7, 0.4, -0.2, 0.0]
+    rms = [0.8] * len(samples)
+    tile = {
+        "ok": True,
+        "mode": "samples",
+        "start_sec": 0.0,
+        "end_sec": 0.006,
+        "start_sample": 0,
+        "sample_start": 0,
+        "width": len(samples),
+        "sample_rate": 1000,
+        "duration": 0.006,
+        "amplitude_peak": 0.7,
+        "samples": samples,
+        "rms": rms,
+        "boom_body_density": [1.0] * len(rms),
+        "boom_body_mask": [True] * len(rms),
+        "boom_relevant_mask": [True] * len(rms),
+        "boom_placeable_mask": [False, True, True, False, False, False],
+        "boom_placeable_count": 2,
+    }
+
+    def fake_tile(*_args, **_kwargs):
+        return tile
+
+    cache.tile = fake_tile  # type: ignore[method-assign]
+    svg = cache.render_svg("fake.wav", start_sec=0.0, end_sec=0.006, width=1200, height=260).decode("utf-8")
+
+    assert 'class="waveform-samples"' in svg
 
 
 def test_export_png_uses_relevant_mask_not_body_mask_for_dark_regions(tmp_path: Path) -> None:

@@ -7,7 +7,7 @@
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-title" content="Drop Review" />
     <title>Drop Aligner Review</title>
-  <link rel="stylesheet" href="/static/style.css?v=visual-boom-gated-20260622b" />
+  <link rel="stylesheet" href="/static/style.css?v=visual-boom-gated-20260628-vector" />
   </head>
   <body>
     <main class="app">
@@ -56,6 +56,7 @@
           <button class="secondary presetBtn" data-preset="1ms">+-1ms</button>
           <button id="jumpAiBtn" class="secondary">Jump to blue</button>
           <button id="exportPngBtn" class="secondary">Export PNG</button>
+          <button id="exportSvgBtn" class="secondary">Export SVG</button>
           <span id="audioStatus" class="muted"></span>
           <span id="playStatus" class="muted"></span>
         </div>
@@ -112,6 +113,38 @@
             <div class="metric stacked">
               <span>Beatgrid</span>
               <strong id="structureBeatgrid">--</strong>
+            </div>
+            <div class="metric stacked">
+              <span>ALS anchor status</span>
+              <strong id="alsAnchorStatus" class="anchorStatus">--</strong>
+            </div>
+            <div class="metric stacked">
+              <span>Independent grid ONE</span>
+              <strong id="gridOneMarker">none</strong>
+            </div>
+            <div class="metric stacked">
+              <span>Visual body entry</span>
+              <strong id="visualDropMarker">none</strong>
+            </div>
+            <div class="metric stacked">
+              <span>Exact ALS impact (blue)</span>
+              <strong id="alsImpactMarker">none</strong>
+            </div>
+            <div class="metric">
+              <span>Grid → impact</span>
+              <strong id="phaseTranslation">--</strong>
+            </div>
+            <div class="metric stacked">
+              <span>Zero crossing (diagnostic)</span>
+              <strong id="diagnosticZeroMarker">none</strong>
+            </div>
+            <div class="metric stacked">
+              <span>Boom body crest (diagnostic)</span>
+              <strong id="boomCrestMarker">none</strong>
+            </div>
+            <div class="metric stacked">
+              <span>Alternate attacks (diagnostic)</span>
+              <strong id="alternateAttackMarkers">none</strong>
             </div>
             <div class="metric">
               <span>First drop</span>
@@ -200,6 +233,6 @@
         </details>
       </aside>
     </main>
-    <script src="/static/app.js?v=visual-boom-gated-20260622b"></script>
+    <script src="/static/app.js?v=visual-boom-gated-20260628-vector"></script>
   </body>
 </html>

@@ -45,6 +45,7 @@ _reexec_with_local_venv()
 from lxml import etree
 
 from drop_aligner.als import modify_als
+from drop_aligner.als_anchor import build_visual_first_als_anchor
 from drop_aligner.candidate_chooser import choose_learned_candidate, load_candidate_chooser_payload, predict_candidate_errors
 from drop_aligner.exclusions import EXCLUDED_DIR_NAMES, row_has_excluded_path
 from drop_aligner.historical_markers import HistoricalMarker, is_human_review_source, load_historical_markers
@@ -94,6 +95,145 @@ VISUAL_SAVE_MAX_ONE_DISTANCE_MS = 90.0
 VISUAL_SAVE_GUI_MASK_VIEW_SEC = 6.0
 VISUAL_SAVE_GUI_MASK_WIDTH = 1200
 VISUAL_SAVE_GUI_MASK_RADIUS_BINS = 2
+
+
+def _drop_point_contract(
+    anchor: Mapping[str, Any],
+    *,
+    visual_marker_sec: Optional[float] = None,
+    visual_selected_by: str = "",
+    beatgrid: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Normalize the distinct DJ marker points for the review client.
+
+    The musical one, visible drop edge, and ALS impact are intentionally kept
+    separate.  Zero crossings, alternates, and body crests are diagnostics and
+    must never silently replace the accepted ALS impact.
+    """
+
+    raw = dict(anchor) if isinstance(anchor, Mapping) else {}
+    attack = raw.get("attack") if isinstance(raw.get("attack"), Mapping) else {}
+    accepted = bool(raw.get("ok") and raw.get("accepted"))
+    sample_rate = _float_or_none(raw.get("sample_rate")) or _float_or_none(attack.get("sample_rate"))
+
+    def point(time_value: Any, sample_value: Any, *, source: str, diagnostic_only: bool = False) -> Optional[Dict[str, Any]]:
+        time_sec = _float_or_none(time_value)
+        if time_sec is None:
+            return None
+        sample: Optional[int]
+        try:
+            sample = int(sample_value) if sample_value is not None else None
+        except (TypeError, ValueError):
+            sample = None
+        return {
+            "time_sec": float(time_sec),
+            "sample": sample,
+            "source": str(source),
+            "diagnostic_only": bool(diagnostic_only),
+        }
+
+    visual_time = _float_or_none(raw.get("visual_marker_sec"))
+    if visual_time is None:
+        visual_time = _float_or_none(visual_marker_sec)
+    grid_downbeat_sec = _float_or_none(raw.get("grid_downbeat_sec"))
+    if grid_downbeat_sec is None and visual_time is not None and isinstance(beatgrid, Mapping):
+        grid_bpm = _float_or_none(beatgrid.get("bpm"))
+        grid_zero = _float_or_none(beatgrid.get("bar_zero_sec"))
+        if grid_bpm and grid_zero is not None:
+            bar_sec = 240.0 / float(grid_bpm)
+            bar_index = round((float(visual_time) - float(grid_zero)) / bar_sec)
+            grid_downbeat_sec = float(grid_zero) + float(bar_index) * bar_sec
+    musical_one = point(
+        grid_downbeat_sec,
+        raw.get("grid_downbeat_sample"),
+        source="independent_beatgrid",
+    )
+    visual_marker = point(
+        visual_time,
+        None,
+        source=visual_selected_by or str(raw.get("selected_by") or "visual_drop_edge"),
+        diagnostic_only=True,
+    )
+    als_impact = point(
+        raw.get("impact_sec") if accepted else None,
+        raw.get("impact_sample"),
+        source=str(raw.get("source") or "visual_first_bounded_attack_v1"),
+    )
+    zero_crossing = point(
+        attack.get("zero_crossing_time_sec"),
+        attack.get("zero_crossing_sample"),
+        source="nearest_zero_crossing",
+        diagnostic_only=True,
+    )
+
+    crest_time = None
+    crest_sample = None
+    crest_payload = (
+        raw.get("boom_body_crest")
+        if isinstance(raw.get("boom_body_crest"), Mapping)
+        else attack.get("boom_body_crest")
+        if isinstance(attack.get("boom_body_crest"), Mapping)
+        else {}
+    )
+    if crest_payload and bool(crest_payload.get("ok")):
+        crest_time = _float_or_none(crest_payload.get("crest_time_sec"))
+        crest_sample = crest_payload.get("crest_sample")
+    if crest_time is None:
+        for prefix in ("body_crest", "body_peak", "boom_body_crest", "impact_crest"):
+            crest_time = _float_or_none(attack.get(f"{prefix}_time_sec"))
+            if crest_time is not None:
+                crest_sample = attack.get(f"{prefix}_sample")
+                break
+    body_crest = point(
+        crest_time,
+        crest_sample,
+        source="boom_body_envelope_crest",
+        diagnostic_only=True,
+    )
+
+    alternates: List[Dict[str, Any]] = []
+    for row in attack.get("alternate_candidates") or []:
+        if not isinstance(row, Mapping):
+            continue
+        alternate = point(
+            row.get("time_sec"),
+            row.get("sample"),
+            source="bounded_attack_alternate",
+            diagnostic_only=True,
+        )
+        if alternate is None:
+            continue
+        confidence = _float_or_none(row.get("confidence"))
+        if confidence is not None:
+            alternate["confidence"] = float(confidence)
+        alternates.append(alternate)
+
+    phase_samples = raw.get("phase_translation_samples")
+    try:
+        phase_samples = int(phase_samples) if phase_samples is not None else None
+    except (TypeError, ValueError):
+        phase_samples = None
+    phase_ms = _float_or_none(raw.get("impact_delta_ms"))
+    if phase_ms is None and phase_samples is not None and sample_rate:
+        phase_ms = float(phase_samples) * 1000.0 / float(sample_rate)
+
+    return {
+        "schema_version": 1,
+        "status": "accepted" if accepted else "rejected",
+        "reason": str(raw.get("reason") or ""),
+        "sample_rate": int(sample_rate) if sample_rate else None,
+        "musical_one": musical_one,
+        "visual_marker": visual_marker,
+        "als_impact": als_impact,
+        "zero_crossing": zero_crossing,
+        "body_crest": body_crest,
+        "body_crest_evidence": dict(crest_payload) if isinstance(crest_payload, Mapping) else {},
+        "phase_translation": {
+            "samples": phase_samples,
+            "milliseconds": float(phase_ms) if phase_ms is not None else None,
+        },
+        "alternate_attacks": alternates,
+    }
 
 
 def _float_or_none(value: Any) -> Optional[float]:
@@ -3076,12 +3216,27 @@ class ReviewApp:
                     continue
                 ai_pick = _float_or_none(row.get("detected_drop_time"))
                 payload = _read_json(row.get("candidates_json", ""))
+                persisted_anchor = (
+                    payload.get("als_anchor")
+                    if isinstance(payload.get("als_anchor"), Mapping)
+                    else payload.get("visual_first_als_anchor")
+                    if isinstance(payload.get("visual_first_als_anchor"), Mapping)
+                    else {}
+                )
                 if ai_pick is None:
                     ai_pick = _float_or_none(payload.get("final_ai_pick"))
-                if ai_pick is None:
+                if ai_pick is None and persisted_anchor:
+                    ai_pick = _float_or_none(persisted_anchor.get("drop_sec"))
+                if ai_pick is None and not self.visual_first:
                     continue
 
                 feature_summary = payload.get("feature_summary") if isinstance(payload.get("feature_summary"), Mapping) else {}
+                feature_map = payload.get("feature_map") if isinstance(payload.get("feature_map"), Mapping) else {}
+                feature_beatgrid = (
+                    feature_map.get("beatgrid")
+                    if isinstance(feature_map.get("beatgrid"), Mapping)
+                    else {}
+                )
                 tier = _normalize_tier(row.get("confidence_tier") or payload.get("confidence_tier") or feature_summary.get("confidence_tier"))
                 if self.review_low_only and tier != "LOW":
                     continue
@@ -3102,9 +3257,9 @@ class ReviewApp:
                     or _float_or_none(feature_summary.get("bpm"))
                     or 128.0
                 )
-                if not selected_candidate:
+                if not selected_candidate and ai_pick is not None:
                     selected_candidate = _synthetic_visual_candidate(float(ai_pick), row, bpm=bpm_value)
-                if not candidates:
+                if not candidates and selected_candidate:
                     candidates = [dict(selected_candidate)]
                 drumprint_pattern_score = _candidate_metric(selected_candidate, feature_summary, "drumprint_pattern_score")
                 fake_hit_penalty = _candidate_metric(selected_candidate, feature_summary, "fake_hit_penalty")
@@ -3125,8 +3280,8 @@ class ReviewApp:
                     "filename": row.get("filename", ""),
                     "track_name": Path(row.get("filename", "")).name,
                     "audio_path": row.get("filename", ""),
-                    "ai_pick": float(ai_pick),
-                    "ai_pick_label": _format_time(float(ai_pick)),
+                    "ai_pick": float(ai_pick) if ai_pick is not None else None,
+                    "ai_pick_label": _format_time(float(ai_pick)) if ai_pick is not None else "",
                     "confidence": _float_or_none(row.get("confidence")) or _float_or_none(payload.get("confidence")) or 0.0,
                     "confidence_tier": tier,
                     "selected_by": row.get("selected_by") or payload.get("selected_by") or "",
@@ -3145,6 +3300,8 @@ class ReviewApp:
                     "top_10_candidates": candidates[:10],
                     "selected_candidate": dict(selected_candidate),
                     "feature_summary": dict(feature_summary),
+                    "feature_map": dict(feature_map),
+                    "beatgrid": dict(feature_beatgrid),
                     "auto_accept": auto_accept,
                     "bpm": bpm_value,
                     "duration_sec": _float_or_none(feature_summary.get("duration_sec")) or 0.0,
@@ -3153,6 +3310,28 @@ class ReviewApp:
                     "row_status": row.get("status", ""),
                     "review": {},
                 }
+                if persisted_anchor:
+                    item["als_anchor"] = dict(persisted_anchor)
+                    item["drop_points"] = _drop_point_contract(
+                        persisted_anchor,
+                        visual_marker_sec=_float_or_none(persisted_anchor.get("visual_marker_sec"))
+                        or _candidate_marker_time(selected_candidate),
+                        visual_selected_by=str(selected_candidate.get("selected_by") or item.get("selected_by") or ""),
+                        beatgrid=feature_beatgrid,
+                    )
+                    persisted_impact = _float_or_none(persisted_anchor.get("drop_sec"))
+                    if bool(persisted_anchor.get("ok") and persisted_anchor.get("accepted")) and persisted_impact is not None:
+                        item["ai_pick"] = float(persisted_impact)
+                        item["ai_pick_label"] = _format_time(float(persisted_impact))
+                        item["visual_first_scanned"] = True
+                        item["visual_first_scan"] = {
+                            "version": "persisted_als_anchor_v1",
+                            "raw_visual_time": persisted_anchor.get("visual_marker_sec"),
+                            "marker": persisted_anchor.get("visual_marker_sec"),
+                            "als_impact": float(persisted_impact),
+                            "source": str(persisted_anchor.get("selected_by") or item.get("selected_by") or ""),
+                            "audit": {},
+                        }
                 if self.visual_first:
                     self._prime_item_with_visual_candidate(item, scan=False)
                 else:
@@ -3298,6 +3477,52 @@ class ReviewApp:
             "source": item["selected_by"],
             "audit": visual.get("visual_audit") if isinstance(visual.get("visual_audit"), Mapping) else {},
         }
+        feature_map = visual.get("feature_map") if isinstance(visual.get("feature_map"), Mapping) else {}
+        feature_beatgrid = (
+            feature_map.get("beatgrid")
+            if isinstance(feature_map.get("beatgrid"), Mapping)
+            else {}
+        )
+        if feature_map:
+            item["feature_map"] = dict(feature_map)
+        if feature_beatgrid:
+            item["beatgrid"] = dict(feature_beatgrid)
+        try:
+            als_anchor = dict(
+                build_visual_first_als_anchor(
+                    str(item.get("audio_path") or ""),
+                    float(item.get("bpm") or 0.0),
+                    sample_rate=VISUAL_FIRST_PRODUCTION_SAMPLE_RATE,
+                    use_cache=True,
+                    visual_result=visual,
+                )
+            )
+        except Exception as exc:
+            als_anchor = {
+                "ok": False,
+                "accepted": False,
+                "reason": "web_review_als_anchor_failed",
+                "error": str(exc) or exc.__class__.__name__,
+                "visual_marker_sec": float(marker),
+            }
+        item["als_anchor"] = als_anchor
+        item["drop_points"] = _drop_point_contract(
+            als_anchor,
+            visual_marker_sec=float(marker),
+            visual_selected_by=str(candidates[0].get("selected_by") or item.get("selected_by") or ""),
+            beatgrid=feature_beatgrid,
+        )
+        impact_sec = _float_or_none(als_anchor.get("drop_sec"))
+        if bool(als_anchor.get("ok") and als_anchor.get("accepted")) and impact_sec is not None:
+            # The blue review line is the exact point that will be written to
+            # Ableton.  The visual body edge remains separately inspectable.
+            item["ai_pick"] = float(impact_sec)
+            item["ai_pick_label"] = _format_time(float(impact_sec))
+            item["visual_first_scan"]["als_impact"] = float(impact_sec)
+            item["visual_first_scan"]["drop_points_status"] = "accepted"
+        else:
+            item["visual_first_scan"]["drop_points_status"] = "rejected"
+            item["visual_first_scan"]["als_anchor_reason"] = str(als_anchor.get("reason") or "")
         for key in (
             "visual_first_hold",
             "visual_first_stale_marker",
@@ -3901,6 +4126,14 @@ class ReviewApp:
             self._prime_item_with_visual_candidate(item, scan=True)
         preview = self._preview_info(item)
         out = dict(item)
+        feature_map = out.get("feature_map") if isinstance(out.get("feature_map"), Mapping) else {}
+        feature_beatgrid = (
+            feature_map.get("beatgrid")
+            if isinstance(feature_map.get("beatgrid"), Mapping)
+            else {}
+        )
+        if feature_beatgrid:
+            out["beatgrid"] = dict(feature_beatgrid)
         try:
             info = self.waveform_cache.info(str(item.get("audio_path", "")))
         except Exception:
@@ -4231,6 +4464,41 @@ class ReviewApp:
         if not item:
             return None
         return self.waveform_cache.render_png(
+            str(item.get("audio_path", "")),
+            start_sec=float(start),
+            end_sec=float(end),
+            width=int(width),
+            height=int(height),
+            markers=self._png_markers(
+                item,
+                user_pick=user_pick,
+                refined_pick=refined_pick,
+                attack_time=attack_time,
+                zero_time=zero_time,
+                knee_time=knee_time,
+                asd_time=asd_time,
+            ),
+        )
+
+    def waveform_svg(
+        self,
+        item_id: str,
+        *,
+        start: float,
+        end: float,
+        width: int,
+        height: int,
+        user_pick: Optional[float] = None,
+        refined_pick: Optional[float] = None,
+        attack_time: Optional[float] = None,
+        zero_time: Optional[float] = None,
+        knee_time: Optional[float] = None,
+        asd_time: Optional[float] = None,
+    ) -> Optional[bytes]:
+        item = self.item_by_id.get(item_id)
+        if not item:
+            return None
+        return self.waveform_cache.render_svg(
             str(item.get("audio_path", "")),
             start_sec=float(start),
             end_sec=float(end),
@@ -5391,6 +5659,31 @@ def _make_handler(app: ReviewApp):
                     self.send_error(HTTPStatus.NOT_FOUND)
                 else:
                     self._send_bytes(data, "image/png")
+            elif path == "/media/waveform_svg":
+                item_id = (qs.get("id") or [""])[0]
+                user_pick = _float_or_none((qs.get("user_pick") or [""])[0])
+                refined_pick = _float_or_none((qs.get("refined_pick") or [""])[0])
+                attack_time = _float_or_none((qs.get("attack_time") or [""])[0])
+                zero_time = _float_or_none((qs.get("zero_time") or [""])[0])
+                knee_time = _float_or_none((qs.get("knee_time") or [""])[0])
+                asd_time = _float_or_none((qs.get("asd_time") or [""])[0])
+                data = app.waveform_svg(
+                    item_id,
+                    start=float((qs.get("start") or ["0"])[0]),
+                    end=float((qs.get("end") or ["1"])[0]),
+                    width=int(float((qs.get("width") or ["9600"])[0])),
+                    height=int(float((qs.get("height") or ["900"])[0])),
+                    user_pick=user_pick,
+                    refined_pick=refined_pick,
+                    attack_time=attack_time,
+                    zero_time=zero_time,
+                    knee_time=knee_time,
+                    asd_time=asd_time,
+                )
+                if data is None:
+                    self.send_error(HTTPStatus.NOT_FOUND)
+                else:
+                    self._send_bytes(data, "image/svg+xml; charset=utf-8")
             else:
                 self.send_error(HTTPStatus.NOT_FOUND)
 

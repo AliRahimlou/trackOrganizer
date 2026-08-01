@@ -329,6 +329,71 @@ body.visualFirst .waveWrapper {
   top: 24px;
 }
 
+.marker.gridOne {
+  background: #00a6c8;
+  opacity: 0.86;
+  width: 2px;
+  z-index: 3;
+}
+
+.marker.gridOne span {
+  background: #dff8fc;
+  color: #075d70;
+  font-weight: 800;
+}
+
+.marker.visualEdge {
+  background: repeating-linear-gradient(to bottom, #d88716 0 5px, transparent 5px 9px);
+  width: 2px;
+  z-index: 3;
+}
+
+.marker.visualEdge span,
+.marker.alternateAttack span {
+  background: #fff2dc;
+  color: #865005;
+  font-weight: 800;
+}
+
+.marker.zeroDiagnostic {
+  background: rgba(17, 24, 32, 0.72);
+  width: 1px;
+  z-index: 2;
+}
+
+.marker.zeroDiagnostic span {
+  background: #edf0f2;
+  color: #111820;
+  font-weight: 700;
+}
+
+.marker.bodyCrest {
+  background: #8a3ffc;
+  opacity: 0.86;
+  width: 2px;
+  z-index: 3;
+}
+
+.marker.bodyCrest span {
+  background: #efe5ff;
+  color: #54219b;
+  font-weight: 800;
+}
+
+.marker.alternateAttack {
+  background: rgba(216, 135, 22, 0.55);
+  width: 1px;
+  z-index: 2;
+}
+
+.anchorStatus.accepted {
+  color: var(--user);
+}
+
+.anchorStatus.rejected {
+  color: var(--danger);
+}
+
 .marker.asd {
   background: var(--asd);
   width: 3px;
@@ -1045,6 +1110,7 @@ body.visualFirst button.markerAccept.primary.ai:hover {
 
   .playRow .presetBtn,
   #exportPngBtn,
+  #exportSvgBtn,
   #jumpAiBtn {
     display: none;
   }

@@ -69,6 +69,56 @@ def test_review_app_loads_fresh_visual_first_library_csv(tmp_path) -> None:
     assert item["selected_candidate"]["source"] == "fresh_visual_first_library_csv"
 
 
+def test_review_item_public_exposes_persisted_feature_map_beatgrid(tmp_path) -> None:
+    summary = tmp_path / "summary.csv"
+    audio = tmp_path / "drums_145_1A_7-Artist - Track.flac"
+    candidates_json = tmp_path / "drums_145_1A_7-Artist - Track_drop_candidates.json"
+    beatgrid = {
+        "bpm": 145.0,
+        "beat_sec": 60.0 / 145.0,
+        "bar_sec": 240.0 / 145.0,
+        "bar_zero_sec": 0.173,
+        "downbeat_confidence": 0.94,
+    }
+    selected = _candidate(48.173, rank=1, score=0.91, micro=0.96)
+    selected["selected_by"] = "visual_boom_grid_one_snap"
+    candidates_json.write_text(
+        json.dumps(
+            {
+                "final_ai_pick": 48.173,
+                "bpm": 145.0,
+                "selected_candidate": selected,
+                "top_10_candidates": [selected],
+                "feature_map": {"ok": True, "bar_count": 96, "beatgrid": beatgrid},
+            }
+        ),
+        encoding="utf-8",
+    )
+    summary.write_text(
+        "filename,detected_drop_time,output_als,candidates_json,status,als_valid,confidence_tier,selected_by\n"
+        f"{audio},48.173,{tmp_path / 'track.als'},{candidates_json},processed,true,HIGH,visual_boom_grid_one_snap\n",
+        encoding="utf-8",
+    )
+
+    app = ReviewApp(
+        summary_csv=str(summary),
+        template=str(tmp_path / "template.als"),
+        correction_log=str(tmp_path / "corrections.jsonl"),
+        auto_retrain_every=0,
+        review_low_only=False,
+        review_medium_and_low=False,
+        regenerate_als_on_correction=False,
+        visual_first=True,
+    )
+    app._prime_item_with_visual_candidate = lambda item, scan=False: None
+
+    public = app._item_public(app.items[0])
+
+    assert public is not None
+    assert public["feature_map"]["beatgrid"] == beatgrid
+    assert public["beatgrid"] == beatgrid
+
+
 def test_even_bar_prior_rescues_one_beat_early_marker_to_same_bar_one() -> None:
     early = _candidate(40.736272108843536, rank=1, score=0.746, micro=0.800, snap_ms=0.27)
     on_one = _candidate(41.14321088435374, rank=2, score=0.875, micro=0.856, snap_ms=-72.79)
@@ -159,6 +209,13 @@ def test_apply_visual_first_result_selects_candidate_matching_blue_marker() -> N
         "top_10_candidates": [stale_phrase],
         "confidence_tier": "LOW",
     }
+    beatgrid = {
+        "bpm": 140.0,
+        "beat_sec": 60.0 / 140.0,
+        "bar_sec": 240.0 / 140.0,
+        "bar_zero_sec": 0.137,
+        "downbeat_confidence": 0.91,
+    }
 
     ok = app._apply_visual_first_result(
         item,
@@ -169,6 +226,7 @@ def test_apply_visual_first_result_selects_candidate_matching_blue_marker() -> N
             "raw_visual_time": 82.40135211267607,
             "selected_candidate": stale_phrase,
             "candidates": [visual_marker],
+            "feature_map": {"ok": True, "bar_count": 96, "beatgrid": beatgrid},
         },
     )
 
@@ -176,6 +234,8 @@ def test_apply_visual_first_result_selects_candidate_matching_blue_marker() -> N
     assert item["ai_pick"] == visual_marker["timestamp"]
     assert item["selected_candidate"]["timestamp"] == visual_marker["timestamp"]
     assert item["top_10_candidates"][0]["timestamp"] == visual_marker["timestamp"]
+    assert item["feature_map"]["beatgrid"] == beatgrid
+    assert item["beatgrid"] == beatgrid
 
 
 def test_visual_first_refresh_preserves_successful_visual_scan() -> None:
@@ -446,7 +506,14 @@ def test_visual_first_save_guard_rejects_marker_before_boom_front_edge(monkeypat
 def test_visual_first_save_guard_uses_visual_first_production_sample_rate(monkeypatch) -> None:
     app = ReviewApp.__new__(ReviewApp)
     app.visual_first = True
-    app._visual_gui_mask_proof = lambda *args, **kwargs: {"passes": True, "reasons": [], "placeable_count": 1}
+    app._visual_gui_mask_proof = lambda *args, **kwargs: {
+        "passes": True,
+        "reasons": [],
+        "placeable_count": 1,
+        "marker_signal_present": True,
+        "marker_relevant_mask": True,
+        "marker_immediate_body_present": True,
+    }
     marker = 32.0
     sample_rates = []
 
@@ -680,7 +747,14 @@ def test_visual_first_save_guard_derives_manual_marker_proof_from_server_gui_mas
 def test_visual_first_save_guard_does_not_inherit_stale_item_candidate_for_manual_marker(monkeypatch) -> None:
     app = ReviewApp.__new__(ReviewApp)
     app.visual_first = True
-    app._visual_gui_mask_proof = lambda *args, **kwargs: {"passes": True, "reasons": [], "placeable_count": 1}
+    app._visual_gui_mask_proof = lambda *args, **kwargs: {
+        "passes": True,
+        "reasons": [],
+        "placeable_count": 1,
+        "marker_signal_present": True,
+        "marker_relevant_mask": True,
+        "marker_immediate_body_present": True,
+    }
     marker = 12.0
     captured = []
 

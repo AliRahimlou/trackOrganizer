@@ -28,7 +28,7 @@ let waveTiles = [];
 let waveView = "window";
 const WAVEFORM_MODE_STORAGE_KEY = "dropReviewWaveformVisualMode";
 const WAVEFORM_MODE_VERSION_KEY = "dropReviewWaveformVisualModeVersion";
-const WAVEFORM_MODE_VERSION = "boom-bars-v17-mask-segment-render";
+const WAVEFORM_MODE_VERSION = "boom-bars-v18-vector-export";
 function initialWaveformVisualMode() {
   const validModes = new Set(["boom", "rms", "peaks"]);
   try {
@@ -64,8 +64,8 @@ const VISUAL_FIRST_MIN_MOBILE_WAVE_HEIGHT = 300;
 const DEFAULT_WINDOW_BEFORE = 20;
 const DEFAULT_WINDOW_AFTER = 30;
 const MIN_VIEW_SAMPLES = 2;
-const WAVEFORM_DETAIL_MULTIPLIER = 2;
-const WAVEFORM_MAX_TILE_BINS = 8000;
+const WAVEFORM_DETAIL_MULTIPLIER = 4;
+const WAVEFORM_MAX_TILE_BINS = 24000;
 const HYPER_RMS_TARGET = 0.78;
 const HYPER_RMS_CEILING = 0.985;
 const HYPER_RMS_KNEE = 0.72;
@@ -410,7 +410,26 @@ function structureMap() {
 }
 
 function structureBeatgrid() {
-  return structureMap()?.beatgrid || currentItem?.beatgrid || null;
+  return currentItem?.feature_map?.beatgrid || currentItem?.beatgrid || structureMap()?.beatgrid || null;
+}
+
+function dropPointContract() {
+  return currentItem?.drop_points && typeof currentItem.drop_points === "object" ? currentItem.drop_points : null;
+}
+
+function dropPointTime(name) {
+  return optionalMarkerTime(dropPointContract()?.[name]?.time_sec);
+}
+
+function acceptedAlsImpactTime() {
+  const points = dropPointContract();
+  if (!points || points.status !== "accepted") return null;
+  return dropPointTime("als_impact");
+}
+
+function alternateAttackPoints() {
+  const rows = dropPointContract()?.alternate_attacks;
+  return Array.isArray(rows) ? rows.filter((row) => optionalMarkerTime(row?.time_sec) !== null) : [];
 }
 
 function barZeroSeconds() {
@@ -837,19 +856,20 @@ function blueMarkerInfo() {
     };
   }
   if (visualFirstMode()) {
+    const points = dropPointContract();
+    const impact = acceptedAlsImpactTime();
     const time =
       optionalMarkerTime(pendingAutoPlacePick) ||
-      optionalMarkerTime(currentItem?.ai_pick) ||
-      candidateTime(currentItem?.selected_candidate) ||
-      selectedMicroTime();
+      impact ||
+      (points ? null : optionalMarkerTime(currentItem?.ai_pick) || candidateTime(currentItem?.selected_candidate) || selectedMicroTime());
     if (time === null) return { time: null, label: "", barNumber: null };
-    const candidate = closestCandidateNearTime(time, 0.030) || currentItem?.selected_candidate || null;
+    const candidate = closestCandidateNearTime(time, 0.120) || currentItem?.selected_candidate || null;
     return {
       time,
-      label: "",
+      label: impact !== null && Math.abs(time - impact) <= 1 / Math.max(sampleRate(), 1) ? "ALS" : "",
       barNumber: nearestBpmOne(time)?.barNumber || null,
       candidate,
-      source: "candidate",
+      source: impact !== null && Math.abs(time - impact) <= 1 / Math.max(sampleRate(), 1) ? "als_impact" : "candidate",
     };
   }
   const candidate = pickedCandidate || defaultBlueAnchorCandidate();
@@ -884,11 +904,23 @@ function visualCandidateZoomRadius() {
 }
 
 function markerTimes() {
+  const micro = selectedMicroInfo();
+  const contract = dropPointContract();
   return {
     ai: optionalMarkerTime(pendingAutoPlacePick) || optionalMarkerTime(currentItem?.ai_pick),
+    micro: selectedMicroTime(),
+    attack: acceptedAlsImpactTime() || optionalMarkerTime(micro?.attack_start_time),
+    zero: dropPointTime("zero_crossing") || optionalMarkerTime(micro?.zero_crossing_time),
     knee: kneeMarkerTime(),
+    asd: optionalMarkerTime(micro?.ableton_asd_time),
     grid: gridMarkerTime(),
     manual: userPick === null ? null : optionalMarkerTime(userPick),
+    musicalOne: dropPointTime("musical_one"),
+    visual: dropPointTime("visual_marker"),
+    crest: dropPointTime("body_crest"),
+    alternates: Array.isArray(contract?.alternate_attacks)
+      ? contract.alternate_attacks.map((row) => optionalMarkerTime(row?.time_sec)).filter((time) => time !== null)
+      : [],
   };
 }
 
@@ -939,9 +971,67 @@ function updateGridMarkerUi() {
   const target = $("blueMarker");
   if (target) {
     const sourceLabel =
-      info.source === "candidate" ? "exact" : info.source === "grid" ? "grid" : info.source === "manual" ? "placed" : "";
+      info.source === "als_impact"
+        ? "ALS impact"
+        : info.source === "candidate"
+          ? "exact"
+          : info.source === "grid"
+            ? "grid"
+            : info.source === "manual"
+              ? "placed"
+              : "";
     const suffix = [info.label, sourceLabel, info.barNumber ? `b${info.barNumber}` : ""].filter(Boolean).join(" ");
     target.textContent = info.time === null ? "none" : `${fmtTime(info.time)} (${info.time.toFixed(6)}s)${suffix ? ` ${suffix}` : ""}`;
+  }
+}
+
+function formatDropPoint(point) {
+  const time = optionalMarkerTime(point?.time_sec);
+  if (time === null) return "none";
+  const sampleRaw = point?.sample;
+  const sample = sampleRaw === null || sampleRaw === undefined ? null : Number(sampleRaw);
+  return `${fmtTime(time)} (${time.toFixed(9)}s)${Number.isInteger(sample) ? ` sample ${sample}` : ""}`;
+}
+
+function renderDropPointContract() {
+  const points = dropPointContract();
+  const status = $("alsAnchorStatus");
+  if (!points) {
+    if (status) status.textContent = "--";
+    for (const id of ["gridOneMarker", "visualDropMarker", "alsImpactMarker", "diagnosticZeroMarker", "boomCrestMarker", "alternateAttackMarkers"]) {
+      if ($(id)) $(id).textContent = "none";
+    }
+    if ($("phaseTranslation")) $("phaseTranslation").textContent = "--";
+    return;
+  }
+  if (status) {
+    status.textContent = points.status === "accepted" ? "READY — ALS impact is blue" : `HOLD — ${points.reason || "anchor proof failed"}`;
+    status.className = `anchorStatus ${points.status === "accepted" ? "accepted" : "rejected"}`;
+  }
+  if ($("gridOneMarker")) $("gridOneMarker").textContent = formatDropPoint(points.musical_one);
+  if ($("visualDropMarker")) $("visualDropMarker").textContent = formatDropPoint(points.visual_marker);
+  if ($("alsImpactMarker")) $("alsImpactMarker").textContent = formatDropPoint(points.als_impact);
+  if ($("diagnosticZeroMarker")) $("diagnosticZeroMarker").textContent = formatDropPoint(points.zero_crossing);
+  if ($("boomCrestMarker")) {
+    const crest = formatDropPoint(points.body_crest);
+    const crestOffsetRaw = points.body_crest_evidence?.crest_offset_ms;
+    const crestOffset = crestOffsetRaw === null || crestOffsetRaw === undefined ? null : Number(crestOffsetRaw);
+    $("boomCrestMarker").textContent = `${crest}${crest !== "none" && Number.isFinite(crestOffset) ? ` (+${crestOffset.toFixed(3)}ms, diagnostic)` : ""}`;
+  }
+  const phaseSamplesRaw = points.phase_translation?.samples;
+  const phaseMsRaw = points.phase_translation?.milliseconds;
+  const phaseSamples = phaseSamplesRaw === null || phaseSamplesRaw === undefined ? null : Number(phaseSamplesRaw);
+  const phaseMs = phaseMsRaw === null || phaseMsRaw === undefined ? null : Number(phaseMsRaw);
+  if ($("phaseTranslation")) {
+    $("phaseTranslation").textContent = Number.isFinite(phaseSamples) || Number.isFinite(phaseMs)
+      ? `${Number.isFinite(phaseSamples) ? `${phaseSamples} samples` : "--"}${Number.isFinite(phaseMs) ? ` / ${phaseMs.toFixed(3)} ms` : ""}`
+      : "--";
+  }
+  if ($("alternateAttackMarkers")) {
+    const alternatives = alternateAttackPoints();
+    $("alternateAttackMarkers").textContent = alternatives.length
+      ? alternatives.map((row, index) => `A${index + 1} ${formatDropPoint(row)}${Number.isFinite(Number(row.confidence)) ? ` c${Number(row.confidence).toFixed(3)}` : ""}`).join(" | ")
+      : "none";
   }
 }
 
@@ -1198,9 +1288,10 @@ function drawBpmClock(ctx, width, height) {
   if (!Number.isFinite(bpm) || bpm <= 0) return;
   const beatSeconds = 60 / bpm;
   if (!Number.isFinite(beatSeconds) || beatSeconds <= 0) return;
+  const barZero = barZeroSeconds();
   const beatPx = beatSeconds * pixelsPerSecond();
-  const firstBeat = Math.max(0, Math.floor(viewportStart / beatSeconds) - 1);
-  const lastBeat = Math.ceil(viewportEnd / beatSeconds) + 1;
+  const firstBeat = Math.max(0, Math.floor((viewportStart - barZero) / beatSeconds) - 1);
+  const lastBeat = Math.ceil((viewportEnd - barZero) / beatSeconds) + 1;
   const maxBeats = 1400;
   if (lastBeat - firstBeat > maxBeats) return;
 
@@ -1208,7 +1299,7 @@ function drawBpmClock(ctx, width, height) {
   ctx.font = "10px -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif";
   const subtleGuides = visualFirstMode();
   for (let beat = firstBeat; beat <= lastBeat; beat += 1) {
-    const time = beat * beatSeconds;
+    const time = barZero + beat * beatSeconds;
     const x = timeToX(time);
     if (x < -30 || x > width + 30) continue;
     const isOne = beat % 4 === 0;
@@ -2762,8 +2853,22 @@ function drawMarkers() {
   const overlay = $("waveOverlay");
   overlay.innerHTML = "";
   if (!currentItem || !waveDuration) return;
+  if (visualFirstMode()) {
+    const times = markerTimes();
+    drawMarker(overlay, times.musicalOne, "gridOne", "ONE", { labelTop: 4 });
+    drawMarker(overlay, times.visual, "visualEdge", "VISUAL", { labelTop: 24 });
+    drawMarker(overlay, times.zero, "zeroDiagnostic", "ZERO", { labelTop: 66 });
+    drawMarker(overlay, times.crest, "bodyCrest", "BODY CREST", { labelTop: 87 });
+    if (viewportDuration() <= 1.0) {
+      times.alternates.forEach((time, index) => {
+        drawMarker(overlay, time, "alternateAttack", `A${index + 1}`, { labelTop: 108 + index * 20 });
+      });
+    }
+  }
   const blue = blueMarkerInfo();
-  drawMarker(overlay, blue.time, "grid", "BLUE", { labelTop: 24 });
+  drawMarker(overlay, blue.time, "grid", visualFirstMode() && blue.source === "als_impact" ? "BLUE ALS" : "BLUE", {
+    labelTop: visualFirstMode() ? 45 : 24,
+  });
   if (!visualFirstMode()) drawMarker(overlay, kneeMarkerTime(), "knee", "KNEE");
   const showCandidateMarkers = !visualFirstMode();
   if (showCandidateMarkers) {
@@ -3694,14 +3799,17 @@ function togglePlay() {
   }
 }
 
-function exportPng() {
+function waveformExportParams(format) {
   if (!currentItem || !waveDuration) return;
+  const wrapperWidth = $("waveWrapper").clientWidth || 1000;
+  const dpr = Math.max(2, window.devicePixelRatio || 1);
+  const isSvg = format === "svg";
   const params = new URLSearchParams({
     id: currentItem.id,
     start: viewportStart.toFixed(9),
     end: viewportEnd.toFixed(9),
-    width: String(Math.max(2400, Math.round(($("waveWrapper").clientWidth || 1000) * Math.max(2, window.devicePixelRatio || 1) * 2))),
-    height: "900",
+    width: String(Math.max(isSvg ? 9600 : 4800, Math.round(wrapperWidth * dpr * (isSvg ? 8 : 4)))),
+    height: isSvg ? "1000" : "1000",
   });
   if (userPick !== null) params.set("user_pick", userPick.toFixed(9));
   const times = markerTimes();
@@ -3710,7 +3818,19 @@ function exportPng() {
   if (times.zero !== null) params.set("zero_time", times.zero.toFixed(9));
   if (times.knee !== null) params.set("knee_time", times.knee.toFixed(9));
   if (times.asd !== null) params.set("asd_time", times.asd.toFixed(9));
+  return params;
+}
+
+function exportPng() {
+  const params = waveformExportParams("png");
+  if (!params) return;
   window.open(`/media/waveform_png?${params.toString()}`, "_blank");
+}
+
+function exportSvg() {
+  const params = waveformExportParams("svg");
+  if (!params) return;
+  window.open(`/media/waveform_svg?${params.toString()}`, "_blank");
 }
 
 function renderState(state) {
@@ -3730,7 +3850,7 @@ function renderState(state) {
   if ($("placeBtn")) $("placeBtn").textContent = visualFirstMode() ? "PLACE 1.1.1" : "PLACE MANUAL";
   if ($("candidateHelp")) {
     $("candidateHelp").textContent = visualFirstMode()
-      ? "Click waveform to play. Place 1.1.1 only when setting green manually."
+      ? "BLUE ALS is the written impact. ONE and VISUAL are independent checks; ZERO and BODY CREST are diagnostics."
       : "Place or accept the marker, then save.";
   }
   if ($("retrainBtn")) {
@@ -3763,6 +3883,7 @@ function renderState(state) {
     $("microConfidence").textContent = "--";
     $("attackCleanliness").textContent = "--";
     $("zeroCrossingQuality").textContent = "--";
+    renderDropPointContract();
     renderAutoAcceptGate(null);
     destroyWave();
     if ($("candidateList")) $("candidateList").innerHTML = "";
@@ -3782,6 +3903,7 @@ function renderState(state) {
   $("confidenceTier").className = `tier ${tierClass(currentItem.confidence_tier)}`;
   $("selectedBy").textContent = currentItem.selected_by || "--";
   renderStructureSummary();
+  renderDropPointContract();
   $("fullGrooveScore").textContent = Number(currentItem.sustained_full_groove_score || 0).toFixed(3);
   $("immediateGrooveScore").textContent = Number(currentItem.immediate_groove_start_score || 0).toFixed(3);
   $("grooveStability").textContent = Number(currentItem.groove_stability || 0).toFixed(3);
@@ -4176,6 +4298,7 @@ function attachEvents() {
     scrollToOriginalTime(blue);
   });
   $("exportPngBtn").addEventListener("click", exportPng);
+  $("exportSvgBtn").addEventListener("click", exportSvg);
   $("zoomOutBtn").addEventListener("click", () => zoomBy(-1));
   $("zoomInBtn").addEventListener("click", () => zoomBy(1));
   $("zoomResetBtn").addEventListener("click", resetZoom);

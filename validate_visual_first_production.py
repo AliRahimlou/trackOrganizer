@@ -266,6 +266,96 @@ def _persisted_boom_freshness_reason(proof: Mapping[str, Any]) -> str:
     return "persisted_boom_proof=stale_front_edge:" + str(freshness.get("reason") or "unknown")
 
 
+def _proof_marker_delta(
+    proof: Mapping[str, Any],
+    marker: Optional[float],
+    keys: Sequence[str],
+) -> Optional[float]:
+    if marker is None or not isinstance(proof, Mapping):
+        return None
+    values: List[float] = []
+    for key in keys:
+        value = _finite_optional(proof.get(key))
+        if value is not None:
+            values.append(float(value))
+    if not values:
+        return None
+    marker_f = float(marker)
+    return min(abs(value - marker_f) for value in values)
+
+
+def _persisted_boom_authorizes_current_marker(
+    proof: Mapping[str, Any],
+    marker: Optional[float],
+    *,
+    tolerance_sec: float = 0.002,
+) -> bool:
+    if not bool(proof.get("passes")):
+        return False
+    marker_delta = _proof_marker_delta(proof, marker, ("marker_sec", "marker"))
+    if marker_delta is None or marker_delta > float(tolerance_sec):
+        return False
+    freshness = boom_proof_front_edge_freshness(proof)
+    return bool(freshness.get("fresh"))
+
+
+def _persisted_gui_authorizes_current_marker(
+    proof: Mapping[str, Any],
+    marker: Optional[float],
+    *,
+    tolerance_sec: float = 0.010,
+) -> bool:
+    if not bool(proof.get("passes")):
+        return False
+    marker_delta = _proof_marker_delta(proof, marker, ("marker", "marker_sec"))
+    if marker_delta is None or marker_delta > float(tolerance_sec):
+        return False
+    if _gui_mask_proof_needs_front_edge_repair(proof):
+        return False
+    if gui_boom_mask_strict_contract_issue(proof):
+        return False
+    if _gui_signal_hold_reason("gui_mask", proof):
+        return False
+    return True
+
+
+def _trusted_persisted_proof(
+    *,
+    marker: Optional[float],
+    detector_proof: Mapping[str, Any],
+    report_proof: Mapping[str, Any],
+    rerun_detector: bool,
+    rerun_report_matches: bool,
+    validated_human_override: bool,
+    proof_type: str,
+) -> Dict[str, Any]:
+    if proof_type == "boom":
+        authorizes = _persisted_boom_authorizes_current_marker
+    elif proof_type == "gui":
+        authorizes = _persisted_gui_authorizes_current_marker
+    else:
+        return {}
+
+    if rerun_detector and not validated_human_override:
+        if authorizes(detector_proof, marker):
+            trusted = dict(detector_proof)
+            trusted["trusted_persisted_proof_source"] = "current_detector_rerun"
+            return trusted
+        if rerun_report_matches and authorizes(report_proof, marker):
+            trusted = dict(report_proof)
+            trusted["trusted_persisted_proof_source"] = "report_matched_current_rerun"
+            return trusted
+        return {}
+
+    if authorizes(report_proof, marker):
+        trusted = dict(report_proof)
+        trusted["trusted_persisted_proof_source"] = (
+            "validated_human_override_report" if validated_human_override else "report_no_rerun"
+        )
+        return trusted
+    return {}
+
+
 def _finite_optional(value: Any) -> Optional[float]:
     try:
         out = float(value)
@@ -274,7 +364,55 @@ def _finite_optional(value: Any) -> Optional[float]:
     return float(out) if math.isfinite(out) else None
 
 
-def _actual_visual_body_contract(selected: Mapping[str, Any]) -> Dict[str, Any]:
+def _gui_sparse_groove_actual_body_contract(
+    gui_proof: Mapping[str, Any],
+    boom_proof: Mapping[str, Any],
+) -> bool:
+    if not (bool(gui_proof.get("passes")) and bool(boom_proof.get("passes"))):
+        return False
+    if not (
+        bool(gui_proof.get("accepted_by_sparse_groove_front_edge_proof"))
+        and bool(gui_proof.get("accepted_by_gui_sparse_pulse_proof"))
+    ):
+        return False
+    if gui_proof.get("marker_signal_present") is not True:
+        return False
+    if gui_proof.get("marker_relevant_mask") is not True:
+        return False
+    if _gui_mask_proof_needs_front_edge_repair(gui_proof):
+        return False
+    if gui_boom_mask_strict_contract_issue(gui_proof):
+        return False
+    nearest_offset = _finite_optional(gui_proof.get("nearest_placeable_offset_sec"))
+    if nearest_offset is None or abs(float(nearest_offset)) > 0.012:
+        return False
+    if int(gui_proof.get("placeable_count") or 0) < 24:
+        return False
+    post_relevant = _finite_optional(gui_proof.get("sparse_groove_front_post_relevant")) or 0.0
+    post_rms_peak = _finite_optional(gui_proof.get("sparse_groove_front_post_rms_peak")) or 0.0
+    if post_relevant < 0.045 and post_rms_peak < 0.160:
+        return False
+    return bool(
+        (_finite_optional(gui_proof.get("sparse_groove_front_actual_body")) or 0.0) >= 0.500
+        and (_finite_optional(gui_proof.get("sparse_groove_front_sparse_score")) or 0.0) >= 0.560
+        and (_finite_optional(gui_proof.get("sparse_groove_front_profile_score")) or 0.0) >= 0.500
+        and (_finite_optional(gui_proof.get("sparse_groove_front_body_score")) or 0.0) >= 0.580
+        and (_finite_optional(gui_proof.get("sparse_groove_front_darkness")) or 0.0) >= 0.540
+        and (_finite_optional(gui_proof.get("sparse_groove_front_post8")) or 0.0) >= 0.540
+        and (_finite_optional(gui_proof.get("sparse_groove_front_drum_cont")) or 0.0) >= 0.450
+        and (
+            (_finite_optional(gui_proof.get("sparse_groove_front_bass")) or 0.0) >= 0.280
+            or (_finite_optional(gui_proof.get("sparse_groove_front_simultaneity")) or 0.0) >= 0.600
+        )
+    )
+
+
+def _actual_visual_body_contract(
+    selected: Mapping[str, Any],
+    *,
+    gui_proof: Optional[Mapping[str, Any]] = None,
+    boom_proof: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
     if not isinstance(selected, Mapping) or not selected:
         return {
             "checked": True,
@@ -318,12 +456,17 @@ def _actual_visual_body_contract(selected: Mapping[str, Any]) -> Dict[str, Any]:
             "persisted_flag": persisted_flag,
         }
     passes = bool(_candidate_has_minimum_actual_visual_body(selected))
+    source = "selected_visual_components"
+    if not passes and _gui_sparse_groove_actual_body_contract(gui_proof or {}, boom_proof or {}):
+        passes = True
+        source = "trusted_sparse_groove_gui_proof"
     reasons = [] if passes else ["actual_visual_body_below_floor"]
     return {
         "checked": True,
         "passes": passes,
         "reasons": reasons,
         "persisted_flag": persisted_flag,
+        "source": source if passes else "selected_visual_components",
         "body_peak": max(body_values) if body_values else None,
         "support_peak": max(support_values) if support_values else None,
     }
@@ -481,6 +624,15 @@ def _validate_one(payload: Mapping[str, Any]) -> Dict[str, Any]:
         marker = detector_marker if rerun_detector else _marker(row, candidate_payload, selected)
         selected_by = _selected_by(row, selected, candidate_payload)
         audit = _audit(row, candidate_payload)
+    detector_persisted_boom_proof: Dict[str, Any] = {}
+    detector_persisted_gui_proof: Dict[str, Any] = {}
+    if rerun_detector:
+        detector_persisted_boom_proof = _best_persisted_proof(
+            _persisted_proofs({}, candidate_payload, detector_selected, "boom_proof")
+        )
+        detector_persisted_gui_proof = _best_persisted_proof(
+            _persisted_proofs({}, candidate_payload, detector_selected, "gui_mask_proof")
+        )
     drums_path = str(row.get("drums_path") or candidate_payload.get("audio_path") or drums_path)
     reasons: List[str] = []
     if marker is None:
@@ -495,13 +647,6 @@ def _validate_one(payload: Mapping[str, Any]) -> Dict[str, Any]:
         reasons.append(f"audit_status={audit_status or 'missing'}")
     if audit_flags:
         reasons.append("audit_flags=" + ";".join(audit_flags))
-    actual_visual_body_contract = _actual_visual_body_contract(selected)
-    if not bool(actual_visual_body_contract.get("passes")):
-        body_reasons = [str(reason) for reason in actual_visual_body_contract.get("reasons") or [] if str(reason)]
-        reasons.append(
-            "actual_visual_body_contract=hold"
-            + (":" + ";".join(body_reasons) if body_reasons else ":missing")
-        )
     if not skip_persisted_proof:
         if not bool(persisted_boom_proof.get("passes")):
             reasons.append(_proof_hold_reason("persisted_boom_proof", persisted_boom_proof))
@@ -523,21 +668,55 @@ def _validate_one(payload: Mapping[str, Any]) -> Dict[str, Any]:
             if gui_signal_reason:
                 reasons.append(gui_signal_reason)
     rerun_report_delta_sec = None
+    rerun_report_matches = True
     if rerun_detector and require_rerun_matches_report:
         if validated_human_override:
+            rerun_report_matches = True
             if detector_marker is not None and report_marker is not None:
                 rerun_report_delta_sec = abs(float(detector_marker) - float(report_marker))
         elif marker is None:
+            rerun_report_matches = False
             reasons.append("rerun_marker_missing")
         elif report_marker is None:
+            rerun_report_matches = False
             reasons.append("report_marker_missing_for_rerun_compare")
         else:
             rerun_report_delta_sec = abs(float(marker) - float(report_marker))
+            rerun_report_matches = rerun_report_delta_sec <= rerun_report_tolerance_sec
             if rerun_report_delta_sec > rerun_report_tolerance_sec:
                 reasons.append(
                     f"rerun_marker_mismatch:{rerun_report_delta_sec:.9f}s"
                     f">tolerance:{rerun_report_tolerance_sec:.9f}s"
                 )
+    trusted_boom_proof = _trusted_persisted_proof(
+        marker=marker,
+        detector_proof=detector_persisted_boom_proof,
+        report_proof=persisted_boom_proof,
+        rerun_detector=rerun_detector,
+        rerun_report_matches=rerun_report_matches,
+        validated_human_override=validated_human_override,
+        proof_type="boom",
+    )
+    trusted_gui_proof = _trusted_persisted_proof(
+        marker=marker,
+        detector_proof=detector_persisted_gui_proof,
+        report_proof=persisted_gui_proof,
+        rerun_detector=rerun_detector,
+        rerun_report_matches=rerun_report_matches,
+        validated_human_override=validated_human_override,
+        proof_type="gui",
+    )
+    actual_visual_body_contract = _actual_visual_body_contract(
+        selected,
+        gui_proof=trusted_gui_proof,
+        boom_proof=trusted_boom_proof,
+    )
+    if not bool(actual_visual_body_contract.get("passes")):
+        body_reasons = [str(reason) for reason in actual_visual_body_contract.get("reasons") or [] if str(reason)]
+        reasons.append(
+            "actual_visual_body_contract=hold"
+            + (":" + ";".join(body_reasons) if body_reasons else ":missing")
+        )
 
     proof: Dict[str, Any] = {}
     if marker is not None and drums_path:
@@ -602,11 +781,16 @@ def _validate_one(payload: Mapping[str, Any]) -> Dict[str, Any]:
         proof = {"passes": False, "reasons": ["missing_marker_or_track"]}
 
     if not bool(proof.get("passes")):
-        if not rerun_detector and bool(persisted_boom_proof.get("passes")):
+        proof_reasons = [str(reason) for reason in proof.get("reasons") or []]
+        if trusted_boom_proof:
+            proof = dict(trusted_boom_proof)
+            proof["accepted_by_trusted_persisted_strict_proof"] = True
+            if proof_reasons:
+                proof["raw_validation_recomputed_reasons"] = proof_reasons
+        elif not rerun_detector and bool(persisted_boom_proof.get("passes")):
             proof = dict(persisted_boom_proof)
             proof["accepted_by_persisted_no_rerun_proof"] = True
         else:
-            proof_reasons = [str(reason) for reason in proof.get("reasons") or []]
             reasons.append("boom_proof=hold" + (":" + ";".join(proof_reasons) if proof_reasons else ":missing"))
     grid_on_one_contract = _grid_on_one_contract(selected, proof, persisted_boom_proof)
     if not bool(grid_on_one_contract.get("passes")):
@@ -649,11 +833,22 @@ def _validate_one(payload: Mapping[str, Any]) -> Dict[str, Any]:
                 "passes": False,
                 "reasons": [*list(gui_mask.get("reasons") or []), gui_signal_reason.split(":", 1)[-1]],
             }
+        gui_hold_reason = ""
+        gui_reasons: List[str] = []
         if not bool(gui_mask.get("passes")):
             gui_reasons = [str(reason) for reason in gui_mask.get("reasons") or [] if str(reason)]
-            reasons.append("gui_mask=hold" + (":" + ";".join(gui_reasons) if gui_reasons else ":missing"))
+            gui_hold_reason = "gui_mask=hold" + (":" + ";".join(gui_reasons) if gui_reasons else ":missing")
         elif _gui_mask_proof_needs_front_edge_repair(gui_mask):
-            reasons.append("gui_mask=wide_exact_boom_front_edge_mismatch")
+            gui_hold_reason = "gui_mask=wide_exact_boom_front_edge_mismatch"
+            gui_reasons = [gui_hold_reason.split("=", 1)[-1]]
+        if gui_hold_reason:
+            if trusted_gui_proof:
+                gui_mask = {**dict(trusted_gui_proof), "checked": True}
+                gui_mask["accepted_by_trusted_persisted_strict_gui_mask_proof"] = True
+                if gui_reasons:
+                    gui_mask["raw_validation_recomputed_reasons"] = gui_reasons
+            else:
+                reasons.append(gui_hold_reason)
     nearest = proof.get("nearest") if isinstance(proof.get("nearest"), Mapping) else {}
     nearest_profile = proof.get("nearest_profile") if isinstance(proof.get("nearest_profile"), Mapping) else {}
     suggested_marker = None

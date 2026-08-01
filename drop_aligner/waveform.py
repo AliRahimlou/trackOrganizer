@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import OrderedDict
 import gzip
 import hashlib
+import html
 import io
 import json
 import math
@@ -22,6 +23,9 @@ PEAK_FULL_READ_LIMIT = 12_000_000
 PEAK_STREAM_BLOCK_FRAMES = 1_000_000
 GLOBAL_RMS_PROFILE_BINS = 8192
 PNG_VERSION = 14
+PNG_MAX_WIDTH = 16_000
+PNG_MAX_HEIGHT = 4_000
+SVG_MAX_DETAIL_BINS = 48_000
 RMS_MAXIMIZER_TARGET = 0.78
 RMS_MAXIMIZER_CEILING = 0.985
 RMS_MAXIMIZER_KNEE = 0.72
@@ -1065,8 +1069,8 @@ class WaveformCache:
         height: int,
         markers: Sequence[Mapping[str, Any]] = (),
     ) -> bytes:
-        width = max(400, min(8000, int(width or 2400)))
-        height = max(180, min(4000, int(height or 720)))
+        width = max(400, min(PNG_MAX_WIDTH, int(width or 2400)))
+        height = max(180, min(PNG_MAX_HEIGHT, int(height or 720)))
         tile = self.tile(audio_path, start_sec=start_sec, end_sec=end_sec, width=width, force_mode="auto")
         image = Image.new("RGB", (width, height), "#ffffff")
         draw = ImageDraw.Draw(image)
@@ -1242,6 +1246,47 @@ class WaveformCache:
                 y2 = int(round(mid - _clip01(lo * gain) * (height * 0.46)))
                 draw.line([(x, y1), (x, y2)], fill="#263746")
 
+        if tile.get("mode") == "samples":
+            samples = [float(v) for v in tile.get("samples", [])]
+            span = max(1, len(samples) - 1)
+            if len(samples) >= 2 and (width / span) >= 0.25:
+                sample_mask = (
+                    [bool(value) for value in tile.get("boom_relevant_mask", [])]
+                    if isinstance(tile.get("boom_relevant_mask"), list)
+                    else []
+                )
+                sample_placeable = (
+                    [bool(value) for value in tile.get("boom_placeable_mask", [])]
+                    if isinstance(tile.get("boom_placeable_mask"), list)
+                    else []
+                )
+                mask_len = max(len(sample_mask), len(sample_placeable))
+
+                def sample_overlay_visible(index: int) -> bool:
+                    if mask_len <= 0:
+                        return True
+                    mask_index = max(0, min(mask_len - 1, int(round(index * (mask_len - 1) / max(1, span)))))
+                    return bool(
+                        (sample_mask[mask_index] if mask_index < len(sample_mask) else False)
+                        or (sample_placeable[mask_index] if mask_index < len(sample_placeable) else False)
+                    )
+
+                segment: List[tuple[int, int]] = []
+                for index, sample in enumerate(samples):
+                    if not sample_overlay_visible(index):
+                        if len(segment) >= 2:
+                            draw.line(segment, fill="#111820", width=max(1, height // 420))
+                        segment = []
+                        continue
+                    segment.append(
+                        (
+                            int(round(index * (width - 1) / span)),
+                            int(round(mid - _clip01(sample * gain) * (height * 0.46))),
+                        )
+                    )
+                if len(segment) >= 2:
+                    draw.line(segment, fill="#111820", width=max(1, height // 420))
+
         start = float(tile.get("start_sec", start_sec))
         end = float(tile.get("end_sec", end_sec))
         span_sec = max(1e-9, end - start)
@@ -1270,6 +1315,255 @@ class WaveformCache:
         buf = io.BytesIO()
         image.save(buf, format="PNG", optimize=True)
         return buf.getvalue()
+
+    def render_svg(
+        self,
+        audio_path: str,
+        *,
+        start_sec: float,
+        end_sec: float,
+        width: int,
+        height: int,
+        markers: Sequence[Mapping[str, Any]] = (),
+    ) -> bytes:
+        width = max(800, min(SVG_MAX_DETAIL_BINS, int(width or 9600)))
+        height = max(240, min(PNG_MAX_HEIGHT, int(height or 900)))
+        tile = self.tile(audio_path, start_sec=start_sec, end_sec=end_sec, width=width, force_mode="auto")
+        mid = height / 2.0
+        gain = 0.92 / max(float(tile.get("amplitude_peak", 1.0) or 1.0), 1e-9)
+        elements: List[str] = [
+            '<?xml version="1.0" encoding="UTF-8"?>',
+            (
+                f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
+                f'viewBox="0 0 {width} {height}" shape-rendering="geometricPrecision">'
+            ),
+            "<title>Boom-gated drums waveform</title>",
+            "<desc>Vector waveform export using the same Boom relevance and placeable masks as the review UI.</desc>",
+            '<rect x="0" y="0" width="100%" height="100%" fill="#ffffff"/>',
+            (
+                f'<line class="centerline" x1="0" y1="{mid:.3f}" x2="{width}" y2="{mid:.3f}" '
+                'stroke="#d7dce2" stroke-width="1" vector-effect="non-scaling-stroke"/>'
+            ),
+        ]
+
+        def add_line(
+            class_name: str,
+            x1: float,
+            y1: float,
+            x2: float,
+            y2: float,
+            *,
+            stroke: str = "#263746",
+            stroke_width: float = 1.0,
+            opacity: Optional[float] = None,
+        ) -> None:
+            opacity_attr = "" if opacity is None else f' opacity="{max(0.0, min(1.0, float(opacity))):.3f}"'
+            elements.append(
+                (
+                    f'<line class="{class_name}" x1="{x1:.3f}" y1="{y1:.3f}" '
+                    f'x2="{x2:.3f}" y2="{y2:.3f}" stroke="{stroke}" '
+                    f'stroke-width="{max(0.1, float(stroke_width)):.3f}" '
+                    f'vector-effect="non-scaling-stroke"{opacity_attr}/>'
+                )
+            )
+
+        def add_polyline(class_name: str, points: Sequence[tuple[float, float]], *, stroke: str = "#263746") -> None:
+            if len(points) < 2:
+                return
+            point_text = " ".join(f"{x:.3f},{y:.3f}" for x, y in points)
+            elements.append(
+                (
+                    f'<polyline class="{class_name}" points="{point_text}" fill="none" '
+                    f'stroke="{stroke}" stroke-width="1" vector-effect="non-scaling-stroke"/>'
+                )
+            )
+
+        rms_values = [max(0.0, float(v)) for v in tile.get("rms", [])]
+        if len(rms_values) >= 2:
+            server_density = [max(0.0, min(1.0, float(value))) for value in tile.get("boom_body_density", [])]
+            server_relevant_mask = [bool(value) for value in tile.get("boom_relevant_mask", [])]
+            server_placeable_mask = [bool(value) for value in tile.get("boom_placeable_mask", [])]
+            use_server_masks = (
+                len(server_density) == len(rms_values)
+                and len(server_relevant_mask) == len(rms_values)
+                and len(server_placeable_mask) == len(rms_values)
+            )
+            if use_server_masks:
+                body = server_density
+                floor = 0.0
+                ceiling = 1.0
+            else:
+                local_stats = _rms_stats(rms_values)
+                global_profile = {
+                    key: value
+                    for key, value in tile.items()
+                    if isinstance(key, str) and key.startswith("global_")
+                }
+                tile_span = max(1e-9, float(tile.get("end_sec", end_sec)) - float(tile.get("start_sec", start_sec)))
+                bin_span = tile_span / max(1, len(rms_values))
+                energy = [_boom_rms_amplitude(value, local_stats, global_profile) for value in rms_values]
+                radius = max(1, int(round((BOOM_BODY_SMOOTH_SECONDS / max(bin_span, 1e-9)) / 2.0)))
+                body = _moving_average(energy, radius)
+                body_array = np.asarray(body, dtype=np.float64)
+                q55 = float(np.percentile(body_array, 55.0))
+                q70 = float(np.percentile(body_array, 70.0))
+                q84 = float(np.percentile(body_array, 84.0))
+                q90 = float(np.percentile(body_array, 90.0))
+                q94 = float(np.percentile(body_array, 94.0))
+                q96 = float(np.percentile(body_array, 96.5))
+                global_floor = _boom_rms_amplitude(_metric_value(local_stats, global_profile, "rms_boom_floor", 0.0), local_stats, global_profile)
+                global_ceiling = _boom_rms_amplitude(_metric_value(local_stats, global_profile, "rms_boom_ceiling", 0.0), local_stats, global_profile)
+                floor = max(
+                    BOOM_BODY_NOISE_FLOOR,
+                    global_floor,
+                    q55 + max(0.0, q90 - q55) * BOOM_BODY_FLOOR_BLEND,
+                    q70 * 0.98,
+                    q84 * 0.82,
+                    q94 * 0.52,
+                )
+                ceiling = max(floor + 0.045, global_ceiling, q96, q94, q90)
+
+            bin_px = width / max(1, len(body))
+            bins_per_bar = max(1, int(round(5.0 / max(bin_px, 0.001))))
+            for i in range(0, len(body), bins_per_bar):
+                end_index = min(len(body), i + bins_per_bar)
+                chunk = body[i:end_index]
+                if not chunk:
+                    continue
+                has_relevant = any(server_relevant_mask[i:end_index]) if use_server_masks else True
+                has_placeable = any(server_placeable_mask[i:end_index]) if use_server_masks else False
+                if use_server_masks and not has_relevant and not has_placeable:
+                    continue
+                density = max(sum(chunk) / max(1, len(chunk)), max(chunk) * 0.88)
+                if use_server_masks:
+                    if not has_placeable and density < BOOM_GUI_BODY_VISIBLE_DENSITY:
+                        continue
+                    normalized = max(density, BOOM_PLACE_MIN_POST_NORMALIZED) if has_placeable else density
+                else:
+                    normalized = max(0.0, min(1.0, (density - floor) / max(ceiling - floor, 0.001)))
+                    if normalized < BOOM_BODY_MIN_NORMALIZED:
+                        continue
+                x0 = i * width / max(1, len(body))
+                x1 = end_index * width / max(1, len(body))
+                x = (x0 + x1) / 2.0
+                amp = float(normalized**0.54)
+                half_height = max(1.0, amp * height * 0.43)
+                line_width = max(0.6, min(max(2.0, height / 80.0), max(1.0, (x1 - x0) * 0.62)))
+                class_name = "waveform-bar placeable" if has_placeable else "waveform-bar relevant"
+                opacity = 0.98 if has_placeable else 0.56 if use_server_masks else 0.90
+                add_line(class_name, x, mid - half_height, x, mid + half_height, stroke_width=line_width, opacity=opacity)
+        elif tile.get("mode") == "samples":
+            samples = [float(v) for v in tile.get("samples", [])]
+            if len(samples) >= 2:
+                span = max(1, len(samples) - 1)
+                sample_mask = [bool(value) for value in tile.get("boom_relevant_mask", [])] if isinstance(tile.get("boom_relevant_mask"), list) else []
+                sample_placeable = [bool(value) for value in tile.get("boom_placeable_mask", [])] if isinstance(tile.get("boom_placeable_mask"), list) else []
+                mask_len = max(len(sample_mask), len(sample_placeable))
+
+                def sample_visible(index: int) -> bool:
+                    if mask_len <= 0:
+                        return True
+                    mask_index = max(0, min(mask_len - 1, int(round(index * (mask_len - 1) / max(1, span)))))
+                    return bool(
+                        (sample_mask[mask_index] if mask_index < len(sample_mask) else False)
+                        or (sample_placeable[mask_index] if mask_index < len(sample_placeable) else False)
+                    )
+
+                segment: List[tuple[float, float]] = []
+                for index, sample in enumerate(samples):
+                    if not sample_visible(index):
+                        add_polyline("waveform-samples", segment)
+                        segment = []
+                        continue
+                    x = index * (width - 1) / span
+                    y = mid - _clip01(sample * gain) * (height * 0.46)
+                    segment.append((x, y))
+                add_polyline("waveform-samples", segment)
+        else:
+            mins = [float(v) for v in tile.get("mins", [])]
+            maxs = [float(v) for v in tile.get("maxs", [])]
+            peak_mask = [bool(value) for value in tile.get("boom_relevant_mask", [])] if isinstance(tile.get("boom_relevant_mask"), list) else []
+            peak_placeable = [bool(value) for value in tile.get("boom_placeable_mask", [])] if isinstance(tile.get("boom_placeable_mask"), list) else []
+            mask_len = max(len(peak_mask), len(peak_placeable))
+            for x, (lo, hi) in enumerate(zip(mins, maxs)):
+                if mask_len > 0:
+                    mask_index = max(0, min(mask_len - 1, int(round(x * (mask_len - 1) / max(1, len(mins) - 1)))))
+                    visible = bool(
+                        (peak_mask[mask_index] if mask_index < len(peak_mask) else False)
+                        or (peak_placeable[mask_index] if mask_index < len(peak_placeable) else False)
+                    )
+                    if not visible:
+                        continue
+                y1 = mid - _clip01(hi * gain) * (height * 0.46)
+                y2 = mid - _clip01(lo * gain) * (height * 0.46)
+                add_line("waveform-peak", float(x), y1, float(x), y2)
+
+        if tile.get("mode") == "samples":
+            samples = [float(v) for v in tile.get("samples", [])]
+            span = max(1, len(samples) - 1)
+            if len(samples) >= 2 and (width / span) >= 0.25:
+                sample_mask = [bool(value) for value in tile.get("boom_relevant_mask", [])] if isinstance(tile.get("boom_relevant_mask"), list) else []
+                sample_placeable = [bool(value) for value in tile.get("boom_placeable_mask", [])] if isinstance(tile.get("boom_placeable_mask"), list) else []
+                mask_len = max(len(sample_mask), len(sample_placeable))
+
+                def sample_detail_visible(index: int) -> bool:
+                    if mask_len <= 0:
+                        return True
+                    mask_index = max(0, min(mask_len - 1, int(round(index * (mask_len - 1) / max(1, span)))))
+                    return bool(
+                        (sample_mask[mask_index] if mask_index < len(sample_mask) else False)
+                        or (sample_placeable[mask_index] if mask_index < len(sample_placeable) else False)
+                    )
+
+                segment: List[tuple[float, float]] = []
+                for index, sample in enumerate(samples):
+                    if not sample_detail_visible(index):
+                        add_polyline("waveform-samples", segment, stroke="#111820")
+                        segment = []
+                        continue
+                    x = index * (width - 1) / span
+                    y = mid - _clip01(sample * gain) * (height * 0.46)
+                    segment.append((x, y))
+                add_polyline("waveform-samples", segment, stroke="#111820")
+
+        start = float(tile.get("start_sec", start_sec))
+        end = float(tile.get("end_sec", end_sec))
+        span_sec = max(1e-9, end - start)
+        colors = {
+            "ai": "#c2352b",
+            "candidate": "#d88716",
+            "micro": "#005f73",
+            "knee": "#008f7a",
+            "asd": "#7a4cff",
+            "attack": "#6a3d9a",
+            "zero": "#111820",
+            "user": "#177245",
+        }
+        for marker in markers:
+            t = _float_or_none(marker.get("time"))
+            if t is None or t < start or t > end:
+                continue
+            x = (t - start) / span_sec * (width - 1)
+            kind = str(marker.get("kind", "user"))
+            color = colors.get(kind, "#111820")
+            label = html.escape(str(marker.get("label") or kind.upper()), quote=True)
+            add_line(f"marker marker-{html.escape(kind, quote=True)}", x, 0.0, x, float(height), stroke=color, stroke_width=max(1.5, width / 2200.0))
+            label_width = max(34, len(label) * 8 + 12)
+            label_x = min(max(2.0, x + 5.0), max(2.0, width - label_width - 2.0))
+            elements.append(
+                (
+                    f'<rect class="marker-label-bg" x="{label_x:.3f}" y="7" width="{label_width:.3f}" height="22" '
+                    f'fill="#ffffff" stroke="{color}" vector-effect="non-scaling-stroke"/>'
+                )
+            )
+            elements.append(
+                f'<text class="marker-label" x="{label_x + 6:.3f}" y="22" fill="{color}" '
+                'font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="13">'
+                f"{label}</text>"
+            )
+
+        elements.append("</svg>")
+        return ("\n".join(elements) + "\n").encode("utf-8")
 
 
 def gui_boom_mask_proof_for_tile(

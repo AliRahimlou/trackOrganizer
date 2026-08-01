@@ -14,6 +14,7 @@ from .boom_profile import (
     marker_boom_proof,
     score_candidate_against_profile,
 )
+from .beatgrid import find_visual_drop_drum_downbeat
 from .detector import DropDetectorConfig, extract_features
 from .microalign import microalign_marker
 from .musical_clock import bpm_clock_for_time, phrase_strength_for_bar
@@ -2716,6 +2717,128 @@ def _accept_boom_proof_by_sustained_body_section(
     return relieved
 
 
+def _earlier_dominant_boom_reason_times(boom_proof: Mapping[str, Any]) -> List[float]:
+    times: List[float] = []
+    for reason in boom_proof.get("reasons") or []:
+        text = str(reason)
+        if "earlier_dominant_boom_available" not in text:
+            continue
+        marker = " at "
+        if marker not in text:
+            continue
+        tail = text.split(marker, 1)[1]
+        sec_text = tail.split("s", 1)[0].strip()
+        value = _finite_float(sec_text)
+        if value is not None:
+            times.append(float(value))
+    return times
+
+
+def _accept_boom_proof_by_gui_front_edge_over_unproven_earlier(
+    boom_proof: Mapping[str, Any],
+    candidate: Mapping[str, Any],
+    gui_proof: Mapping[str, Any],
+    *,
+    audio_path: str,
+    profile_floor: float = 0.620,
+) -> Dict[str, Any]:
+    proof = dict(boom_proof)
+    if bool(proof.get("passes")):
+        return proof
+    reasons = [str(reason) for reason in proof.get("reasons") or [] if str(reason)]
+    if not reasons or not all("earlier_dominant_boom_available" in reason for reason in reasons):
+        return proof
+    if not (
+        bool(gui_proof.get("passes"))
+        and gui_proof.get("marker_signal_present") is True
+        and gui_proof.get("marker_relevant_mask") is True
+        and not _gui_mask_proof_needs_front_edge_repair(
+            gui_proof,
+            trust_reasonless_relief_offset=True,
+        )
+        and not gui_boom_mask_strict_contract_issue(gui_proof)
+    ):
+        return proof
+    if not (
+        _gui_proof_has_actual_drop_body(gui_proof)
+        or _gui_proof_has_leading_drop_front_edge(gui_proof)
+        or gui_proof.get("marker_immediate_body_present") is True
+    ):
+        return proof
+    if not _candidate_on_one(candidate, tolerance_ms=40.0):
+        return proof
+
+    nearest = proof.get("nearest") if isinstance(proof.get("nearest"), Mapping) else {}
+    nearest_profile = proof.get("nearest_profile") if isinstance(proof.get("nearest_profile"), Mapping) else {}
+    nearest_offset = _finite_float(nearest.get("offset_sec"))
+    if nearest_offset is None or abs(float(nearest_offset)) > 0.060 or not bool(nearest.get("contains_marker")):
+        return proof
+    profile_score = float(_finite_float(nearest_profile.get("profile_score")) or 0.0)
+    if profile_score < float(profile_floor):
+        return proof
+
+    body = _candidate_visual_body_summary(candidate)
+    if not (
+        body["body_score"] >= 0.620
+        and body["darkness"] >= 0.600
+        and body["post8"] >= 0.540
+        and body["drum"] >= 0.740
+        and body["drum_cont"] >= 0.500
+        and (body["bass"] >= 0.180 or body["simultaneity"] >= 0.560)
+    ):
+        return proof
+
+    earlier_times = _earlier_dominant_boom_reason_times(proof)
+    if not earlier_times:
+        return proof
+    for earlier_time in earlier_times:
+        try:
+            earlier_gui = _gui_mask_proof(
+                audio_path,
+                float(earlier_time),
+                fine_front_edge_check=True,
+                stable_wide_fallback=False,
+            )
+        except Exception:
+            earlier_gui = {}
+        if (
+            bool(earlier_gui.get("passes"))
+            and earlier_gui.get("marker_signal_present") is True
+            and earlier_gui.get("marker_relevant_mask") is True
+            and not _gui_mask_proof_needs_front_edge_repair(
+                earlier_gui,
+                trust_reasonless_relief_offset=True,
+            )
+            and not gui_boom_mask_strict_contract_issue(earlier_gui)
+            and (
+                _gui_proof_has_actual_drop_body(earlier_gui)
+                or _gui_proof_has_leading_drop_front_edge(earlier_gui)
+                or earlier_gui.get("marker_immediate_body_present") is True
+            )
+        ):
+            return proof
+
+    relieved = dict(proof)
+    relieved.update(
+        {
+            "passes": True,
+            "accepted_by_gui_front_edge_over_unproven_earlier_boom": True,
+            "raw_reasons": reasons,
+            "ignored_unproven_earlier_boom_times": [round(float(time), 6) for time in earlier_times],
+            "gui_front_edge_over_unproven_earlier_profile_score": float(profile_score),
+            "gui_front_edge_over_unproven_earlier_body_score": float(body["body_score"]),
+            "reasons": [],
+        }
+    )
+    relieved_profile = dict(nearest_profile)
+    relieved_profile["accepted_by_gui_front_edge_over_unproven_earlier_boom"] = True
+    relieved_profile["raw_reasons"] = [
+        str(reason) for reason in nearest_profile.get("reasons") or [] if str(reason)
+    ]
+    relieved["nearest_profile"] = relieved_profile
+    return relieved
+
+
 def _accept_gui_contract_by_sustained_body_section(
     gui_proof: Mapping[str, Any],
     boom_proof: Mapping[str, Any],
@@ -4482,6 +4605,11 @@ def _phase_calibrated_reclaimed_visual_body(
     profile: Optional[Mapping[str, Any]] = None,
     beatgrid: Optional[Mapping[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
+    # Retired: a reclaimed waveform body is the evidence under test and may
+    # not establish the clock phase used to approve itself.  Keep the helper
+    # as a compatibility seam for callers, but fail closed.
+    return None
+
     marker = _finite_float(marker_sec)
     if marker is None or not isinstance(selected, Mapping):
         return None
@@ -4852,44 +4980,8 @@ def _final_overbroad_reclaim_arbitration(
         replacement["visual_overbroad_reclaim_arbitration"] = True
         replacement["visual_body_reclaim_from"] = summarize_visual_candidate(selected)
         replacement_time = _visual_candidate_time(replacement)
-        if replacement_time is not None and not _candidate_on_one(replacement, tolerance_ms=80.0):
-            grid = beatgrid if isinstance(beatgrid, Mapping) else {}
-            bpm_value = _finite_float(grid.get("bpm"))
-            bar_sec_value = _beatgrid_bar_sec(grid)
-            if bpm_value and bpm_value > 0.0 and bar_sec_value and bar_sec_value > 0.0:
-                existing_clock = _candidate_bpm_clock(replacement)
-                try:
-                    nearest_bar = int(
-                        existing_clock.get("nearest_one_bar")
-                        or _visual_components(replacement).get("clock_bar")
-                        or round(float(replacement_time) / float(bar_sec_value)) + 1
-                    )
-                except (TypeError, ValueError):
-                    nearest_bar = int(round(float(replacement_time) / float(bar_sec_value)) + 1)
-                nearest_bar = max(1, nearest_bar)
-                calibrated_zero = float(replacement_time) - float(nearest_bar - 1) * float(bar_sec_value)
-                calibrated_clock = bpm_clock_for_time(
-                    float(replacement_time),
-                    float(bpm_value),
-                    clock_zero_sec=float(calibrated_zero),
-                )
-                if calibrated_clock:
-                    calibrated_clock["source"] = "visual_reclaimed_body_phase_calibrated"
-                    calibrated_clock["calibrated_from_clock_zero_sec"] = _finite_float(
-                        existing_clock.get("clock_zero_sec")
-                    ) or 0.0
-                    calibrated_clock["visual_phase_calibration_marker_sec"] = float(replacement_time)
-                    replacement["bpm_clock"] = dict(calibrated_clock)
-                    replacement_visual = dict(_visual_components(replacement))
-                    replacement_visual["clock_bar"] = int(
-                        calibrated_clock.get("nearest_one_bar", replacement_visual.get("clock_bar", 0)) or 0
-                    )
-                    replacement_visual["one_distance_ms"] = float(
-                        calibrated_clock.get("one_distance_ms", 0.0) or 0.0
-                    )
-                    replacement_visual["visual_body_reclaim_phase_calibrated"] = True
-                    replacement_visual["visual_boom_grid_phase_calibrated"] = True
-                    replacement["visual_components"] = replacement_visual
+        if replacement_time is not None and not _candidate_on_one(replacement, tolerance_ms=40.0):
+            return None
         return replacement
 
     bar_sec = _beatgrid_bar_sec(beatgrid) or 2.0
@@ -8938,6 +9030,67 @@ def _absolute_final_proven_front_edge_audit_relief(
     preferred = audit.get("preferred_candidate") if isinstance(audit.get("preferred_candidate"), Mapping) else {}
     preferred_time = _visual_candidate_event_time(preferred) if preferred else None
     selected_time = _visual_candidate_event_time(selected)
+    ignored_earlier_boom_times = [
+        float(time)
+        for time in boom_proof.get("ignored_unproven_earlier_boom_times") or []
+        if _finite_float(time) is not None
+    ]
+    preferred_was_unproven_earlier_boom = bool(
+        preferred_time is not None
+        and ignored_earlier_boom_times
+        and any(abs(float(preferred_time) - float(time)) <= 0.050 for time in ignored_earlier_boom_times)
+    )
+    gui_over_unproven_earlier_relief = bool(
+        flags
+        and flags
+        <= {
+            "earlier_phrase_body_edge_available",
+            "earlier_real_drop_available_before_late_marker",
+            "ambiguous_visual_drop_evidence",
+        }
+        and bool(boom_proof.get("accepted_by_gui_front_edge_over_unproven_earlier_boom"))
+        and preferred_was_unproven_earlier_boom
+        and bool(gui_proof.get("passes"))
+        and gui_proof.get("marker_signal_present") is True
+        and gui_proof.get("marker_relevant_mask") is True
+        and not _gui_mask_proof_needs_front_edge_repair(
+            gui_proof,
+            trust_reasonless_relief_offset=True,
+        )
+        and not gui_boom_mask_strict_contract_issue(gui_proof)
+        and (
+            _gui_proof_has_actual_drop_body(gui_proof)
+            or _gui_proof_has_leading_drop_front_edge(gui_proof)
+            or gui_proof.get("marker_immediate_body_present") is True
+        )
+        and bool(boom_proof.get("passes"))
+        and _candidate_on_one(selected, tolerance_ms=40.0)
+        and _candidate_has_visible_boom_body(
+            selected,
+            profile_floor=0.620,
+            body_floor=0.620,
+            darkness_floor=0.600,
+            post8_floor=0.540,
+            drum_floor=0.740,
+            drum_cont_floor=0.500,
+            bass_floor=0.180,
+            simultaneity_floor=0.560,
+            require_transition=False,
+        )
+    )
+    if gui_over_unproven_earlier_relief:
+        return {
+            **dict(audit),
+            "status": "pass",
+            "recommended_action": "accept",
+            "flags": [],
+            "flag_codes": [],
+            "cleared_flag_codes": sorted(flags),
+            "gui_front_edge_over_unproven_earlier_boom_audit_relief": True,
+            "ignored_unproven_earlier_boom_times": [
+                round(float(time), 6) for time in ignored_earlier_boom_times
+            ],
+        }
     if (
         not bool(visual.get("audit_preferred_gui_contract_vetoed"))
         and (
@@ -11141,7 +11294,13 @@ def _proven_boom_phase_calibrated_clock(
     profile: Mapping[str, Any],
     bar_sec: Any,
 ) -> Optional[Dict[str, Any]]:
-    """Return a BPM clock whose one is calibrated to a proven visual body edge."""
+    """Deprecated fail-closed seam for candidate-local visual rephasing.
+
+    A visually proven body can refine placement around a separately proven
+    one, but cannot translate ``clock_zero_sec`` to make itself on-grid.
+    """
+    return None
+
     if not bool(boom_proof.get("passes")):
         return None
     marker = _finite_float(marker_sec)
@@ -11220,18 +11379,12 @@ def _proven_boom_phase_calibrated_clock(
 
 
 def _grid_phase_neutralized_candidate(candidate: Mapping[str, Any], marker_sec: float) -> Dict[str, Any]:
+    """Return visual evidence without altering the candidate's grid facts."""
     row = dict(candidate)
     visual = dict(_visual_components(row))
-    visual["one_distance_ms"] = 0.0
-    visual["visual_boom_grid_phase_neutralized_for_proof"] = True
+    visual["visual_body_proof_only"] = True
+    visual["grid_phase_neutralization_rejected"] = True
     row["visual_components"] = visual
-    clock = dict(row.get("bpm_clock") if isinstance(row.get("bpm_clock"), Mapping) else {})
-    if clock:
-        clock["on_one"] = True
-        clock["one_distance_ms"] = 0.0
-        clock["nearest_one_time"] = float(marker_sec)
-        clock["beat_in_bar"] = 1
-        row["bpm_clock"] = clock
     return row
 
 
@@ -11243,7 +11396,9 @@ def _boom_proof_with_grid_phase_neutralized(
     profile: Mapping[str, Any],
     beatgrid: Mapping[str, Any],
 ) -> Optional[Dict[str, Any]]:
-    """Return visual Boom proof for a strong body blocked only by bad grid phase."""
+    """Deprecated fail-closed seam; grid failure remains a proof failure."""
+    return None
+
     marker = _finite_float(marker_sec)
     if marker is None or not selected:
         return None
@@ -13136,6 +13291,29 @@ def select_first_visual_chunk(candidates: Sequence[Mapping[str, Any]]) -> Option
             and vocal(row) <= 0.320
         )
 
+    def strong_phrase_local_reentry(row: Mapping[str, Any]) -> bool:
+        """Protect a proven phrase-start body from a denser later repeat.
+
+        Analysis-rate normalization can move continuity and height metrics by
+        a few hundredths.  A strong on-phrase local re-entry must therefore
+        not become a mere "bass body release" solely because a later bar is
+        somewhat denser.  The later bar can still win through the dedicated
+        fake/intro and definitive-drop predicates below.
+        """
+
+        return bool(
+            is_local_reentry(row)
+            and _candidate_on_one(row, tolerance_ms=40.0)
+            and phrase_prior(row) >= 0.860
+            and local_gap(row) >= 0.280
+            and drum_cont(row) >= 0.850
+            and post_drum_cont8(row) >= 0.650
+            and drum(row) >= 0.950
+            and post4(row) >= 0.600
+            and post8(row) >= 0.620
+            and bass(row) >= 0.500
+        )
+
     def instrumental_bass_section_entry(row: Mapping[str, Any]) -> bool:
         return bool(
             clock_bar(row) >= 33
@@ -13272,6 +13450,7 @@ def select_first_visual_chunk(candidates: Sequence[Mapping[str, Any]]) -> Option
             bass_body_release = bool(
                 later_bar <= row_bar + 24
                 and row_bar <= 17
+                and not strong_phrase_local_reentry(row)
                 and local_gap(later) >= 0.145
                 and bass(later) >= bass(row) + 0.100
                 and post8(later) >= post8(row) - 0.025
@@ -14445,23 +14624,12 @@ def _clock_for_visual_edge(marker: float, bpm: Optional[float], clock_zero_sec: 
     if not clock:
         return {}
     clock["source"] = "gui_boom_front_edge_track_grid"
-    one_distance = abs(float(_finite_float(clock.get("one_distance_ms")) or 0.0))
-    calibration_allowed = bool(
-        str(selected.get("selected_by") or "")
-        or bool(_visual_components(selected).get("gui_boom_front_edge_contract"))
-        or bool(_visual_components(selected).get("visual_body_reclaim_phase_calibrated"))
-    )
-    if one_distance > 40.0 or (calibration_allowed and one_distance > 1.0):
-        nearest_one = _finite_float(clock.get("nearest_one_time"))
-        if nearest_one is not None:
-            calibrated_zero = float(base_zero) + (float(marker) - float(nearest_one))
-            calibrated = bpm_clock_for_time(float(marker), float(bpm_value), clock_zero_sec=float(calibrated_zero))
-            if calibrated:
-                calibrated["source"] = "gui_boom_front_edge_calibrated_grid"
-                calibrated["calibrated_from_clock_zero_sec"] = float(base_zero)
-                calibrated["visual_phase_calibration_ms"] = float(one_distance)
-                calibrated["visual_phase_calibration_marker_sec"] = float(marker)
-                clock = calibrated
+    # The waveform edge is the evidence being judged, so it cannot also move
+    # the grid that supplies its musical-on-one proof.  A phase correction must
+    # come from independent beat/downbeat evidence before this helper is called.
+    # Keeping the original clock here makes a visually credible off-grid body
+    # fail closed instead of declaring itself beat one.
+    clock["visual_edge_phase_locked"] = True
     return dict(clock)
 
 
@@ -15418,6 +15586,13 @@ def _local_fine_gui_front_edge_repair(
         candidate_offsets.append(float(nearest_offset))
     if bool(allow_current_pass):
         candidate_offsets.append(0.0)
+    if bpm and float(bpm) > 0.0:
+        beat_sec = 60.0 / float(bpm)
+        for scale in (1.0, 0.5, 2.0):
+            beat_offset = float(scale) * float(beat_sec)
+            if beat_offset <= float(max_abs_offset_sec):
+                candidate_offsets.append(-beat_offset)
+                candidate_offsets.append(beat_offset)
     steps = (
         max(0, int(max_scan_steps))
         if max_scan_steps is not None
@@ -15476,6 +15651,11 @@ def _local_fine_gui_front_edge_repair(
             or _gui_mask_proof_needs_front_edge_repair(repaired_gui)
         )
         if gui_failed_before_body_proof:
+            nested_reasons = {
+                str(reason)
+                for reason in list(repaired_gui.get("raw_reasons") or []) + list(repaired_gui.get("reasons") or [])
+                if str(reason)
+            }
             nested_offset = _finite_float(repaired_gui.get("nearest_placeable_offset_sec"))
             queued_nested_offset = False
             if (
@@ -15492,6 +15672,20 @@ def _local_fine_gui_front_edge_repair(
                         candidate_offsets.append(float(combined_offset))
             if queued_nested_offset:
                 continue
+            if (
+                nested_offset is not None
+                and abs(float(nested_offset)) <= 0.020
+                and abs(float(nested_offset)) >= 0.0005
+                and repaired_gui.get("marker_signal_present") is True
+                and repaired_gui.get("marker_relevant_mask") is True
+                and "marker_not_on_gui_boom_front_edge_mask" in nested_reasons
+            ):
+                combined_offset = float(offset) + float(nested_offset)
+                if abs(float(combined_offset)) <= float(max_abs_offset_sec):
+                    nested_key = round(float(combined_offset), 4)
+                    if nested_key not in seen_offsets:
+                        candidate_offsets.append(float(combined_offset))
+                        continue
         repaired_gui_reasons = {
             str(reason)
             for reason in list(repaired_gui.get("raw_reasons") or []) + list(repaired_gui.get("reasons") or [])
@@ -15585,6 +15779,12 @@ def _local_fine_gui_front_edge_repair(
                 "reasons": [f"boom_proof_error:{str(exc) or exc.__class__.__name__}"],
             }
         boom_proof = _accept_boom_proof_by_sparse_impact(boom_proof, candidate)
+        boom_proof = _accept_boom_proof_by_gui_front_edge_over_unproven_earlier(
+            boom_proof,
+            candidate,
+            repaired_gui,
+            audio_path=audio_path,
+        )
         if not bool(boom_proof.get("passes")):
             continue
 
@@ -19913,7 +20113,61 @@ def _final_strict_contract_candidate_pool_recovery(
             if clock:
                 candidate["bpm_clock"] = dict(clock)
         if not _candidate_on_one(candidate, tolerance_ms=40.0):
-            continue
+            try:
+                offgrid_seed_gui = _gui_mask_proof(
+                    audio_path,
+                    row_time_f,
+                    fine_front_edge_check=True,
+                )
+            except Exception:
+                offgrid_seed_gui = {}
+            offgrid_seed_reasons = {
+                str(reason)
+                for reason in list(offgrid_seed_gui.get("raw_reasons") or []) + list(offgrid_seed_gui.get("reasons") or [])
+                if str(reason)
+            }
+            offgrid_repaired = None
+            if (
+                offgrid_seed_gui.get("marker_signal_present") is True
+                and offgrid_seed_gui.get("marker_relevant_mask") is True
+                and "marker_not_on_gui_boom_front_edge_mask" in offgrid_seed_reasons
+            ):
+                beat_sec_for_repair = 0.0
+                if bpm and float(bpm) > 0.0:
+                    beat_sec_for_repair = 60.0 / float(bpm)
+                if beat_sec_for_repair <= 0.0:
+                    beat_sec_for_repair = float(_beatgrid_bar_sec(beatgrid) or 2.0) / 4.0
+                offgrid_repaired = _local_fine_gui_front_edge_repair(
+                    audio_path,
+                    row_time_f,
+                    candidate,
+                    boom_candidates=[
+                        dict(item)
+                        for item in candidates
+                        if isinstance(item, Mapping)
+                    ],
+                    context_candidates=[dict(candidate), dict(selected)]
+                    + [dict(item) for item in candidates if isinstance(item, Mapping)][:28],
+                    profile=profile,
+                    beatgrid=beatgrid,
+                    bpm=bpm,
+                    clock_zero_sec=clock_zero_sec,
+                    rejected_sections=rejected,
+                    source="visual_final_contract_gui_mask_nearest_repair",
+                    reason=(
+                        "strict pool recovery repaired an off-grid seed to the nearest "
+                        "GUI-proven on-one front edge"
+                    ),
+                    max_abs_offset_sec=max(0.300, min(0.620, 1.35 * float(beat_sec_for_repair))),
+                    allow_current_pass=True,
+                    max_scan_steps=0,
+                )
+            if offgrid_repaired is None:
+                continue
+            candidate = dict(offgrid_repaired.get("candidate") or {})
+            row_time_f = float(offgrid_repaired.get("marker"))
+            if not _candidate_on_one(candidate, tolerance_ms=40.0):
+                continue
         body = _candidate_visual_body_summary(candidate)
         visible_body = bool(
             _candidate_has_visible_boom_body(
@@ -19950,7 +20204,67 @@ def _final_strict_contract_candidate_pool_recovery(
                 continue
         proof = _accept_boom_proof_by_sparse_impact(proof, candidate)
         if not bool(proof.get("passes")):
-            continue
+            proof_reasons = [str(reason) for reason in proof.get("reasons") or [] if str(reason)]
+            repaired = None
+            if proof_reasons and all("earlier_dominant_boom_available" in reason for reason in proof_reasons):
+                try:
+                    seed_gui = _gui_mask_proof(
+                        audio_path,
+                        row_time_f,
+                        fine_front_edge_check=True,
+                    )
+                except Exception:
+                    seed_gui = {}
+                seed_gui_reasons = {
+                    str(reason)
+                    for reason in list(seed_gui.get("raw_reasons") or []) + list(seed_gui.get("reasons") or [])
+                    if str(reason)
+                }
+                beat_sec_for_repair = 0.0
+                if bpm and float(bpm) > 0.0:
+                    beat_sec_for_repair = 60.0 / float(bpm)
+                if beat_sec_for_repair <= 0.0:
+                    beat_sec_for_repair = float(_beatgrid_bar_sec(beatgrid) or 2.0) / 4.0
+                if (
+                    seed_gui.get("marker_signal_present") is True
+                    and seed_gui.get("marker_relevant_mask") is True
+                    and "marker_not_on_gui_boom_front_edge_mask" in seed_gui_reasons
+                ):
+                    repaired = _local_fine_gui_front_edge_repair(
+                        audio_path,
+                        row_time_f,
+                        candidate,
+                        boom_candidates=[
+                            dict(item)
+                            for item in candidates
+                            if isinstance(item, Mapping)
+                        ],
+                        context_candidates=proof_rows,
+                        profile=profile,
+                        beatgrid=beatgrid,
+                        bpm=bpm,
+                        clock_zero_sec=(
+                            candidate.get("bpm_clock", {}).get("clock_zero_sec")
+                            if isinstance(candidate.get("bpm_clock"), Mapping)
+                            else clock_zero_sec
+                        ),
+                        rejected_sections=rejected,
+                        source="visual_final_contract_gui_mask_nearest_repair",
+                        reason=(
+                            "strict pool recovery zoomed a later candidate to the GUI-proven "
+                            "front edge after the earlier Boom warning failed close-up proof"
+                        ),
+                        max_abs_offset_sec=max(0.300, min(0.620, 1.35 * float(beat_sec_for_repair))),
+                        allow_current_pass=True,
+                        max_scan_steps=0,
+                    )
+            if repaired is None:
+                continue
+            candidate = dict(repaired.get("candidate") or {})
+            row_time_f = float(repaired.get("marker"))
+            proof = dict(repaired.get("proof") or {})
+            gui = dict(repaired.get("gui_proof") or {})
+            body = _candidate_visual_body_summary(candidate)
 
         candidate_clock = candidate.get("bpm_clock") if isinstance(candidate.get("bpm_clock"), Mapping) else {}
         proof_nearest = proof.get("nearest") if isinstance(proof.get("nearest"), Mapping) else {}
@@ -20043,6 +20357,76 @@ def _final_strict_contract_candidate_pool_recovery(
                         ),
                     }
                 gui = recomputed_gui
+        if _gui_mask_proof_needs_front_edge_repair(
+            gui,
+            trust_reasonless_relief_offset=True,
+        ) or (
+            not bool(gui.get("passes"))
+            and gui.get("marker_signal_present") is True
+            and gui.get("marker_relevant_mask") is True
+            and "marker_not_on_gui_boom_front_edge_mask"
+            in {
+                str(reason)
+                for reason in list(gui.get("raw_reasons") or []) + list(gui.get("reasons") or [])
+                if str(reason)
+            }
+        ):
+            pool_nearest_offset = _finite_float(gui.get("nearest_placeable_offset_sec"))
+            pool_gui_reasons = {
+                str(reason)
+                for reason in list(gui.get("raw_reasons") or []) + list(gui.get("reasons") or [])
+                if str(reason)
+            }
+            repaired = None
+            beat_sec_for_repair = 0.0
+            if bpm and float(bpm) > 0.0:
+                beat_sec_for_repair = 60.0 / float(bpm)
+            if beat_sec_for_repair <= 0.0:
+                beat_sec_for_repair = float(_beatgrid_bar_sec(beatgrid) or 2.0) / 4.0
+            pool_repair_max_abs_offset = max(0.260, min(0.620, 1.35 * float(beat_sec_for_repair)))
+            if pool_nearest_offset is not None:
+                pool_repair_max_abs_offset = max(
+                    pool_repair_max_abs_offset,
+                    min(0.980, abs(float(pool_nearest_offset)) + 0.060),
+                )
+            if (
+                pool_nearest_offset is not None
+                and abs(float(pool_nearest_offset)) <= 0.960
+                and gui.get("marker_signal_present") is True
+                and gui.get("marker_relevant_mask") is True
+                and "marker_not_on_gui_boom_front_edge_mask" in pool_gui_reasons
+            ):
+                repaired = _local_fine_gui_front_edge_repair(
+                    audio_path,
+                    row_time_f,
+                    candidate,
+                    boom_candidates=[dict(item) for item in candidates if isinstance(item, Mapping)],
+                    context_candidates=proof_rows,
+                    profile=profile,
+                    beatgrid=beatgrid,
+                    bpm=bpm,
+                    clock_zero_sec=(
+                        candidate_clock.get("clock_zero_sec")
+                        if isinstance(candidate_clock, Mapping)
+                        else clock_zero_sec
+                    ),
+                    rejected_sections=rejected,
+                    source="visual_final_contract_gui_mask_nearest_repair",
+                    reason=(
+                        "strict pool recovery moved the marker to the nearest visible "
+                        "drop-body front edge"
+                    ),
+                    max_abs_offset_sec=pool_repair_max_abs_offset,
+                    allow_current_pass=True,
+                    max_scan_steps=0,
+                )
+            if repaired is not None:
+                candidate = dict(repaired.get("candidate") or {})
+                row_time_f = float(repaired.get("marker"))
+                proof = dict(repaired.get("proof") or {})
+                gui = dict(repaired.get("gui_proof") or {})
+                body = _candidate_visual_body_summary(candidate)
+                track_grid_main_phrase_front = False
         if (
             not bool(gui.get("passes"))
             or (
@@ -20053,6 +20437,25 @@ def _final_strict_contract_candidate_pool_recovery(
             continue
         if gui.get("marker_signal_present") is False:
             continue
+        raw_fine_gui_front_edge = bool(
+            bool(gui.get("passes"))
+            and gui.get("marker_signal_present") is True
+            and gui.get("marker_relevant_mask") is True
+            and gui.get("marker_immediate_body_present") is True
+            and not gui.get("accepted_by_coarse_gui_front_edge_after_fine_probe")
+            and not gui.get("accepted_by_boom_front_edge_proof")
+            and not gui.get("accepted_by_staccato_front_body_proof")
+            and not gui.get("accepted_by_sparse_groove_front_edge_proof")
+            and not gui.get("accepted_by_sustained_body_section")
+            and not gui.get("accepted_by_actual_body_proof")
+            and not gui.get("accepted_by_opening_body_start_proof")
+            and not [str(reason) for reason in gui.get("reasons") or [] if str(reason)]
+            and not gui_boom_mask_strict_contract_issue(gui)
+            and not _gui_mask_proof_needs_front_edge_repair(
+                gui,
+                trust_reasonless_relief_offset=True,
+            )
+        )
 
         candidate["boom_proof"] = dict(proof)
         candidate["gui_mask_proof"] = dict(gui)
@@ -20087,6 +20490,7 @@ def _final_strict_contract_candidate_pool_recovery(
                 "time_delta": abs(row_time_f - marker_f),
                 "same_time": abs(row_time_f - marker_f) <= 0.040,
                 "track_grid_main_phrase_front": bool(track_grid_main_phrase_front),
+                "raw_fine_gui_front_edge": bool(raw_fine_gui_front_edge),
             }
         )
     if not pool:
@@ -20108,6 +20512,17 @@ def _final_strict_contract_candidate_pool_recovery(
                 )
             )
             return current_later_main_fronts[0]
+    raw_fine_front_edges = [item for item in pool if bool(item.get("raw_fine_gui_front_edge"))]
+    if raw_fine_front_edges:
+        raw_fine_front_edges.sort(
+            key=lambda item: (
+                float(item["marker"]),
+                -float(item["body_score"]),
+                -float(item["darkness"]),
+                float(item["time_delta"]),
+            )
+        )
+        return raw_fine_front_edges[0]
     max_body = max(float(item["body_score"]) for item in pool)
     max_darkness = max(float(item["darkness"]) for item in pool)
     max_phrase = max(float(item["phrase"]) for item in pool)
@@ -20954,6 +21369,23 @@ def _earlier_same_section_reset_front_edge_repair(
                     "earlier on-one reset front has visible signal/relevant mask and stronger reset than the later body repeat"
                 ),
             }
+        gui_strict_issue = gui_boom_mask_strict_contract_issue(gui)
+        gui_has_front_edge_contract = bool(
+            _gui_proof_has_actual_drop_body(gui)
+            or _gui_proof_has_leading_drop_front_edge(gui)
+            or _gui_proof_has_exact_sparse_front_edge(gui, proof, candidate)
+            or bool(gui.get("accepted_by_sparse_transition_front_edge"))
+            or bool(gui.get("accepted_by_low_density_transition_body_start"))
+        )
+        if _gui_mask_proof_needs_front_edge_repair(
+            gui,
+            trust_reasonless_relief_offset=True,
+        ):
+            continue
+        if gui_strict_issue and gui_strict_issue != "marker_has_no_immediate_drop_body":
+            continue
+        if gui_strict_issue == "marker_has_no_immediate_drop_body" and not gui_has_front_edge_contract:
+            continue
         candidate["boom_proof"] = dict(proof)
         candidate["gui_mask_proof"] = dict(gui)
         visual = dict(_visual_components(candidate))
@@ -23058,6 +23490,22 @@ def _analysis_rate_recovery_result(
         if not bool(gui_proof.get("passes")):
             gui_proof = recovered.get("gui_mask_proof") if isinstance(recovered.get("gui_mask_proof"), Mapping) else {}
         if not bool(gui_proof.get("passes")):
+            continue
+        gui_strict_issue = gui_boom_mask_strict_contract_issue(gui_proof)
+        if (
+            gui_strict_issue == "marker_has_no_immediate_drop_body"
+            and _gui_proof_has_exact_sparse_front_edge(gui_proof, boom_proof, selected)
+        ):
+            gui_strict_issue = None
+        if (
+            gui_strict_issue
+            or _gui_mask_proof_needs_front_edge_repair(
+                gui_proof,
+                trust_reasonless_relief_offset=True,
+            )
+            or gui_proof.get("marker_signal_present") is not True
+            or gui_proof.get("marker_relevant_mask") is not True
+        ):
             continue
         if not _candidate_on_one(selected, tolerance_ms=40.0):
             continue
@@ -28785,6 +29233,144 @@ def visual_first_marker(
             selected_visual["clock_bar"] = int(final_clock.get("nearest_one_bar", selected_visual.get("clock_bar", 0)) or 0)
             selected_visual["one_distance_ms"] = float(final_clock.get("one_distance_ms", 0.0) or 0.0)
             selected["visual_components"] = selected_visual
+    local_drum_downbeat = None
+    local_drum_error = ""
+    if bpm and bpm > 0.0:
+        try:
+            selected_visual_for_drum = _visual_components(selected)
+            visual_anchor = _finite_float(selected_visual_for_drum.get("visual_block_start_time"))
+            if visual_anchor is None:
+                visual_anchor = _finite_float(selected.get("visual_raw_chunk_time"))
+            if visual_anchor is None:
+                visual_anchor = float(raw_time)
+            bar_for_local = _beatgrid_bar_sec(beatgrid) or (240.0 / float(bpm))
+            if (
+                not np.isfinite(float(visual_anchor))
+                or abs(float(visual_anchor) - float(raw_time)) > max(2.0, 0.75 * float(bar_for_local))
+            ):
+                visual_anchor = float(raw_time)
+            local_drum_sample_rate = int(sample_rate)
+            if local_drum_sample_rate > VISUAL_BODY_PEAK_REVIEW_SAMPLE_RATE:
+                local_drum_sample_rate = VISUAL_BODY_PEAK_REVIEW_SAMPLE_RATE
+            local_features = extract_features(
+                audio_path,
+                DropDetectorConfig(sample_rate=local_drum_sample_rate, hpss=False, use_drumprint=False),
+                bpm=float(bpm),
+            )
+            local_drum_downbeat = find_visual_drop_drum_downbeat(
+                local_features,
+                visual_time_sec=float(visual_anchor),
+                current_marker_sec=float(marker),
+                bpm=float(bpm),
+                clock_zero_sec=clock_zero,
+            )
+        except Exception as exc:
+            local_drum_error = str(exc) or exc.__class__.__name__
+    if isinstance(local_drum_downbeat, Mapping):
+        local_downbeat_time = _finite_float(local_drum_downbeat.get("time_sec"))
+        local_confidence = _finite_float(local_drum_downbeat.get("confidence")) or 0.0
+        local_score = _finite_float(local_drum_downbeat.get("score")) or 0.0
+        local_beat_sec = _finite_float(local_drum_downbeat.get("beat_sec")) or (60.0 / float(bpm or 128.0))
+        local_delta = None if local_downbeat_time is None else float(local_downbeat_time) - float(marker)
+        current_one_distance = _clock_one_distance_ms(final_clock if isinstance(final_clock, Mapping) else {})
+        local_move_allowed = bool(
+            local_downbeat_time is not None
+            # This low-resolution pattern pass may recover an off-grid/snare
+            # candidate, but it must not displace an independently proven one.
+            # Exact post-one attack placement is handled by the bounded PCM
+            # refinement stage, not by moving the musical grid candidate here.
+            and current_one_distance > 1.0
+            and abs(float(local_delta or 0.0)) >= max(0.010, 0.018 * float(local_beat_sec))
+            and local_confidence >= 0.260
+            and local_score >= 0.210
+            and float(local_delta or 0.0) <= max(0.220, 1.20 * float(local_beat_sec))
+            and (
+                float(local_delta or 0.0) <= 0.0
+                or current_one_distance > 40.0
+                or local_confidence >= 0.360
+            )
+        )
+        if local_move_allowed and local_downbeat_time is not None:
+            previous_marker = float(marker)
+            marker = float(local_downbeat_time)
+            local_micro_probe: Mapping[str, Any] = {}
+            try:
+                local_micro_probe = microalign_marker(
+                    audio_path,
+                    float(marker),
+                    search_before_ms=50,
+                    search_after_ms=int(max(140.0, min(420.0, 0.48 * float(local_beat_sec) * 1000.0))),
+                )
+            except Exception:
+                local_micro_probe = {}
+            if isinstance(local_micro_probe, Mapping) and local_micro_probe:
+                local_zoomed_marker = _zoomed_marker_time(
+                    float(marker),
+                    local_micro_probe,
+                    _visual_components(selected),
+                )
+                if abs(float(local_zoomed_marker) - float(marker)) <= max(0.070, 0.20 * float(local_beat_sec)):
+                    marker = float(local_zoomed_marker)
+            selected = dict(selected)
+            selected["timestamp"] = float(marker)
+            selected["snapped_sec"] = float(marker)
+            selected["time_sec"] = float(marker)
+            selected["microaligned_time"] = float(marker)
+            selected["selected_by"] = "visual_local_drum_downbeat_refinement"
+            selected["reason"] = (
+                f"{selected.get('reason') or 'visual drop marker'}; local drums/kick/backbeat refinement "
+                f"moved marker from {previous_marker:.6f}s to visual-section downbeat {float(marker):.6f}s"
+            )
+            local_clock = _clock_for_visual_edge(float(marker), bpm, clock_zero, selected)
+            if local_clock:
+                selected["bpm_clock"] = dict(local_clock)
+                final_clock = dict(local_clock)
+                updated_zero = _finite_float(local_clock.get("clock_zero_sec"))
+                if updated_zero is not None:
+                    clock_zero = float(updated_zero)
+                    if isinstance(beatgrid, Mapping):
+                        beatgrid = dict(beatgrid)
+                        beatgrid["bar_zero_sec"] = float(clock_zero)
+                        if bpm:
+                            beatgrid["bpm"] = float(bpm)
+                            beatgrid["beat_sec"] = 60.0 / float(bpm)
+                            beatgrid["bar_sec"] = 240.0 / float(bpm)
+            selected_visual = dict(_visual_components(selected))
+            selected_visual["local_drum_downbeat_refinement"] = True
+            selected_visual["local_drum_previous_marker"] = float(previous_marker)
+            selected_visual["local_drum_downbeat_time"] = float(marker)
+            selected_visual["local_drum_confidence"] = float(local_confidence)
+            selected_visual["local_drum_score"] = float(local_score)
+            selected_visual["local_drum_kick_peak"] = float(local_drum_downbeat.get("kick_peak", 0.0) or 0.0)
+            selected_visual["local_drum_backbeat_snare"] = float(local_drum_downbeat.get("backbeat_snare", 0.0) or 0.0)
+            selected_visual["local_drum_post_body"] = float(local_drum_downbeat.get("post_body", 0.0) or 0.0)
+            selected_visual["local_drum_visual_delta_sec"] = float(local_drum_downbeat.get("visual_delta_sec", 0.0) or 0.0)
+            if isinstance(final_clock, Mapping):
+                selected_visual["clock_bar"] = int(final_clock.get("nearest_one_bar", selected_visual.get("clock_bar", 0)) or 0)
+                selected_visual["one_distance_ms"] = float(final_clock.get("one_distance_ms", 0.0) or 0.0)
+            selected["visual_components"] = selected_visual
+            if isinstance(micro, Mapping):
+                micro = dict(micro)
+            else:
+                micro = {}
+            if isinstance(local_micro_probe, Mapping) and local_micro_probe:
+                micro.update(dict(local_micro_probe))
+            micro["local_drum_downbeat_refinement_used"] = True
+            micro["local_drum_previous_marker"] = float(previous_marker)
+            micro["local_drum_downbeat_time"] = float(marker)
+            micro["local_drum_confidence"] = float(local_confidence)
+            micro["local_drum_score"] = float(local_score)
+            micro["microaligned_time"] = float(marker)
+            micro["snap_offset_ms"] = float((float(marker) - float(raw_time)) * 1000.0)
+            micro["reason"] = (
+                f"{micro.get('reason') or 'MicroSnap reviewed'}; "
+                "visual section refined to first local kick/downbeat body impact"
+            )
+            selected["microalign"] = dict(micro)
+    elif local_drum_error and isinstance(selected.get("visual_components"), Mapping):
+        selected_visual = dict(selected["visual_components"])
+        selected_visual["local_drum_downbeat_refinement_error"] = local_drum_error
+        selected["visual_components"] = selected_visual
     selected["reason"] = (
         f"{selected.get('reason')}; zoomed from visual block edge "
         f"{raw_time:.6f}s to transient/body {marker:.6f}s"
@@ -32768,9 +33354,14 @@ def visual_first_marker(
                     audit = dict(snapped_audit)
                     candidates = snapped_proof_candidates[:10]
     def current_selected_clock_zero(candidate: Mapping[str, Any]) -> Optional[float]:
-        candidate_clock = candidate.get("bpm_clock") if isinstance(candidate.get("bpm_clock"), Mapping) else {}
-        selected_clock_zero = _finite_float(candidate_clock.get("clock_zero_sec"))
-        return selected_clock_zero if selected_clock_zero is not None else clock_zero
+        # Repairs share the feature-map clock.  Candidate clocks are derived
+        # evidence and must never become an authoritative phase source.
+        authoritative_zero = (
+            _finite_float(beatgrid.get("bar_zero_sec"))
+            if isinstance(beatgrid, Mapping)
+            else None
+        )
+        return authoritative_zero if authoritative_zero is not None else clock_zero
 
     post_contract_stronger_repair = _full_track_stronger_boom_front_edge_repair(
         selected,
@@ -36340,7 +36931,114 @@ def visual_first_marker(
                             recovered.pop("analysis_rate_recovery", None)
                             promoted_recovered.pop("analysis_rate_recovery", None)
                             recovered.pop("error", None)
-                return recovered
+                recovered_selected_final = (
+                    recovered.get("selected_candidate")
+                    if isinstance(recovered.get("selected_candidate"), Mapping)
+                    else {}
+                )
+                recovered_gui_final = (
+                    recovered.get("gui_mask_proof")
+                    if isinstance(recovered.get("gui_mask_proof"), Mapping)
+                    else recovered_selected_final.get("gui_mask_proof")
+                    if isinstance(recovered_selected_final.get("gui_mask_proof"), Mapping)
+                    else {}
+                )
+                recovered_boom_final = (
+                    recovered.get("boom_proof")
+                    if isinstance(recovered.get("boom_proof"), Mapping)
+                    else recovered_selected_final.get("boom_proof")
+                    if isinstance(recovered_selected_final.get("boom_proof"), Mapping)
+                    else {}
+                )
+                recovered_strict_issue = gui_boom_mask_strict_contract_issue(recovered_gui_final)
+                if (
+                    recovered_strict_issue == "marker_has_no_immediate_drop_body"
+                    and _gui_proof_has_exact_sparse_front_edge(
+                        recovered_gui_final,
+                        recovered_boom_final,
+                        recovered_selected_final,
+                    )
+                ):
+                    recovered_strict_issue = None
+                recovered_needs_front_edge = _gui_mask_proof_needs_front_edge_repair(
+                    recovered_gui_final,
+                    trust_reasonless_relief_offset=True,
+                )
+                if (
+                    recovered_strict_issue
+                    or recovered_needs_front_edge
+                    or not bool(recovered_gui_final.get("passes"))
+                ):
+                    recovered_marker_final = _finite_float(recovered.get("marker"))
+                    recovered_last_mile = None
+                    if recovered_marker_final is not None and recovered_selected_final:
+                        recovered_last_mile = _final_strict_contract_candidate_pool_recovery(
+                            recovered_selected_final,
+                            float(recovered_marker_final),
+                            [
+                                dict(row)
+                                for row in (
+                                    list(recovered.get("candidates", []) or [])
+                                    + list(boom_candidates or [])
+                                    + list(body_peak_candidates or [])
+                                    + list(candidates_for_selection or [])
+                                    + list(extended_candidates_for_later_guard or [])
+                                )
+                                if isinstance(row, Mapping)
+                            ],
+                            audio_path=audio_path,
+                            profile=boom_profile,
+                            beatgrid=beatgrid if isinstance(beatgrid, Mapping) else {},
+                            bpm=bpm,
+                            clock_zero_sec=current_selected_clock_zero(recovered_selected_final),
+                            rejected_sections=rejected_sections,
+                        )
+                    if recovered_last_mile is not None:
+                        recovered_candidate = dict(recovered_last_mile["candidate"])
+                        recovered_gui = dict(recovered_last_mile["gui_proof"])
+                        recovered_proof = dict(recovered_last_mile["proof"])
+                        recovered_visual = dict(_visual_components(recovered_candidate))
+                        recovered_visual["analysis_rate_last_mile_strict_gui_recovery"] = True
+                        recovered_visual["analysis_rate_last_mile_previous_marker"] = float(
+                            recovered_marker_final or 0.0
+                        )
+                        recovered_visual["boom_proof_pass"] = True
+                        recovered_visual["gui_mask_contract_pass"] = True
+                        recovered_visual["actual_visual_body_contract_pass"] = True
+                        recovered_candidate["visual_components"] = recovered_visual
+                        recovered_candidate["boom_proof"] = dict(recovered_proof)
+                        recovered_candidate["gui_mask_proof"] = dict(recovered_gui)
+                        recovered.update(
+                            {
+                                "ok": True,
+                                "marker": float(recovered_last_mile["marker"]),
+                                "raw_visual_time": float(recovered_last_mile["marker"]),
+                                "selected_candidate": recovered_candidate,
+                                "candidates": [
+                                    dict(row)
+                                    for row in recovered_last_mile.get("audit_candidates", [])
+                                    if isinstance(row, Mapping)
+                                ][:10],
+                                "visual_audit": dict(recovered_last_mile["audit"]),
+                                "boom_proof": dict(recovered_proof),
+                                "gui_mask_proof": dict(recovered_gui),
+                                "gui_boom_mask_proof": dict(recovered_gui),
+                                "final_contract_failed": False,
+                            }
+                        )
+                        recovered.pop("error", None)
+                        recovered_gui_final = recovered_gui
+                        recovered_strict_issue = gui_boom_mask_strict_contract_issue(recovered_gui_final)
+                        recovered_needs_front_edge = _gui_mask_proof_needs_front_edge_repair(
+                            recovered_gui_final,
+                            trust_reasonless_relief_offset=True,
+                        )
+                if not (
+                    recovered_strict_issue
+                    or recovered_needs_front_edge
+                    or not bool(recovered_gui_final.get("passes"))
+                ):
+                    return recovered
         final_result["ok"] = False
         final_result["error"] = "final_visual_contract_failed"
         final_result["final_contract_failed"] = True
@@ -40175,6 +40873,35 @@ def visual_first_marker(
                         trust_reasonless_relief_offset=True,
                     )
     if final_needs_front_edge_repair:
+        final_nearest_beat_sec = 0.0
+        bpm_value_for_nearest = _finite_float(bpm)
+        if bpm_value_for_nearest and bpm_value_for_nearest > 0.0:
+            final_nearest_beat_sec = 60.0 / float(bpm_value_for_nearest)
+        final_nearest_max_abs_offset_sec = max(
+            0.240,
+            min(0.520, 1.10 * float(final_nearest_beat_sec or 0.0)),
+        )
+        final_nearest_offset_sec = _finite_float(
+            final_gui_for_source.get("nearest_placeable_offset_sec")
+        )
+        final_gui_reasons = {
+            str(reason)
+            for reason in list(final_gui_for_source.get("raw_reasons") or [])
+            + list(final_gui_for_source.get("reasons") or [])
+            if str(reason)
+        }
+        if (
+            final_nearest_offset_sec is not None
+            and float(final_nearest_offset_sec) < -0.100
+            and abs(float(final_nearest_offset_sec)) <= 0.960
+            and final_gui_for_source.get("marker_signal_present") is True
+            and final_gui_for_source.get("marker_relevant_mask") is True
+            and "marker_not_on_gui_boom_front_edge_mask" in final_gui_reasons
+        ):
+            final_nearest_max_abs_offset_sec = max(
+                final_nearest_max_abs_offset_sec,
+                min(0.980, abs(float(final_nearest_offset_sec)) + 0.060),
+            )
         final_nearest_repair_pool = [dict(final_selected_for_source)] + [
             dict(row)
             for row in list(final_result.get("candidates", []) or [])
@@ -40197,7 +40924,7 @@ def visual_first_marker(
             rejected_sections=rejected_sections,
             source="visual_final_contract_gui_mask_nearest_repair",
             reason="final GUI contract moved the marker to the nearest visible drop-body front edge",
-            max_abs_offset_sec=0.240,
+            max_abs_offset_sec=final_nearest_max_abs_offset_sec,
         )
         if final_local_nearest is not None:
             repaired_candidate = dict(final_local_nearest.get("candidate") or {})
@@ -40918,4 +41645,121 @@ def visual_first_marker(
                 )
     final_selected_for_source["visual_components"] = final_visual
     final_result["selected_candidate"] = final_selected_for_source
+    last_mile_gui = (
+        final_result.get("gui_mask_proof")
+        if isinstance(final_result.get("gui_mask_proof"), Mapping)
+        else final_selected_for_source.get("gui_mask_proof")
+        if isinstance(final_selected_for_source.get("gui_mask_proof"), Mapping)
+        else {}
+    )
+    last_mile_boom = (
+        final_result.get("boom_proof")
+        if isinstance(final_result.get("boom_proof"), Mapping)
+        else final_selected_for_source.get("boom_proof")
+        if isinstance(final_selected_for_source.get("boom_proof"), Mapping)
+        else {}
+    )
+    last_mile_exact_sparse = _gui_proof_has_exact_sparse_front_edge(
+        last_mile_gui,
+        last_mile_boom,
+        final_selected_for_source,
+    )
+    last_mile_strict_issue = gui_boom_mask_strict_contract_issue(last_mile_gui)
+    if last_mile_exact_sparse and last_mile_strict_issue == "marker_has_no_immediate_drop_body":
+        last_mile_strict_issue = ""
+    last_mile_needs_front_edge = _gui_mask_proof_needs_front_edge_repair(
+        last_mile_gui,
+        trust_reasonless_relief_offset=True,
+    )
+    if last_mile_strict_issue or last_mile_needs_front_edge or not bool(last_mile_gui.get("passes")):
+        last_mile_pool = [
+            dict(row)
+            for row in (
+                list(final_result.get("candidates", []) or [])
+                + list(late_arbitration_pool or [])
+                + list(candidates or [])
+                + list(candidates_for_selection or [])
+                + list(extended_candidates_for_later_guard or [])
+                + list(body_peak_candidates or [])
+                + list(boom_candidates or [])
+            )
+            if isinstance(row, Mapping)
+        ]
+        last_mile_recovery = _final_strict_contract_candidate_pool_recovery(
+            final_selected_for_source,
+            float(final_result.get("marker") or 0.0),
+            last_mile_pool,
+            audio_path=audio_path,
+            profile=boom_profile,
+            beatgrid=beatgrid if isinstance(beatgrid, Mapping) else {},
+            bpm=bpm,
+            clock_zero_sec=current_selected_clock_zero(final_selected_for_source),
+            rejected_sections=rejected_sections,
+        )
+        if last_mile_recovery is not None:
+            recovered_candidate = dict(last_mile_recovery["candidate"])
+            recovered_gui = dict(last_mile_recovery["gui_proof"])
+            recovered_boom = dict(last_mile_recovery["proof"])
+            recovered_visual = dict(_visual_components(recovered_candidate))
+            recovered_visual["last_mile_strict_gui_recovery"] = True
+            recovered_visual["last_mile_strict_gui_previous_marker"] = float(final_result.get("marker") or 0.0)
+            recovered_visual["boom_proof_pass"] = True
+            recovered_visual["gui_mask_contract_pass"] = True
+            recovered_visual["actual_visual_body_contract_pass"] = True
+            recovered_candidate["visual_components"] = recovered_visual
+            recovered_candidate["boom_proof"] = dict(recovered_boom)
+            recovered_candidate["gui_mask_proof"] = dict(recovered_gui)
+            final_selected_for_source = recovered_candidate
+            final_visual = recovered_visual
+            final_result.update(
+                {
+                    "ok": True,
+                    "marker": float(last_mile_recovery["marker"]),
+                    "raw_visual_time": float(last_mile_recovery["marker"]),
+                    "selected_candidate": recovered_candidate,
+                    "candidates": [
+                        dict(item)
+                        for item in last_mile_recovery.get("audit_candidates", [])
+                        if isinstance(item, Mapping)
+                    ][:10],
+                    "visual_audit": dict(last_mile_recovery["audit"]),
+                    "boom_proof": dict(recovered_boom),
+                    "gui_mask_proof": dict(recovered_gui),
+                    "gui_boom_mask_proof": dict(recovered_gui),
+                    "final_contract_failed": False,
+                }
+            )
+            final_result.pop("error", None)
+            last_mile_gui = recovered_gui
+            last_mile_strict_issue = gui_boom_mask_strict_contract_issue(last_mile_gui)
+            last_mile_needs_front_edge = _gui_mask_proof_needs_front_edge_repair(
+                last_mile_gui,
+                trust_reasonless_relief_offset=True,
+            )
+        if last_mile_strict_issue or last_mile_needs_front_edge or not bool(last_mile_gui.get("passes")):
+            final_result["ok"] = False
+            final_result["final_contract_failed"] = True
+            final_result["error"] = "final_gui_mask_strict_contract_failed:" + str(
+                last_mile_strict_issue
+                or ("wide_exact_boom_front_edge_mismatch" if last_mile_needs_front_edge else "")
+                or ";".join(str(reason) for reason in last_mile_gui.get("reasons") or [])
+                or "gui_mask_failed"
+            )
+            audit_for_failure = (
+                dict(final_result.get("visual_audit"))
+                if isinstance(final_result.get("visual_audit"), Mapping)
+                else {}
+            )
+            failure_flags = [str(flag) for flag in audit_for_failure.get("flag_codes") or [] if str(flag)]
+            if "final_gui_mask_strict_contract_failed" not in failure_flags:
+                failure_flags.append("final_gui_mask_strict_contract_failed")
+            audit_for_failure.update(
+                {
+                    "ok": False,
+                    "status": "review",
+                    "recommended_action": "review",
+                    "flag_codes": failure_flags,
+                }
+            )
+            final_result["visual_audit"] = audit_for_failure
     return final_result
