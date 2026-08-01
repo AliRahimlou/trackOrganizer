@@ -89,6 +89,7 @@ DROP_FUSION_REQUIRE_SAFE = str(os.environ.get("DROP_FUSION_REQUIRE_SAFE", "1")).
 DROP_FUSION_OVERRIDE_DB_ANCHOR = str(os.environ.get("DROP_FUSION_OVERRIDE_DB_ANCHOR", "1")).strip().lower() not in {"0", "false", "no", "off"}
 DROP_FUSION_OVERRIDE_MANUAL_ANCHOR = str(os.environ.get("DROP_FUSION_OVERRIDE_MANUAL_ANCHOR", "0")).strip().lower() not in {"0", "false", "no", "off"}
 DROP_FUSION_OVERRIDE_VISUAL_FIRST_ANCHOR = str(os.environ.get("DROP_FUSION_OVERRIDE_VISUAL_FIRST_ANCHOR", "0")).strip().lower() not in {"0", "false", "no", "off"}
+DROP_DB_OVERRIDES_VISUAL_ANCHOR = str(os.environ.get("DROP_DB_OVERRIDES_VISUAL_ANCHOR", "0")).strip().lower() not in {"0", "false", "no", "off"}
 DROP_FUSION_MIN_CONFIDENCE = float(os.environ.get("DROP_FUSION_MIN_CONFIDENCE", "0.64"))
 DROP_FUSION_MIN_SCORE = float(os.environ.get("DROP_FUSION_MIN_SCORE", "0.58"))
 DROP_FUSION_SAMPLE_RATE = int(str(os.environ.get("DROP_FUSION_SAMPLE_RATE", "22050")).strip() or "22050")
@@ -3494,11 +3495,25 @@ def modify_als_file(input_path: Optional[str], target_folder: str, track_names: 
     if (not use_rekordbox_cue_test) and bpm_value and drums_source_path:
         db_sec, db_conf, db_reason = _lookup_drop_from_db(drums_source_path, bpm_value)
         if db_sec is not None:
-            drop_sec = float(db_sec)
-            drop_conf = max(float(drop_conf), float(db_conf))
-            used_db_anchor = True
-            role_anchor_map = _retarget_anchor_map(role_anchor_map, track_names, float(drop_sec))
-            print(f"[WARP] Using drop DB anchor: {drop_sec:.3f}s ({db_reason})")
+            if used_visual_first_anchor and not bool(DROP_DB_OVERRIDES_VISUAL_ANCHOR):
+                # The approved visual-first anchor is sample-accurate and fully
+                # proven; a DB running mean (or a slug match on a different
+                # edit) must not displace it. Record the disagreement so review
+                # tooling can surface it.
+                db_delta_ms = abs(float(db_sec) - float(drop_sec)) * 1000.0
+                drop_meta = dict(drop_meta or {})
+                drop_meta["drop_db_conflict_sec"] = float(db_sec)
+                drop_meta["drop_db_conflict_delta_ms"] = float(db_delta_ms)
+                print(
+                    f"[WARP] Drop DB anchor {float(db_sec):.3f}s ({db_reason}) differs from approved "
+                    f"visual anchor by {db_delta_ms:.1f}ms; keeping visual anchor."
+                )
+            else:
+                drop_sec = float(db_sec)
+                drop_conf = max(float(drop_conf), float(db_conf))
+                used_db_anchor = True
+                role_anchor_map = _retarget_anchor_map(role_anchor_map, track_names, float(drop_sec))
+                print(f"[WARP] Using drop DB anchor: {drop_sec:.3f}s ({db_reason})")
 
     # Manual override from Ableton project (if user set the correct 1.1.1 on the drums clip).
     if (not use_rekordbox_cue_test) and bpm_value:

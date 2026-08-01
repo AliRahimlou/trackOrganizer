@@ -151,6 +151,19 @@ def _add_check(checks: List[Dict[str, Any]], name: str, passed: bool, detail: st
     checks.append({"name": name, "passed": bool(passed), "detail": detail})
 
 
+def _clip_anchor_sec(clip: etree._Element) -> Optional[float]:
+    """SecTime of the clip's BeatTime-0 warp marker (the 1.1.1 drop anchor)."""
+    node = clip.find("WarpMarkers")
+    if node is None:
+        return None
+    for marker in _marker_values(node):
+        beat = marker.get("beat_time")
+        sec = marker.get("sec_time")
+        if beat is not None and abs(float(beat)) <= BEAT_TOLERANCE and sec is not None:
+            return float(sec)
+    return None
+
+
 def verify_als(
     als_path: str,
     *,
@@ -309,6 +322,26 @@ def verify_als(
     audio_exists, refs = _file_ref_exists(clip, als_path)
     report["audio_file_references"] = refs
     _add_check(checks, "audio_file_reference_exists", bool(audio_exists), "; ".join(refs[:4]))
+
+    # Every stem clip must carry the same BeatTime-0 anchor: the drop lands on
+    # 1.1.1 for drums, inst, and vocals alike or the set drifts out of phase.
+    clip_anchors = [_clip_anchor_sec(other) for other in clips]
+    report["clip_anchor_times"] = clip_anchors
+    if len(clips) > 1:
+        present = [t for t in clip_anchors if t is not None]
+        _add_check(
+            checks,
+            "all_clips_have_drop_anchor",
+            len(present) == len(clips),
+            f"anchored_clips={len(present)}/{len(clips)}",
+        )
+        spread = (max(present) - min(present)) if present else None
+        _add_check(
+            checks,
+            "all_clips_share_drop_anchor",
+            spread is not None and float(spread) <= float(tolerance_sec),
+            f"anchor_spread_sec={spread}; tolerance_sec={float(tolerance_sec):.9f}",
+        )
 
     if candidates_json:
         try:

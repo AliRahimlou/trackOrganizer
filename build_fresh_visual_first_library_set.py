@@ -29,6 +29,12 @@ from drop_aligner.als import modify_als
 from drop_aligner.als_anchor import build_visual_first_als_anchor
 from drop_aligner.boom_profile import boom_proof_front_edge_freshness
 from drop_aligner.exclusions import drums_stem_signal_stats, is_near_empty_drums_stem, row_is_acapella
+from drop_aligner.production_contract import (
+    DISALLOWED_PASS_SOURCES,
+    DISALLOWED_PASS_SOURCE_PREFIXES,
+    HUMAN_OVERRIDE_MATCH_TOLERANCE_SEC,
+    VALIDATED_HUMAN_OVERRIDE_SELECTED_BY,
+)
 from drop_aligner.visual_first import (
     VISUAL_FIRST_PRODUCTION_SAMPLE_RATE,
     _accept_gui_contract_by_actual_body_proof,
@@ -48,21 +54,7 @@ from verify_als import verify_als
 
 AUDIO_EXTENSIONS = {".wav", ".flac", ".aiff", ".aif", ".mp3"}
 ROLE_ORDER = {"drums": 1, "inst": 2, "vocals": 3}
-DISALLOWED_PASS_SOURCES = {
-    "historical_human_marker",
-    "historical_review_memory",
-    "manual_review_marker",
-    "review_auto_place",
-    "saved_closest_to_review_pick",
-    "visual_drop_v2",
-    "visual_drop_v2_candidate",
-    "visual_first_rms_body_fallback",
-    "web_accept_blue_marker",
-    "web_save_placed_marker",
-}
-DISALLOWED_PASS_SOURCE_PREFIXES = ("historical_", "saved_")
 DEFAULT_WAVEFORM_CACHE_DIR = Path(__file__).resolve().parent / "artifacts" / "waveform_cache"
-VALIDATED_HUMAN_OVERRIDE_SELECTED_BY = "visual_validated_human_review_override"
 DEFAULT_PER_TRACK_TIMEOUT_SEC = 600.0
 
 
@@ -1303,7 +1295,7 @@ def _apply_validated_human_overrides(
     template: Path,
     strict_stems: bool,
     waveform_cache_dir: Path,
-    tolerance_sec: float = 0.050,
+    tolerance_sec: float = HUMAN_OVERRIDE_MATCH_TOLERANCE_SEC,
 ) -> Dict[str, Any]:
     summary: Dict[str, Any] = {
         "enabled": bool(correction_logs),

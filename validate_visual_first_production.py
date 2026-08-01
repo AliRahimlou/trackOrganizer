@@ -64,25 +64,17 @@ from build_fresh_visual_first_library_set import _verify_combined_set  # noqa: E
 from project_config import STEMS_ROOT_DIR  # noqa: E402
 
 
-DISALLOWED_PASS_SOURCES = {
-    "historical_human_marker",
-    "historical_review_memory",
-    "manual_review_marker",
-    "review_auto_place",
-    "saved_closest_to_review_pick",
-    "visual_drop_v2",
-    "visual_drop_v2_candidate",
-    "visual_first_rms_body_fallback",
-    "web_accept_blue_marker",
-    "web_save_placed_marker",
-}
-DISALLOWED_PASS_SOURCE_PREFIXES = ("historical_", "saved_")
-VALIDATED_HUMAN_OVERRIDE_SELECTED_BY = "visual_validated_human_review_override"
+from drop_aligner.production_contract import (  # noqa: E402
+    DISALLOWED_PASS_SOURCES,
+    DISALLOWED_PASS_SOURCE_PREFIXES,
+    MAX_GRID_ONE_DISTANCE_MS,
+    VALIDATED_HUMAN_OVERRIDE_SELECTED_BY,
+)
+
 DEFAULT_OUT_DIR = Path("models")
 DEFAULT_REPORT_ROOT = Path.home() / "Desktop" / "MUSIC" / "GeneratedSet" / "VisualFirstFresh"
 CURRENT_REPORT_GLOB = "VISUAL_FIRST_FRESH_ALL_TRACKS_*_report.json"
 LEGACY_REPORT_GLOB = "VISUAL_FIRST_FRESH_ALL_DRUMS_*_report.json"
-MAX_GRID_ONE_DISTANCE_MS = 90.0
 DERIVED_REPORT_NAME_TOKENS = (
     "_detector_pass_only_report",
     "_production_validation",

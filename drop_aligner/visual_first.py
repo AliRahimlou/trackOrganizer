@@ -28166,13 +28166,22 @@ def visual_first_marker(
                     rejected_sections=rejected_sections,
                 )
                 if recovered is not None:
+                    # bpm/clock_zero are only assigned after a candidate is
+                    # selected, which never happened on this path; derive the
+                    # grid hints locally so the recovered marker is returned
+                    # instead of raising UnboundLocalError.
+                    recovery_beatgrid = (
+                        feature_map.get("beatgrid")
+                        if isinstance(feature_map.get("beatgrid"), Mapping)
+                        else {}
+                    )
+                    recovery_bpm = _finite_float(recovery_beatgrid.get("bpm")) or infer_bpm_from_path(audio_path)
+                    recovery_clock_zero = _finite_float(recovery_beatgrid.get("bar_zero_sec"))
                     recovered = _same_cluster_stronger_front_edge_pullback_result(
                         recovered,
                         audio_path=audio_path,
-                        beatgrid=feature_map.get("beatgrid")
-                        if isinstance(feature_map.get("beatgrid"), Mapping)
-                        else {},
-                        bpm=bpm,
+                        beatgrid=recovery_beatgrid,
+                        bpm=recovery_bpm,
                         profile=load_boom_profile(),
                         boom_candidates=(
                             recovered.get("boom_candidates")
@@ -28180,7 +28189,7 @@ def visual_first_marker(
                             else boom_candidates
                         ),
                         rejected_sections=rejected_sections,
-                        clock_zero_sec=clock_zero,
+                        clock_zero_sec=recovery_clock_zero,
                     )
                     return recovered
             return {

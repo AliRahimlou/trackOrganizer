@@ -8,12 +8,21 @@ from pathlib import Path
 import build_visual_first_production_queue as queue
 
 
+def _clean_gui_mask_proof() -> dict:
+    return {
+        "passes": True,
+        "marker_signal_present": True,
+        "marker_relevant_mask": True,
+    }
+
+
 def _row_with_boom_proof(proof: dict) -> dict:
     return {
         "audit_status": "pass",
         "audit_flags": [],
         "selected_by": "visual_boom_grid_one_snap",
         "boom_proof": proof,
+        "gui_mask_proof": _clean_gui_mask_proof(),
     }
 
 
@@ -88,6 +97,7 @@ def test_gate_artifacts_add_reviewable_failures_to_full_review_only(tmp_path: Pa
         "audit_flags": [],
         "selected_by": "visual_boom_grid_one_snap",
         "boom_proof": _fresh_boom(16.0),
+        "gui_mask_proof": _clean_gui_mask_proof(),
         "als_anchor": {
             "ok": True,
             "accepted": True,

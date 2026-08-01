@@ -12,29 +12,12 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from drop_aligner.boom_profile import boom_proof_front_edge_freshness
+from drop_aligner.production_contract import (
+    DISALLOWED_PASS_SOURCES,
+    DISALLOWED_PASS_SOURCE_PREFIXES,
+    unsafe_selected_source as _unsafe_selected_source,
+)
 from project_config import GENERATED_SET_DIR
-
-
-DISALLOWED_PASS_SOURCES = {
-    "historical_human_marker",
-    "historical_review_memory",
-    "manual_review_marker",
-    "review_auto_place",
-    "saved_closest_to_review_pick",
-    "visual_drop_v2",
-    "visual_drop_v2_candidate",
-    "visual_first_rms_body_fallback",
-    "web_accept_blue_marker",
-    "web_save_placed_marker",
-}
-DISALLOWED_PASS_SOURCE_PREFIXES = ("historical_", "saved_")
-
-
-def _unsafe_selected_source(selected_by: str) -> bool:
-    source = str(selected_by or "").strip()
-    return source in DISALLOWED_PASS_SOURCES or any(
-        source.startswith(prefix) for prefix in DISALLOWED_PASS_SOURCE_PREFIXES
-    )
 
 FLAG_PRIORITY = {
     "off_one_bpm_grid": 0,
@@ -261,6 +244,20 @@ def _boom_reasons(row: Mapping[str, Any]) -> List[str]:
     return [str(reason) for reason in _boom_proof(row).get("reasons") or [] if str(reason)]
 
 
+def _gui_mask_proof(row: Mapping[str, Any]) -> Mapping[str, Any]:
+    proof = row.get("gui_mask_proof")
+    return proof if isinstance(proof, Mapping) else {}
+
+
+def _gui_mask_passes(row: Mapping[str, Any]) -> bool:
+    proof = _gui_mask_proof(row)
+    return (
+        bool(proof.get("passes"))
+        and proof.get("marker_signal_present") is True
+        and proof.get("marker_relevant_mask") is True
+    )
+
+
 def _boom_profile_score(row: Mapping[str, Any]) -> str:
     proof = _boom_proof(row)
     nearest = proof.get("nearest_profile") if isinstance(proof.get("nearest_profile"), Mapping) else {}
@@ -422,6 +419,7 @@ def row_passes_production_gate(row: Mapping[str, Any]) -> bool:
         and not _flags(row)
         and not _unsafe_selected_source(_selected_by(row))
         and _boom_passes(row)
+        and _gui_mask_passes(row)
     )
 
 
@@ -444,6 +442,17 @@ def _reason(row: Mapping[str, Any]) -> str:
         else:
             boom_reasons = _boom_reasons(row)
             reasons.append("boom_proof=hold" + (":" + ";".join(boom_reasons) if boom_reasons else ":missing"))
+    if not _gui_mask_passes(row):
+        gui_proof = _gui_mask_proof(row)
+        gui_reasons = [str(reason) for reason in gui_proof.get("reasons") or [] if str(reason)]
+        if not gui_proof:
+            reasons.append("gui_mask=missing")
+        elif not bool(gui_proof.get("passes")):
+            reasons.append("gui_mask=hold" + (":" + ";".join(gui_reasons) if gui_reasons else ":missing"))
+        elif gui_proof.get("marker_signal_present") is not True:
+            reasons.append("gui_mask=blank_marker:no_visible_signal")
+        else:
+            reasons.append("gui_mask=stale_missing_marker_relevant_mask")
     return " | ".join(reasons) or "held by production gate"
 
 

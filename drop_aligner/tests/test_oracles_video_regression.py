@@ -15,10 +15,12 @@ def test_oracles_video_manual_launch_point_regression() -> None:
     if not Path(audio_path).exists():
         pytest.skip(f"local audio fixture not available: {audio_path}")
 
+    # use_cache=False: the canary must exercise the live analysis path — a
+    # stale feature/tile cache must never be able to fake a pass here.
     result = visual_first_marker(
         audio_path,
         sample_rate=VISUAL_FIRST_PRODUCTION_SAMPLE_RATE,
-        use_cache=True,
+        use_cache=False,
     )
     selected = result["selected_candidate"]
 
